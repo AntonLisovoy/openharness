@@ -2705,7 +2705,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         // sits on the typing indicator forever.
         onTurnAborted: (message) => {
           announceTurnAborted(session.sessionId, 'devin', message)
-          emitSessionEvents(session.sessionId, [{ type: 'turn_ended', payload: {} }])
+          emitSessionEvents(session.sessionId, [{ type: 'turn_ended', payload: { aborted: true } }])
         },
         onFatal: (err) => console.warn(`[devin] ${sid(session.sessionId)} ${err.message}`),
       })
@@ -4449,7 +4449,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
           st.turnOpen = false
           st.pendingTools.clear()
           console.log(`[turn] ${sid(sessionId)} force-closed by ${status === 'error' ? 'StopFailure' : 'Stop'} hook (after grace)`)
-          emitSessionEvents(sessionId, [{ type: 'turn_ended', payload: {} }])
+          emitSessionEvents(sessionId, [{ type: 'turn_ended', payload: status === 'error' ? { aborted: true } : {} }])
         }
       })().catch((err) => {
         console.error('[hooks] claude stop hook failed:', err instanceof Error ? err.message : err)
