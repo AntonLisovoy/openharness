@@ -1,7 +1,14 @@
 import { randomBytes } from 'node:crypto'
+import { readFileSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, extname, join, resolve } from 'node:path'
 import { WebSocket } from 'ws'
 import { env } from '../config/env.js'
 import { readAuthSession } from '../lib/authSession.js'
+import { installedHarnessCatalog, orchestratorEngineSupported } from './catalog.js'
+import { compileFlow, FlowError, parseFlowSource, type FlowIssue } from './flow.js'
+import { OrchestratorError } from './model.js'
+import type { HarnessChoice } from './prompts.js'
 
 export function localOrchestratorRequest(port: number, machineId: string, payload: Record<string, unknown>, timeoutMs = 30_000): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
@@ -29,15 +36,21 @@ export function localOrchestratorRequest(port: number, machineId: string, payloa
   })
 }
 
+function daemonTarget(portArg?: number, machineArg?: string): { port: number; machineId: string } {
+  const port = portArg ?? env.PORT, machineId = machineArg ?? readAuthSession()?.machineId ?? ''
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !machineId) throw new Error('A running local daemon and machine identity are required (--port, --machine).')
+  return { port, machineId }
+}
+
 export function parseOrchestratorArgs(argv: readonly string[]): { port: number; machineId: string; payload: Record<string, unknown> } {
   const args: string[] = []
-  let port = env.PORT, machineId = readAuthSession()?.machineId ?? ''
+  let portArg: number | undefined, machineArg: string | undefined
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--port') port = Number(argv[++i])
-    else if (argv[i] === '--machine') machineId = argv[++i] ?? ''
+    if (argv[i] === '--port') portArg = Number(argv[++i])
+    else if (argv[i] === '--machine') machineArg = argv[++i] ?? ''
     else args.push(argv[i])
   }
-  if (!Number.isInteger(port) || port < 1 || port > 65535 || !machineId) throw new Error('A running local daemon and machine identity are required (--port, --machine).')
+  const { port, machineId } = daemonTarget(portArg, machineArg)
   const [action, id, ...rest] = args
   const payload: Record<string, unknown> = { action, id }
   switch (action) {
@@ -49,11 +62,13 @@ export function parseOrchestratorArgs(argv: readonly string[]): { port: number; 
     case 'complete': payload.summary = rest[0]; break
     case 'message': Object.assign(payload, { text: rest[0], messageId: rest[1] ?? randomBytes(16).toString('hex') }); break
     case 'steer': Object.assign(payload, { taskId: rest[0], attempt: Number(rest[1]), text: rest[2], messageId: rest[3] ?? randomBytes(16).toString('hex') }); break
-    default: throw new Error('Usage: harness orchestrator [--port N --machine ID] list|catalog|status|plan|finish|fail|retry|cancel|resume|complete|message|steer [project-id] [arguments]')
+    default: throw new Error('Usage: harness orchestrator [--port N --machine ID] run|list|catalog|status|plan|finish|fail|retry|cancel|resume|complete|message|steer [project-id] [arguments]')
   }
   return { port, machineId, payload }
 }
 export async function orchestratorCommand(argv: readonly string[]): Promise<number> {
+  const at = argv.findIndex((arg, i) => !arg.startsWith('--') && argv[i - 1] !== '--port' && argv[i - 1] !== '--machine')
+  if (argv[at] === 'run') return flowRunCommand([...argv.slice(0, at), ...argv.slice(at + 1)], { err: text => console.error(text.trimEnd()) })
   try {
     const { port, machineId, payload } = parseOrchestratorArgs(argv)
     const reply = await localOrchestratorRequest(port, machineId, payload)
@@ -78,4 +93,101 @@ export function summarizeOrchestratorReply(reply: Record<string, unknown>): Reco
       deliveryReason: m.deliveryReason, text: String(m.text).slice(0, 160),
     })) : [],
   } }
+}
+
+const FLOW_USAGE = 'Usage: harness orchestrator run <flow> [--input name=value]... [--cwd DIR] [--engine ENGINE] [--parallelism N] [--bypass-permission] [--dry-run] [--port N --machine ID]'
+export interface FlowArgs { flow: string; inputs: Record<string, string>; dryRun: boolean; bypassPermission: boolean; cwd?: string; engine?: string; parallelism?: number; port?: number; machine?: string }
+export function parseFlowArgs(argv: readonly string[]): FlowArgs {
+  const args: FlowArgs = { flow: '', inputs: {}, dryRun: false, bypassPermission: false }
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    const value = (): string => {
+      const next = argv[++i]
+      if (next === undefined || next.startsWith('--')) throw new Error(arg === '--input' ? 'Pass inputs as --input name=value.' : `${arg} needs a value.`)
+      return next
+    }
+    if (arg === '--input') {
+      const pair = value(), at = pair.indexOf('=')
+      if (at < 1) throw new Error('Pass inputs as --input name=value.')
+      const name = pair.slice(0, at)
+      if (Object.hasOwn(args.inputs, name)) throw new Error(`Duplicate input: ${name}`)
+      args.inputs[name] = pair.slice(at + 1)
+    } else if (arg === '--dry-run') args.dryRun = true
+    else if (arg === '--bypass-permission') args.bypassPermission = true
+    else if (arg === '--cwd') args.cwd = value()
+    else if (arg === '--engine') args.engine = value()
+    else if (arg === '--parallelism') {
+      const n = Number(value())
+      if (!Number.isInteger(n) || n < 1 || n > 6) throw new Error('--parallelism takes a whole number from 1 to 6.')
+      args.parallelism = n
+    } else if (arg === '--port') args.port = Number(value())
+    else if (arg === '--machine') args.machine = value()
+    else if (arg.startsWith('--')) throw new Error(`Unknown option: ${arg}`)
+    else if (!args.flow) args.flow = arg
+    else throw new Error(FLOW_USAGE)
+  }
+  if (!args.flow) throw new Error(FLOW_USAGE)
+  return args
+}
+export function resolveFlowPath(ref: string, cwd: string, home: string, isFile: (path: string) => boolean): { path: string; byName: boolean } {
+  const direct = resolve(cwd, ref)
+  if (isFile(direct)) return { path: direct, byName: false }
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(ref)) throw new OrchestratorError('FLOW_NOT_FOUND', `No flow file at ${ref}.`)
+  for (const folder of [join(cwd, '.harness', 'flows'), join(home, '.harness', 'flows')]) {
+    const found = ['yaml', 'yml', 'json'].map(ext => join(folder, `${ref}.${ext}`)).filter(isFile)
+    if (found.length > 1) throw new OrchestratorError('FLOW_AMBIGUOUS', `${found.join(' and ')} both define ${ref}; keep one.`)
+    if (found.length) return { path: found[0], byName: true }
+  }
+  throw new OrchestratorError('FLOW_NOT_FOUND', `No flow named ${ref} in ${join(cwd, '.harness', 'flows')} or ~/.harness/flows.`)
+}
+
+interface FlowIo { cwd: string; home: string; out(text: string): void; err(text: string): void; catalog(): HarnessChoice[]; engineSupported(engine: string): boolean; request: typeof localOrchestratorRequest }
+const defaultIo = (): FlowIo => ({
+  cwd: process.cwd(), home: homedir(), out: text => { process.stdout.write(text) }, err: text => { process.stderr.write(text) },
+  catalog: installedHarnessCatalog, engineSupported: orchestratorEngineSupported, request: localOrchestratorRequest,
+})
+const isFile = (path: string): boolean => statSync(path, { throwIfNoEntry: false })?.isFile() === true
+
+/** `run <flow>`: compile and check locally (no daemon for --dry-run), then start it on the local daemon. */
+export async function flowRunCommand(argv: readonly string[], overrides: Partial<FlowIo> = {}): Promise<number> {
+  const io = { ...defaultIo(), ...overrides }
+  try {
+    const args = parseFlowArgs(argv)
+    const cwd = resolve(io.cwd, args.cwd ?? '.')
+    const located = resolveFlowPath(args.flow, cwd, io.home, isFile)
+    const source = readFileSync(located.path, 'utf8')
+    const parsed = parseFlowSource(source, located.path)
+    const compiled = compileFlow(parsed, args.inputs)
+    const engine = args.engine ?? compiled.engine ?? 'claude'
+    const installed = new Set(io.catalog().map(h => h.id))
+    const problems: FlowIssue[] = []
+    if (!io.engineSupported(engine)) problems.push({ path: 'engine', message: `${engine} cannot run orchestrator work here.` })
+    compiled.tasks.forEach((task, index) => {
+      if (task.run !== undefined) return
+      const own = task.harness.startsWith('engine:') ? task.harness.slice('engine:'.length) : null
+      if (own !== null ? !io.engineSupported(own) : !installed.has(task.harness)) {
+        problems.push({ path: `tasks[${index}] (${task.id})`, message: own !== null ? `${task.harness} cannot run orchestrator work here.` : `${task.harness} is not an installed harness on this machine.`, ...parsed.at(['tasks', index, 'harness']) })
+      }
+    })
+    if (problems.length) throw new FlowError(located.path, problems)
+    const warnings = [...compiled.warnings]
+    if (located.byName && compiled.name !== basename(located.path, extname(located.path))) warnings.push(`${basename(located.path)} declares name ${compiled.name}.`)
+    for (const warning of warnings) io.err(`warning: ${warning}\n`)
+    if (args.dryRun) {
+      io.out(`${JSON.stringify({ flow: { name: compiled.name, path: located.path, sha256: parsed.sha256 }, engine, inputs: compiled.inputs, warnings, tasks: compiled.tasks }, null, 2)}\n`)
+      return 0
+    }
+    const { port, machineId } = daemonTarget(args.port, args.machine)
+    const reply = await io.request(port, machineId, {
+      action: 'start', id: randomBytes(16).toString('hex'), engine, cwd, bypassPermission: args.bypassPermission,
+      prompt: compiled.description ? `${compiled.name}: ${compiled.description}` : `Flow ${compiled.name}`,
+      ...(args.parallelism !== undefined ? { parallelism: args.parallelism } : {}),
+      flow: { source, path: located.path }, inputs: args.inputs,
+    })
+    io.out(`${JSON.stringify(summarizeOrchestratorReply(reply), null, 2)}\n`)
+    return reply.error ? 1 : 0
+  } catch (error) {
+    io.err(`${error instanceof Error ? error.message : 'Flow run failed.'}\n`)
+    return 1
+  }
 }
