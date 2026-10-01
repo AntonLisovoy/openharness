@@ -1,14 +1,16 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { mkdir, realpath, rename, rm, stat } from 'node:fs/promises'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { z } from 'zod'
 import type { AgentEngine } from '../engines/types.js'
 import { readPrivateStateFile, secureStateDirectory } from '../lib/secureState.js'
 import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
+import { compileFlow, inputEnvName, parseFlowSource } from './flow.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Task } from './model.js'
 import { directorPrompt, workerPrompt, type HarnessChoice } from './prompts.js'
+import { startStep, stepFailure, type StepHandle, type StepSpawner } from './steps.js'
 
 export interface AgentRuntime {
   viewerUrl?: string | null
@@ -27,6 +29,8 @@ export interface OrchestratorDependencies {
   cancel(agentId: string): void
   agent(agentId: string): AgentRuntime | null
   changed?(id: string, revision: number): void
+  /** Spawner for flow shell steps; the login-shell spawner when absent. */
+  spawnStep?: StepSpawner
 }
 
 type Outcome = { summary: string; paths: string[] } | { failed: string; retryable: boolean }
@@ -39,6 +43,7 @@ export class OrchestratorService {
   private readonly pumping = new Set<string>()
   private readonly launching = new Set<string>()
   private readonly assistantMessages = new Map<string, string>()
+  private readonly steps = new Map<string, { run: Run; task: Task; handle: StepHandle }>()
   private loaded = false
   private stopped = false
   constructor(private readonly deps: OrchestratorDependencies) {}
@@ -156,12 +161,17 @@ export class OrchestratorService {
       return this.snapshot(prior.id)
     }
     requireThat(!existsSync(join(this.deps.stateDir, `${spec.id}.json`)), 'CORRUPT_STATE', 'A saved project with this id could not be read. Its data was preserved.')
+    const parsed = spec.flow ? parseFlowSource(spec.flow.source, spec.flow.path) : null
+    const flow = parsed ? compileFlow(parsed, spec.inputs ?? {}) : null
+    if (flow) for (const task of flow.tasks) this.checkHarness(spec.engine, task, true)
     let parent = this.deps.workspaceDir
+    let cwd: string | undefined
     if (spec.cwd) {
       requireThat(isAbsolute(spec.cwd) && !/[\x00-\x1f]/.test(spec.cwd), 'INVALID_CWD', 'Choose an absolute project folder.')
       const folder = await stat(spec.cwd).catch(() => null)
       requireThat(folder?.isDirectory(), 'INVALID_CWD', 'Choose an existing project folder.')
-      parent = join(await realpath(spec.cwd), '.harness-projects')
+      cwd = await realpath(spec.cwd)
+      parent = join(cwd, '.harness-projects')
     }
     // Re-check after async folder validation; two callers can share a creation id.
     if (this.runs.has(spec.id)) return this.start(spec)
@@ -171,14 +181,20 @@ export class OrchestratorService {
     const now = Date.now()
     const run: Run = {
       version: 1, id: spec.id, fingerprint, prompt: spec.prompt, engine: spec.engine,
-      bypassPermission: spec.bypassPermission, parallelism: spec.parallelism, root,
-      directorId: null, directorWorking: false, state: 'starting', error: null,
+      bypassPermission: spec.bypassPermission, parallelism: spec.parallelism, root, ...(cwd ? { cwd } : {}),
+      directorId: null, directorWorking: false, state: flow ? 'active' : 'starting', error: null,
       tasks: [], messages: [], revision: 0, createdAt: now, updatedAt: now,
+      ...(flow ? { flow: { name: flow.name, path: spec.flow!.path, sha256: parsed!.sha256, inputs: { ...flow.inputs }, warnings: flow.warnings } } : {}),
     }
     this.message(run, 'user', run.prompt)
+    if (flow) {
+      writeFileSync(join(root, 'flow.yaml'), spec.flow!.source, { mode: 0o400, flag: 'wx' })
+      this.addTasks(run, flow.tasks)
+    }
     this.save(run)
     this.runs.set(run.id, run)
-    this.background(run, this.launchDirector(run))
+    if (flow) this.pump(run)
+    else this.background(run, this.launchDirector(run))
     return this.snapshot(run.id)
   }
   private async launchDirector(run: Run): Promise<void> {
@@ -202,18 +218,28 @@ export class OrchestratorService {
   }
   plan(id: string, raw: unknown): void {
     const run = this.get(id)
+    requireThat(!run.flow, 'FLOW_PINNED', 'This project runs a pinned flow; its tasks cannot be changed.')
     requireThat(run.state === 'active' || run.state === 'starting', 'PROJECT_INACTIVE', 'Resume this project before adding work.')
     const tasks = z.array(TaskSpec).min(1).max(32).parse(raw)
+    // A scope rule, not a sandbox: shell steps and automatic completion come from a file the user runs.
+    requireThat(tasks.every(t => t.run === undefined && t.outputs === undefined && t.timeoutMs === undefined && t.retry === undefined), 'FLOW_ONLY', 'run, outputs, timeoutMs and retry are only available in flow files.')
     validatePlan(run.tasks, tasks)
-    const catalog = this.catalog()
-    for (const task of tasks) {
-      requireThat(task.harness === `engine:${run.engine}` || catalog.some(h => h.id === task.harness && this.deps.supportsEngine(h.engine)), 'HARNESS_UNAVAILABLE', `${task.harness} is not an installed, supported harness.`)
-    }
-    for (const task of tasks) if (!run.tasks.some(t => t.id === task.id)) {
-      run.tasks.push({ ...task, state: 'queued', attempt: 1, agentId: null, cwd: '', summary: '', error: null, uncertain: false, artifacts: [], inputs: {} })
-    }
+    for (const task of tasks) this.checkHarness(run.engine, task, false)
+    this.addTasks(run, tasks)
     this.changed(run)
     this.pump(run)
+  }
+  private addTasks(run: Run, tasks: TaskSpec[]): void {
+    for (const task of tasks) if (!run.tasks.some(t => t.id === task.id)) {
+      run.tasks.push({ ...task, state: 'queued', attempt: 1, agentId: null, cwd: '', summary: '', error: null, uncertain: false, artifacts: [], inputs: {}, promptSha256: createHash('sha256').update(task.prompt).digest('hex') })
+    }
+  }
+  private ownEngine(harness: string): string | null { return harness.startsWith('engine:') ? harness.slice('engine:'.length) : null }
+  private checkHarness(engine: string, task: TaskSpec, flow: boolean): void {
+    if (task.run !== undefined) return
+    const own = this.ownEngine(task.harness)
+    const ok = own !== null ? own === engine || (flow && this.deps.supportsEngine(own)) : this.catalog().some(h => h.id === task.harness && this.deps.supportsEngine(h.engine))
+    requireThat(ok, 'HARNESS_UNAVAILABLE', `${task.harness} is not an installed, supported harness.`)
   }
   private artifactRoot(run: Run, task: Task, attempt = task.attempt): string { return join(run.root, 'artifacts', task.id, `attempt-${attempt}`) }
   private pump(run: Run): void {
@@ -236,7 +262,19 @@ export class OrchestratorService {
         this.launching.add(key)
         this.background(run, this.launchTask(run, task, inputs).finally(() => this.launching.delete(key)))
       }
+      this.settleFlow(run)
     } finally { this.pumping.delete(run.id) }
+  }
+  private settleFlow(run: Run): void {
+    if (!run.flow) return
+    let error: string | null = null
+    if (run.tasks.every(t => t.state === 'succeeded')) {
+      run.state = 'completed'
+      this.message(run, 'system', `Flow ${run.flow.name} completed: ${run.tasks.length} tasks succeeded.`)
+    } else if (!run.tasks.some(t => ['queued', 'launching', 'running'].includes(t.state))) {
+      error = `Flow stopped: ${run.tasks.filter(t => t.state !== 'succeeded').map(t => `${t.id} (${t.state})`).join(', ')}. Retry a task or cancel the project.`
+    }
+    if (run.state === 'completed' || run.error !== error) { run.error = error; this.changed(run) }
   }
   private async launchTask(run: Run, task: Task, inputs: Task[]): Promise<void> {
     let creating = false
@@ -244,16 +282,20 @@ export class OrchestratorService {
       await mkdir(task.cwd, { recursive: true, mode: 0o700 })
       for (const input of inputs) await materializeInputs(this.artifactRoot(run, input), join(task.cwd, 'inputs', input.id), input.artifacts)
       if (task.state !== 'launching' || run.state !== 'active') return
+      if (task.run !== undefined) return this.launchStep(run, task)
       const harness = this.catalog().find(h => h.id === task.harness)
-      requireThat(harness || task.harness === `engine:${run.engine}`, 'HARNESS_UNAVAILABLE', `${task.harness} is no longer installed.`)
+      const own = this.ownEngine(task.harness)
+      requireThat(harness || (own !== null && (own === run.engine || (!!run.flow && this.deps.supportsEngine(own)))), 'HARNESS_UNAVAILABLE', `${task.harness} is no longer installed.`)
+      const engine = (harness?.engine ?? own!) as AgentEngine
       writeFileSync(join(task.cwd, 'ORCHESTRATOR_TASK.md'), workerPrompt(run, task, this.deps.command), { mode: 0o600, flag: 'wx' })
       creating = true
       const result = await this.deps.create({
-        engine: (harness?.engine ?? run.engine) as AgentEngine, cwd: task.cwd,
+        engine, cwd: task.cwd,
         dsh: harness?.id ?? null, bypassPermission: run.bypassPermission,
         prompt: 'Read ORCHESTRATOR_TASK.md in this folder and complete the specialist assignment using your harness. Verify the result, update the viewer/verdict, then report through the exact finish or fail command in that file.', name: task.title,
       })
       task.agentId = result.agentId
+      task.engine = engine
       if ((task as Task).state === 'cancelled' || (run as Run).state === 'cancelled') this.deps.cancel(result.agentId)
       else if (task.state === 'launching') task.state = 'running'
     } catch (error) {
@@ -264,9 +306,40 @@ export class OrchestratorService {
         this.queueResult(run, `Task ${task.id} could not start: ${task.error}`)
       }
     }
-    this.changed(run)
-    this.pump(run)
-    this.dispatchPending(run)
+    this.launched(run)
+  }
+  private launched(run: Run): void { this.changed(run); this.pump(run); this.dispatchPending(run) }
+  private stepEnv(run: Run, task: Task): Record<string, string> {
+    const flow = run.flow!
+    const env: Record<string, string> = {}
+    for (const [name, value] of Object.entries(flow.inputs)) env[inputEnvName(name)] = value
+    // Reserved names are set last so a flow input can never shadow them.
+    return { ...env, HARNESS_PROJECT_DIR: run.cwd ?? run.root, HARNESS_FLOW_DIR: dirname(flow.path), HARNESS_RUN_ID: run.id, HARNESS_TASK_ID: task.id, HARNESS_ATTEMPT: String(task.attempt) }
+  }
+  private launchStep(run: Run, task: Task): void {
+    const attempt = task.attempt, key = this.attemptKey(run, task)
+    const handle = startStep(task.run!, { cwd: task.cwd, env: this.stepEnv(run, task), spawn: this.deps.spawnStep })
+    this.steps.set(key, { run, task, handle })
+    if (handle.pid !== undefined) task.pid = handle.pid
+    task.state = 'running'
+    void handle.done.then(async result => {
+      this.steps.delete(key)
+      await this.settleAuto(run, task, attempt, result.code === 0 && !result.error
+        ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: ['stdout.log', 'stderr.log'] }
+        : { failed: stepFailure(result), retryable: true })
+    })
+    this.launched(run)
+  }
+  /** Daemon-initiated results (step exit, outputs, timeout): wait out a settle in flight, then act only if still current. */
+  private async settleAuto(run: Run, task: Task, attempt: number, outcome: Outcome): Promise<boolean> {
+    const key = this.attemptKey(run, task, attempt)
+    await this.finishing.get(key)?.catch(() => {})
+    if (this.stopped || this.finishing.has(key) || run.state !== 'active' || task.attempt !== attempt || !['running', 'launching'].includes(task.state)) return false
+    try { await this.settle(run, task, attempt, outcome); return true }
+    catch (error) {
+      console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${(error as Error).message}`)
+      return false
+    }
   }
   private task(run: Run, id: string, attempt?: number): Task {
     const task = run.tasks.find(t => t.id === id)
@@ -347,12 +420,13 @@ export class OrchestratorService {
       message.deliveryReason = revoked ? 'Cancelled before delivery.' : 'Stopped after dispatch; inspect the agent before resending.'
     }
     this.changed(run)
+    for (const task of tasks) this.steps.get(this.attemptKey(run, task))?.handle.stop()
     for (const agent of agents) this.deps.cancel(agent)
     this.pump(run)
   }
   resume(id: string): void {
     const run = this.get(id)
-    requireThat(run.directorId && this.deps.agent(run.directorId), 'DIRECTOR_UNAVAILABLE', 'Inspect or restart the original director before resuming; no duplicate will be launched.')
+    requireThat(run.flow || (run.directorId && this.deps.agent(run.directorId)), 'DIRECTOR_UNAVAILABLE', 'Inspect or restart the original director before resuming; no duplicate will be launched.')
     requireThat(run.state !== 'starting', 'PROJECT_STARTING', 'The director is still starting.')
     run.state = 'active'; run.error = null
     this.changed(run); this.pump(run)
@@ -369,6 +443,7 @@ export class OrchestratorService {
     RunId.parse(messageId)
     z.string().trim().min(1).max(24_000).parse(text)
     const run = this.get(id)
+    requireThat(!run.flow, 'DIRECTOR_UNAVAILABLE', 'This project runs a flow without a director. Use retry, cancel or steer instead.')
     const prior = run.messages.find(m => m.id === messageId)
     if (prior) { requireThat(prior.text === text, 'MESSAGE_CONFLICT', 'This message id has different text.'); return }
     requireThat(run.directorId && this.deps.agent(run.directorId), 'DIRECTOR_UNAVAILABLE', 'The director is unavailable. Inspect its agent to reconnect.')
@@ -396,6 +471,7 @@ export class OrchestratorService {
   }
   private queueResult(run: Run, text: string): void {
     const message = this.message(run, 'system', text)
+    if (run.flow) return // No director: the result is part of the record, not a delivery.
     if (run.directorId) message.targetAgentId = run.directorId
     message.delivery = 'pending'
   }
@@ -457,6 +533,12 @@ export class OrchestratorService {
   }
   stop(): void {
     this.stopped = true
+    for (const { run, task, handle } of this.steps.values()) {
+      handle.stop()
+      task.state = 'failed'; task.error = 'Stopped with the daemon.'
+      this.save(run)
+    }
+    this.steps.clear()
     for (const id of this.dirty.keys()) this.save(this.runs.get(id)!)
   }
 }

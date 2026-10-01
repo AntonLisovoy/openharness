@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as filesystem from 'node:fs/promises'
 import * as privateState from '../lib/secureState.js'
 import { OrchestratorService, type OrchestratorDependencies } from './service.js'
-import { OrchestratorError, type Task } from './model.js'
+import { OrchestratorError, type Run, type Task } from './model.js'
+import type { StepSpawner } from './steps.js'
 import { orchestratorRequest } from './wire.js'
 
 vi.mock('node:fs/promises', async importOriginal => {
@@ -525,4 +527,139 @@ describe('durable orchestrator lifecycle', () => {
     service.complete(id, 'All 64 task results and pinned input contracts verified')
     expect(service.snapshot(id).state).toBe('completed')
   }, 30_000)
+})
+
+const sh: StepSpawner = (script, opts) => spawn('/bin/sh', ['-c', script], { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+
+describe('flow runs', () => {
+  let root: string, project: string, service: OrchestratorService, deps: OrchestratorDependencies
+  let launches: Parameters<OrchestratorDependencies['create']>[0][], agents: Set<string>, cancelled: string[]
+  const flowId = 'abcdefabcdefabcdefabcdefabcdef12'
+  const snap = () => service.snapshot(flowId) as unknown as Run & { tasks: Task[] }
+  const state = (taskId: string) => snap().tasks.find(t => t.id === taskId)!
+  const until = async (taskId: string, wanted: Task['state'], attempt?: number): Promise<Task> => {
+    await vi.waitFor(() => expect(state(taskId)).toMatchObject({ state: wanted, ...(attempt ? { attempt } : {}) }), { timeout: 5000 })
+    return state(taskId)
+  }
+  const startFlow = (source: string, inputs: Record<string, string> = {}) =>
+    service.start({ id: flowId, engine: 'claude', prompt: 'Flow demo', cwd: project, flow: { source, path: join(project, '.harness/flows/demo.yaml') }, inputs })
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'orchestrator-flow-')); project = join(root, 'project'); mkdirSync(project)
+    launches = []; agents = new Set(); cancelled = []
+    deps = {
+      stateDir: join(root, 'state'), workspaceDir: join(root, 'projects'), command: 'harness orchestrator', spawnStep: sh,
+      supportsEngine: e => e === 'claude' || e === 'codex',
+      catalog: () => [{ id: 'test/cad', name: 'cad', description: 'cad', engine: 'claude', viewer: true }],
+      create: async input => { launches.push(input); const agentId = `agent-${launches.length}`; agents.add(agentId); return { agentId } },
+      send: () => {}, cancel: agent => { cancelled.push(agent) },
+      agent: agent => agents.has(agent) ? {} : null,
+    }
+    service = new OrchestratorService(deps)
+  })
+  afterEach(() => { service.stop(); vi.useRealTimers(); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }) })
+
+  it('runs a pinned graph without a director and completes it', async () => {
+    const source = `spec: 1
+name: demo
+inputs: { word: { required: true } }
+tasks:
+  - { id: make, run: 'printf "%s" "$HARNESS_INPUT_WORD" > word.txt; echo "$HARNESS_PROJECT_DIR|$HARNESS_FLOW_DIR|$HARNESS_TASK_ID|$HARNESS_ATTEMPT"' }
+  - { id: check, run: 'cat inputs/make/stdout.log', depends_on: [make] }
+`
+    await startFlow(source, { word: '$(id)' })
+    const done = await vi.waitFor(() => { expect(snap().state).toBe('completed'); return snap() }, { timeout: 5000 })
+    expect(launches).toHaveLength(0)
+    expect(done).toMatchObject({ directorId: null, error: null, cwd: realpathSync(project), flow: { name: 'demo', inputs: { word: '$(id)' }, warnings: [] } })
+    expect(done.flow!.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(readFileSync(join(done.root, 'flow.yaml'), 'utf8')).toBe(source)
+    const make = done.tasks[0]
+    expect(make).toMatchObject({ state: 'succeeded', harness: 'run', pid: expect.any(Number), promptSha256: expect.stringMatching(/^[a-f0-9]{64}$/) })
+    expect(make.artifacts.map(a => a.path)).toEqual(['stdout.log', 'stderr.log'])
+    expect(readFileSync(join(make.cwd, 'word.txt'), 'utf8')).toBe('$(id)')
+    expect(done.tasks[1].summary).toContain(`${realpathSync(project)}|${join(project, '.harness/flows')}|make|1`)
+    expect(done.messages.every(m => m.delivery === undefined)).toBe(true)
+    expect(done.messages.at(-1)!.text).toBe('Flow demo completed: 2 tasks succeeded.')
+  })
+  it('uses the run root as the project folder when none was chosen, and says when a step printed nothing', async () => {
+    await service.start({ id: flowId, engine: 'claude', prompt: 'Flow demo', flow: { source: `spec: 1\nname: demo\ntasks: [{ id: a, run: 'test -f "$HARNESS_PROJECT_DIR/flow.yaml"' }]\n`, path: '/flows/demo.yaml' } })
+    expect(await until('a', 'succeeded')).toMatchObject({ summary: 'Exited 0.' })
+    expect(snap().cwd).toBeUndefined()
+  })
+  it('fails a step with its exit code and stops the flow with a readable error', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: bad, run: 'echo nope >&2; exit 4' }\n  - { id: after, run: 'true', depends_on: [bad] }\n`)
+    expect((await until('bad', 'failed')).error).toBe('exit 4: nope')
+    await until('after', 'blocked')
+    await vi.waitFor(() => expect(snap().error).toBe('Flow stopped: bad (failed), after (blocked). Retry a task or cancel the project.'))
+    expect(snap().state).toBe('active')
+    service.retry(flowId, 'bad')
+    await until('bad', 'failed', 2)
+  })
+  it('launches agent tasks on any supported engine and refuses director-only operations', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: a, harness: 'engine:codex', prompt: 'Write a.md', outputs: { files: [a.md] } }\n  - { id: b, harness: test/cad, prompt: 'Model it', timeout: 5m }\n`)
+    await until('a', 'running'); await until('b', 'running')
+    expect(launches.map(l => l.engine).sort()).toEqual(['claude', 'codex'])
+    expect(state('a')).toMatchObject({ engine: 'codex' })
+    expect(state('b')).toMatchObject({ engine: 'claude' })
+    expect(() => service.plan(flowId, [task('x')])).toThrow(expect.objectContaining({ code: 'FLOW_PINNED' }))
+    expect(() => service.chat(flowId, 'c'.repeat(32), 'hi')).toThrow(expect.objectContaining({ code: 'DIRECTOR_UNAVAILABLE' }))
+    service.cancel(flowId, 'b')
+    service.resume(flowId)
+    expect(snap().state).toBe('active')
+  })
+  it('validates the whole flow before creating anything', async () => {
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: missing/x, prompt: p }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE' })
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: "engine:gemini", prompt: p }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE' })
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, run: "echo $inputs.x" }]\n')).rejects.toMatchObject({ code: 'INVALID_FLOW' })
+    expect(existsSync(join(project, '.harness-projects'))).toBe(false)
+  })
+  it('keeps flow-only fields away from director plans', async () => {
+    await service.start({ id, engine: 'claude', prompt: 'Make something' })
+    await vi.waitFor(() => expect(service.snapshot(id).state).toBe('active'))
+    for (const extra of [{ run: 'rm -rf ~' }, { outputs: { files: ['x'] } }, { timeoutMs: 1000 }, { retry: { maxAttempts: 1 } }]) {
+      expect(() => service.plan(id, [{ ...task('a', [], 'test/cad'), ...extra }])).toThrow(expect.objectContaining({ code: 'FLOW_ONLY' }))
+    }
+    expect(() => service.plan(id, [task('a', [], 'engine:codex')])).toThrow(expect.objectContaining({ code: 'HARNESS_UNAVAILABLE' }))
+  })
+  it('stops a running step on cancel without recording a result', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'sleep 30' }]\n`)
+    await until('slow', 'running')
+    const exited = (service as unknown as { steps: Map<string, { handle: { done: Promise<unknown> } }> }).steps.values().next().value!.handle.done
+    service.cancel(flowId)
+    await exited
+    expect(state('slow')).toMatchObject({ state: 'cancelled', artifacts: [] })
+  })
+  it('records a step whose shell could not start', async () => {
+    deps.spawnStep = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }) }
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true' }]\n`)
+    expect(await until('a', 'failed')).toMatchObject({ error: 'the shell could not be found (ENOENT)' })
+    expect(state('a').pid).toBeUndefined()
+  })
+  it('records steps it stopped on a graceful daemon stop', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'sleep 30' }]\n`)
+    await until('slow', 'running')
+    service.stop()
+    const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
+    expect(saved.tasks[0]).toMatchObject({ state: 'failed', error: 'Stopped with the daemon.' })
+  })
+  it('warns and leaves the step open when its result cannot be saved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(filesystem.rename).mockRejectedValueOnce(new Error('disk full'))
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true' }]\n`)
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] a attempt 1: disk full'), { timeout: 5000 })
+    expect(state('a').state).toBe('running')
+    service.cancel(flowId)
+  })
+  it('waits for an explicit finish that fails, then settles the step itself', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'sleep 0.3' }]\n`)
+    await until('a', 'running')
+    const exited = (service as unknown as { steps: Map<string, { handle: { done: Promise<unknown> } }> }).steps.values().next().value!.handle.done
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    vi.mocked(filesystem.rename).mockImplementationOnce(async () => { await gate; throw new Error('disk full') })
+    const explicit = service.finish(flowId, 'a', 1, 'by hand', ['stdout.log']).catch((error: Error) => error)
+    await exited
+    release()
+    expect(await explicit).toMatchObject({ message: 'disk full' })
+    await until('a', 'succeeded')
+  })
 })
