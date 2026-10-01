@@ -1,8 +1,7 @@
 // cli/src/orchestrator/flow.spec.ts
 import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
-import { z } from 'zod'
-import { FlowError, FlowFile, compileFlow, inputEnvName, parseFlowSource, RUN_STEP_DEFAULT_TIMEOUT_MS } from './flow.js'
+import { FlowError, compileFlow, flowJsonSchema, inputEnvName, parseFlowSource, RUN_STEP_DEFAULT_TIMEOUT_MS } from './flow.js'
 
 const launch = `spec: 1
 name: product-launch
@@ -133,6 +132,20 @@ describe('published flow schema', () => {
     const { $id, title, ...rest } = file
     expect($id).toBe('https://harness.autonomous.ai/dsh/spec/1/flow.schema.json')
     expect(title).toBe('Orchestrator flow (.harness/flows/*.yaml), spec 1')
-    expect(rest).toEqual(z.toJSONSchema(FlowFile, { io: 'input' }))
+    expect(rest).toEqual(flowJsonSchema())
+  })
+  it('says a task is either a shell step or an agent task', () => {
+    const items = (flowJsonSchema() as { properties: { tasks: { items: Record<string, unknown> } } }).properties.tasks.items
+    expect(items.oneOf).toEqual([
+      expect.objectContaining({ required: ['id', 'run'], not: { anyOf: [{ required: ['harness'] }, { required: ['prompt'] }, { required: ['outputs'] }] } }),
+      expect.objectContaining({ required: ['id', 'harness', 'prompt'], not: { required: ['run'] } }),
+    ])
+  })
+  it.each([
+    ['no action', '{ id: a }', 'needs harness and prompt'],
+    ['run with agent fields', '{ id: a, run: "true", harness: engine:claude, prompt: p }', 'not both'],
+    ['run with outputs', '{ id: a, run: "true", outputs: { files: [x] } }', 'outputs apply to agent tasks'],
+  ])('rejects a task with %s, as the schema does', (_name, item, expected) => {
+    expect(issues(() => compile(`spec: 1\nname: x\ntasks: [${item}]\n`))).toContain(expected)
   })
 })
