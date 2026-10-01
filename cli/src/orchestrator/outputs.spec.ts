@@ -1,8 +1,19 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+  return {
+    ...actual,
+    lstat: vi.fn(actual.lstat),
+    readFile: vi.fn(actual.readFile),
+  }
+})
+
 import { checkOutputs, globToRegExp } from './outputs.js'
+import * as fsp from 'node:fs/promises'
 
 describe('output globs', () => {
   it.each([
@@ -40,11 +51,44 @@ describe('checkOutputs', () => {
     symlinkSync(join(cwd, 'elsewhere.json'), join(cwd, '.harness/verdict.json'))
     expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false })
   })
+  it('rejects .harness as a symlink to an outside folder', async () => {
+    write('a.step')
+    rmSync(join(cwd, '.harness'), { recursive: true, force: true })
+    const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'verdict.json'), JSON.stringify({ spec: 1, ready: true }))
+    symlinkSync(outside, join(cwd, '.harness'))
+    expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false })
+    rmSync(outside, { recursive: true, force: true })
+  })
+  it('rejects verdict when readFile fails', async () => {
+    write('a.step')
+    write('.harness/verdict.json', JSON.stringify({ spec: 1, ready: true }))
+    const readFileMock = fsp.readFile as any
+    readFileMock.mockRejectedValueOnce(new Error('read failed'))
+    expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false, missing: ['.harness/verdict.json with ready: true'] })
+    vi.restoreAllMocks()
+  })
+  it('rejects verdict when read text exceeds size bound', async () => {
+    write('a.step')
+    write('.harness/verdict.json', JSON.stringify({ spec: 1, ready: true }))
+    const readFileMock = fsp.readFile as any
+    readFileMock.mockResolvedValueOnce('x'.repeat(1024 * 1024 + 1))
+    expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false, missing: ['.harness/verdict.json with ready: true'] })
+    vi.restoreAllMocks()
+  })
+  it('rejects verdict when second lstat fails on verdict file', async () => {
+    write('a.step')
+    write('.harness/verdict.json', JSON.stringify({ spec: 1, ready: true }))
+    const lstatMock = fsp.lstat as any
+    lstatMock.mockResolvedValueOnce({ isDirectory: () => true }).mockRejectedValueOnce(new Error('permission denied'))
+    expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false, missing: ['.harness/verdict.json with ready: true'] })
+    vi.restoreAllMocks()
+  })
   it('ignores upstream inputs and symlinks', async () => {
     write('inputs/part/a.step')
+    write('real/a.step')
     const outside = mkdtempSync(join(tmpdir(), 'outside-')); writeFileSync(join(outside, 'b.step'), 'x')
     symlinkSync(join(outside, 'b.step'), join(cwd, 'b.step')); symlinkSync(outside, join(cwd, 'linked'))
-    expect(await checkOutputs(cwd, { files: ['**/*.step'] })).toEqual({ ok: false, missing: ['**/*.step'] })
+    expect(await checkOutputs(cwd, { files: ['**/*.step'] })).toEqual({ ok: true, files: ['real/a.step'] })
     rmSync(outside, { recursive: true, force: true })
   })
   it('bounds the walk and the number of matches', async () => {
