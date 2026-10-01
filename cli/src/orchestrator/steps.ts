@@ -4,14 +4,17 @@ import { createWriteStream } from 'node:fs'
 import { basename, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { Readable } from 'node:stream'
-import { killPidGroup, spawnDshCommand } from '../dsh/shell.js'
+import { killPidGroup, signalPidGroup, spawnDshCommand } from '../dsh/shell.js'
 
 export type StepSpawner = (script: string, opts: { cwd: string; env: Record<string, string> }) => ChildProcess
 /** `started` is false when the shell itself could not start: a launch error, never retried automatically. */
 export interface StepResult { code: number | null; signal: NodeJS.Signals | null; error: string | null; started: boolean; stdoutTail: string; stderrTail: string }
-export interface StepHandle { pid: number | undefined; done: Promise<StepResult>; stop(): void }
+/** `done` resolves once the step's whole process group is gone; `stop({ now: true })` skips the grace period (daemon exit). */
+export interface StepHandle { pid: number | undefined; done: Promise<StepResult>; stop(options?: { now?: boolean }): void }
 export const STEP_LOG_LIMIT = 8 * 1024 * 1024
 const TAIL = 2000
+// How long after the SIGKILL a group may take to disappear before the step reports it could not confirm that.
+const KILL_SETTLE_MS = 2000
 
 function describe(error: unknown): string {
   const code = (error as NodeJS.ErrnoException).code
@@ -46,6 +49,15 @@ function capture(stream: Readable | null, file: string, onFail: (message: string
   }
 }
 
+/** True once no process of the group is left; false if one still is (or cannot be checked) at the deadline. */
+async function groupGone(pid: number, until: number): Promise<boolean> {
+  for (;;) {
+    try { process.kill(-pid, 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true }
+    if (Date.now() >= until) return false
+    await new Promise(r => setTimeout(r, 50).unref())
+  }
+}
+
 /** Run a flow's shell step in its task folder and its own process group, output streamed to files. */
 export function startStep(script: string, opts: { cwd: string; env: Record<string, string>; spawn?: StepSpawner; graceMs?: number }): StepHandle {
   const spawner = opts.spawn ?? ((s, o) => spawnDshCommand(s, o))
@@ -55,9 +67,14 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
   catch (error) {
     return { pid: undefined, stop: () => {}, done: Promise.resolve({ code: 127, signal: null, error: describe(error), started: false, stdoutTail: '', stderrTail: '' }) }
   }
-  let error: string | null = null, killing = false
+  let error: string | null = null, giveUpAt: number | undefined
   // killPidGroup's SIGKILL is not tied to the leader: descendants that ignore SIGTERM still go.
-  const stop = (): void => { if (child.pid !== undefined && !killing) { killing = true; killPidGroup(child.pid, graceMs) } }
+  const stop = ({ now = false } = {}): void => {
+    if (child.pid === undefined) return
+    if (now) signalPidGroup(child.pid, 'SIGKILL')
+    else if (giveUpAt === undefined) killPidGroup(child.pid, graceMs)
+    giveUpAt ??= Date.now() + graceMs + KILL_SETTLE_MS
+  }
   const failed = (message: string): void => { error ??= message; stop() }
   const stdout = capture(child.stdout, join(opts.cwd, 'stdout.log'), failed)
   const stderr = capture(child.stderr, join(opts.cwd, 'stderr.log'), failed)
@@ -71,6 +88,8 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
       await Promise.race([closed, new Promise(r => setTimeout(r, graceMs).unref())])
       child.stdout?.destroy(); child.stderr?.destroy()
       await Promise.all([stdout.close(), stderr.close()])
+      // Ended only when nothing of it is left: its owner may start a retry or exit next.
+      if (child.pid !== undefined && !await groupGone(child.pid, giveUpAt!)) error ??= 'processes it started could not be confirmed stopped'
       resolve({ code: error && code === null ? 127 : code, signal, error, started: child.pid !== undefined, stdoutTail: stdout.tail(), stderrTail: stderr.tail() })
     }
     child.on('error', e => { error ??= describe(e); if (child.pid === undefined) void finish(null, null) })
