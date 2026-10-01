@@ -10,7 +10,7 @@ import { materializeInputs, snapshotArtifacts } from './artifacts.js'
 import { compileFlow, inputEnvName, parseFlowSource } from './flow.js'
 import { checkOutputs } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
-import { directorPrompt, workerPrompt, type HarnessChoice } from './prompts.js'
+import { directorPrompt, durationLabel, workerPrompt, type HarnessChoice } from './prompts.js'
 import { startStep, stepFailure, type StepHandle, type StepSpawner } from './steps.js'
 
 export interface AgentRuntime {
@@ -402,9 +402,7 @@ export class OrchestratorService {
   private async expire(run: Run, task: Task, attempt: number): Promise<void> {
     // Captured first: once the timeout wins, a retry may already have reset the task.
     const agentId = task.agentId, step = this.steps.get(this.attemptKey(run, task, attempt))
-    const ms = task.timeoutMs!, unit = ms % 3_600_000 === 0 ? 'h' : ms % 60_000 === 0 ? 'm' : 's'
-    const label = `${ms / { h: 3_600_000, m: 60_000, s: 1000 }[unit]}${unit}`
-    if (!await this.settleAuto(run, task, attempt, { failed: `Timed out after ${label}.` })) return
+    if (!await this.settleAuto(run, task, attempt, { failed: `Timed out after ${durationLabel(task.timeoutMs!)}.` })) return
     step?.handle.stop()
     if (agentId) this.deps.cancel(agentId)
   }
