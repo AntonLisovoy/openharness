@@ -10,7 +10,7 @@ import { orchestratorRequest } from './wire.js'
 
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return { ...actual, rm: vi.fn(actual.rm) }
+  return { ...actual, rm: vi.fn(actual.rm), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile) }
 })
 
 const id = '0123456789abcdef0123456789abcdef'
@@ -48,6 +48,17 @@ describe('durable orchestrator lifecycle', () => {
     expect(launches[0].prompt.length).toBeLessThan(2000)
     expect(readFileSync(join(launches[0].cwd, 'ORCHESTRATOR.md'), 'utf8')).toContain('test/blender')
     await expect(service.start({ id, engine: 'claude', prompt: 'Different' })).rejects.toMatchObject({ code: 'PROJECT_CONFLICT' })
+  })
+  it('does not mark a task succeeded when it is cancelled while its artifacts are being saved', async () => {
+    await start(); await active()
+    service.plan(id, [task('part')])
+    const part = await running('part')
+    writeFileSync(join(part.cwd, 'part.step'), 'cad')
+    const realRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename
+    vi.mocked(filesystem.rename).mockImplementationOnce(async (from, to) => { service.cancel(id, 'part'); return realRename(from, to) })
+    await expect(service.finish(id, 'part', 1, 'done', ['part.step'])).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    expect(tasks()[0].state).toBe('cancelled')
+    expect(service.snapshot(id).state).toBe('active')
   })
   it('validates every dependency and harness before launching any task', async () => {
     await start(); await active()
