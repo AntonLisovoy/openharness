@@ -962,6 +962,23 @@ tasks:
     expect(cancelled).toEqual([state('agent').agentId])
     recovered.stop()
   })
+  it('enforces recovered deadlines only once recover() says the daemon is ready, not on an early lookup', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p', timeout: '1h' }))
+    const a = await until('a', 'running')
+    service.stop()
+    const file = join(deps.stateDir, `${flowId}.json`), saved = JSON.parse(readFileSync(file, 'utf8'))
+    saved.tasks[0].deadline = Date.now() - 1
+    writeFileSync(file, JSON.stringify(saved))
+    service = new OrchestratorService(deps)
+    expect(service.roleOf(a.agentId!)).toEqual({ role: 'worker' }) // the daemon asks this while it is still starting
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(internals().deadlines.size).toBe(0)
+    expect(state('a').state).toBe('running')
+    expect(cancelled).toEqual([])
+    service.recover()
+    await vi.waitFor(() => expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
+    expect(cancelled).toEqual([a.agentId])
+  })
   it('recovers nothing twice and leaves deadlines of inactive projects alone', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: agent, harness: test/cad, prompt: p, timeout: 1h }]\n`)
     await until('agent', 'running')
@@ -982,6 +999,7 @@ tasks:
     saved.state = 'paused'; saved.tasks[0].deadline = Date.now() - 1
     writeFileSync(file, JSON.stringify(saved))
     service = new OrchestratorService(deps)
+    service.recover()
     expect(snap().state).toBe('paused')
     expect(internals().deadlines.size).toBe(0)
     service.resume(flowId)
@@ -1015,7 +1033,7 @@ tasks:
   it('clears pending deadlines and retries when the daemon stops', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
     await until('a', 'running')
-    service.resume(flowId) // an armed deadline is not armed twice
+    service.recover(); service.resume(flowId) // an armed deadline is not armed twice
     expect(internals().deadlines.size).toBe(1)
     service.stop()
     expect(internals().deadlines.size).toBe(0)
