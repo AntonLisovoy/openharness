@@ -129,7 +129,48 @@
         "required": [
           "id"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "description": "A shell step: run, without harness, prompt or outputs.",
+            "required": [
+              "id",
+              "run"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "harness"
+                  ]
+                },
+                {
+                  "required": [
+                    "prompt"
+                  ]
+                },
+                {
+                  "required": [
+                    "outputs"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "description": "An agent task: harness and prompt, without run.",
+            "required": [
+              "id",
+              "harness",
+              "prompt"
+            ],
+            "not": {
+              "required": [
+                "run"
+              ]
+            }
+          }
+        ]
       }
     }
   },

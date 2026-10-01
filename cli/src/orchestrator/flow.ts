@@ -36,6 +36,19 @@ export const FlowFile = z.strictObject({
   tasks: z.array(FlowTask).min(1).max(64),
 })
 export type FlowFile = z.infer<typeof FlowFile>
+/**
+ * The published `flow.schema.json` (without `$id`/`title`). The zod schema stays per field for friendly messages;
+ * the task alternatives that compileFlow enforces are stated here for editors and other readers.
+ */
+export function flowJsonSchema(): Record<string, unknown> {
+  const schema: Record<string, unknown> = z.toJSONSchema(FlowFile, { io: 'input' })
+  const task = (schema.properties as { tasks: { items: Record<string, unknown> } }).tasks.items
+  task.oneOf = [
+    { description: 'A shell step: run, without harness, prompt or outputs.', required: ['id', 'run'], not: { anyOf: [{ required: ['harness'] }, { required: ['prompt'] }, { required: ['outputs'] }] } },
+    { description: 'An agent task: harness and prompt, without run.', required: ['id', 'harness', 'prompt'], not: { required: ['run'] } },
+  ]
+  return schema
+}
 export interface FlowIssue { path: string; message: string; line?: number; col?: number }
 export interface ParsedFlow {
   flow: FlowFile; sha256: string; file: string
