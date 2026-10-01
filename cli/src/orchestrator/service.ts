@@ -498,7 +498,8 @@ export class OrchestratorService {
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
     const tasks = taskId ? [this.task(run, taskId)] : run.tasks
-    if (!taskId) { run.state = 'cancelled'; run.directorWorking = false }
+    // A flow's error only advises what to do next; nothing is left to do once the whole project is cancelled.
+    if (!taskId) { run.state = 'cancelled'; run.directorWorking = false; if (run.flow) run.error = null }
     const agents: string[] = []
     for (const task of tasks) {
       // Also for a failed task: its due retry is dropped.
