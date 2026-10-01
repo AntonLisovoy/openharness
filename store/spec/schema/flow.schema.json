@@ -73,7 +73,8 @@
           "run": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 24000
+            "maxLength": 24000,
+            "description": "Shell command, run in the task folder in its own process group. Exit 0 is success. Inputs are in HARNESS_INPUT_<NAME>; $inputs is not substituted here."
           },
           "outputs": {
             "type": "object",
@@ -97,11 +98,13 @@
             "required": [
               "files"
             ],
-            "additionalProperties": false
+            "additionalProperties": false,
+            "description": "Agent tasks: when the worker ends a turn and every glob matches a file in the task folder (and .harness/verdict.json says ready, if asked), the task finishes."
           },
           "timeout": {
             "type": "string",
-            "pattern": "^[1-9][0-9]{0,5}[smh]$"
+            "pattern": "^[1-9][0-9]{0,5}[smh]$",
+            "description": "Limit for one attempt, at most 24h. Shell steps default to 10m; agent tasks have no default."
           },
           "retry": {
             "type": "object",
@@ -109,13 +112,14 @@
               "max_attempts": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 5
+                "maximum": 6
               }
             },
             "required": [
               "max_attempts"
             ],
-            "additionalProperties": false
+            "additionalProperties": false,
+            "description": "Automatic retries: max_attempts is the number of attempts in all, the first attempt included. Without retry a failed task is not run again automatically."
           },
           "depends_on": {
             "maxItems": 32,

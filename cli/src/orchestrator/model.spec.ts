@@ -26,6 +26,6 @@ describe('model compatibility', () => {
       .toEqual({ files: ['*.step'], verdict: 'ready' })
     expect(StartSpec.parse({ id: legacyRun.id, prompt: 'Flow x', engine: 'claude', flow: { source: 'spec: 1', path: '/p/x.yaml' }, inputs: { a: '1' } }))
       .toMatchObject({ flow: { path: '/p/x.yaml' }, inputs: { a: '1' } })
-    expect(() => TaskSpec.parse({ id: 'x', title: 'x', harness: 'run', prompt: 'p', retry: { maxAttempts: 6 } })).toThrow()
+    expect(() => TaskSpec.parse({ id: 'x', title: 'x', harness: 'run', prompt: 'p', retry: { maxAttempts: 7 } })).toThrow()
   })
 })
