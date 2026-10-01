@@ -15,6 +15,13 @@ vi.mock('node:fs/promises', async importOriginal => {
   return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile) }
 })
 
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, writeFileSync: vi.fn(actual.writeFileSync) }
+})
+import * as fs from 'node:fs'
+const diskFull = () => vi.mocked(fs.writeFileSync).mockImplementation(() => { throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }) })
+
 vi.mock('./outputs.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./outputs.js')>()
   return { ...actual, checkOutputs: vi.fn(actual.checkOutputs) }
@@ -572,6 +579,7 @@ describe('flow runs', () => {
   })
   const leftovers: number[] = []
   afterEach(() => {
+    vi.mocked(fs.writeFileSync).mockReset() // back to the real write
     service.stop(); vi.useRealTimers(); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true })
     for (const pid of leftovers.splice(0)) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
   })
@@ -666,6 +674,23 @@ tasks:
     await vi.waitFor(() => expect(snap().error).toBe('Flow stopped: a (failed). Retry a task or cancel the project.'))
     expect(state('a').attempt).toBe(1)
     expect(spawner).toHaveBeenCalledTimes(1)
+  })
+  it('stops the process and the agent on cancel even when the state cannot be saved', async () => {
+    await startFlow(steps({ id: 's', run: 'sleep 30' }, { id: 'a', harness: 'test/cad', prompt: 'p' }))
+    const pid = (await until('s', 'running')).pid!, agent = (await until('a', 'running')).agentId
+    diskFull()
+    expect(() => service.cancel(flowId)).toThrow(/ENOSPC/)
+    expect(cancelled).toEqual([agent])
+    await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 2000 })
+  })
+  it('stops every step on a daemon stop even when saving fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(steps({ id: 's1', run: 'sleep 30' }, { id: 's2', run: 'sleep 30' }))
+    const pids = [(await until('s1', 'running')).pid!, (await until('s2', 'running')).pid!]
+    diskFull()
+    expect(() => service.stop()).not.toThrow()
+    expect(warn).toHaveBeenCalledWith(`[orchestrator] could not save ${flowId}: ENOSPC: no space left on device, write`)
+    await vi.waitFor(() => expect(pids.filter(alive)).toEqual([]), { timeout: 2000 })
   })
   it('records steps it stopped on a graceful daemon stop', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'sleep 30' }]\n`)
