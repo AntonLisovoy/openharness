@@ -15,6 +15,12 @@ vi.mock('node:fs/promises', async importOriginal => {
   return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile) }
 })
 
+vi.mock('./outputs.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./outputs.js')>()
+  return { ...actual, checkOutputs: vi.fn(actual.checkOutputs) }
+})
+import * as outputsModule from './outputs.js'
+
 const id = '0123456789abcdef0123456789abcdef'
 const task = (id: string, dependsOn: string[] = [], harness = 'test/cad') => ({ id, title: id, harness, prompt: `Build ${id} and verify it`, dependsOn })
 describe('durable orchestrator lifecycle', () => {
@@ -702,5 +708,54 @@ tasks:
     service.stop()
     const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
     expect(saved.tasks[0]).toMatchObject({ state: 'cancelled' })
+  })
+
+  it('finishes an agent task when its turn ends with the declared outputs', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: part, harness: test/cad, prompt: 'Model it', outputs: { files: ['*.step'], verdict: ready } }\n  - { id: check, run: 'cat inputs/part/part.step', depends_on: [part] }\n`)
+    const part = await until('part', 'running')
+    const end = (payload?: Record<string, unknown>, extra: Record<string, unknown> = {}) => service.ingest({ type: 'turn_ended', agentId: part.agentId, payload, ...extra })
+    end() // no payload at all
+    await vi.waitFor(() => expect(snap().messages.at(-1)!.text).toBe('Task part attempt 1: turn ended. Outputs missing: *.step, .harness/verdict.json with ready: true'))
+    writeFileSync(join(part.cwd, 'part.step'), 'cad v1')
+    mkdirSync(join(part.cwd, '.harness')); writeFileSync(join(part.cwd, '.harness/verdict.json'), JSON.stringify({ spec: 1, ready: true }))
+    const checks = vi.mocked(outputsModule.checkOutputs).mock.calls.length
+    end({ aborted: true }); end({}, { replay: true }); service.ingest({ type: 'text_delta', agentId: part.agentId, payload: { content: 'x' } })
+    expect(vi.mocked(outputsModule.checkOutputs).mock.calls.length).toBe(checks) // none of these is a finished turn
+    end({}); end({}) // a duplicate end is harmless
+    await until('part', 'succeeded')
+    expect(state('part')).toMatchObject({ summary: 'Outputs present: part.step', artifacts: [expect.objectContaining({ path: 'part.step' })] })
+    await vi.waitFor(() => expect(snap().state).toBe('completed'))
+  })
+  it('leaves explicit finish working and ignores turns of tasks without outputs', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: note, harness: test/cad, prompt: 'Write', timeout: 1h }\n`)
+    const note = await until('note', 'running')
+    const checks = vi.mocked(outputsModule.checkOutputs).mock.calls.length
+    service.ingest({ type: 'turn_ended', agentId: note.agentId, payload: {} })
+    expect(vi.mocked(outputsModule.checkOutputs).mock.calls.length).toBe(checks)
+    await service.finish(flowId, 'note', 1, 'Done by hand', [])
+    expect(state('note').state).toBe('succeeded')
+  })
+  it('keeps the task running when an output changes while it is saved', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: part, harness: test/cad, prompt: 'Model it', outputs: { files: ['*.step'] } }\n`)
+    const part = await until('part', 'running')
+    writeFileSync(join(part.cwd, 'part.step'), 'v1')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const realCopy = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).copyFile
+    vi.mocked(filesystem.copyFile).mockImplementationOnce(async (from, to) => { await realCopy(from, to); writeFileSync(join(part.cwd, 'part.step'), 'v2, still writing') })
+    service.ingest({ type: 'turn_ended', agentId: part.agentId, payload: {} })
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith(expect.stringContaining('changed during handoff')))
+    expect(state('part').state).toBe('running')
+  })
+  it('logs, and keeps the task running, when the outputs cannot be checked', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: part, harness: test/cad, prompt: 'Model it', outputs: { files: ['*.step'] } }\n`)
+    const part = await until('part', 'running')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(outputsModule.checkOutputs).mockRejectedValueOnce(new OrchestratorError('OUTPUTS_TOO_LARGE', 'too many'))
+    service.ingest({ type: 'turn_ended', agentId: part.agentId, payload: {} })
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] part attempt 1: too many'))
+    vi.mocked(outputsModule.checkOutputs).mockRejectedValueOnce('boom')
+    service.ingest({ type: 'turn_ended', agentId: part.agentId, payload: {} })
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] part attempt 1: outputs not checked'))
+    expect(state('part').state).toBe('running')
   })
 })

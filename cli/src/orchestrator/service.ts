@@ -8,6 +8,7 @@ import { readPrivateStateFile, secureStateDirectory } from '../lib/secureState.j
 import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
 import { compileFlow, inputEnvName, parseFlowSource } from './flow.js'
+import { checkOutputs } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Task } from './model.js'
 import { directorPrompt, workerPrompt, type HarnessChoice } from './prompts.js'
 import { startStep, stepFailure, type StepHandle, type StepSpawner } from './steps.js'
@@ -515,9 +516,34 @@ export class OrchestratorService {
       this.changed(run, false)
     })
   }
+  /** A worker's ended turn is a cue to look for declared outputs; it is never itself evidence of success. */
+  private workerTurnEnded(frame: { agentId?: unknown; payload?: unknown }): boolean {
+    for (const run of this.runs.values()) {
+      const task = run.tasks.find(t => t.agentId === frame.agentId)
+      if (!task) continue
+      const aborted = (frame.payload as { aborted?: unknown } | undefined)?.aborted === true
+      if (run.flow && task.outputs && !aborted && task.state === 'running' && run.state === 'active') void this.autoFinish(run, task, task.attempt)
+      return true
+    }
+    return false
+  }
+  private async autoFinish(run: Run, task: Task, attempt: number): Promise<void> {
+    try {
+      const check = await checkOutputs(task.cwd, task.outputs!)
+      if (!check.ok) {
+        this.message(run, 'system', `Task ${task.id} attempt ${attempt}: turn ended. Outputs missing: ${check.missing.join(', ')}`)
+        this.changed(run, false)
+        return
+      }
+      await this.settleAuto(run, task, attempt, { summary: `Outputs present: ${check.files.join(', ')}`.slice(0, 12_000), paths: check.files })
+    } catch (error) {
+      console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${error instanceof Error ? error.message : 'outputs not checked'}`)
+    }
+  }
   ingest(frame: { type?: unknown; agentId?: unknown; payload?: unknown; replay?: unknown }): void {
     if (this.stopped) return
     this.load()
+    if (frame.type === 'turn_ended' && frame.replay !== true && this.workerTurnEnded(frame)) return
     const run = [...this.runs.values()].find(r => r.directorId === frame.agentId)
     if (!run || frame.replay === true) return
     const payload = (frame.payload ?? {}) as Record<string, unknown>
