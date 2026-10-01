@@ -1,6 +1,6 @@
 // cli/src/orchestrator/flow.ts
 import { createHash } from 'node:crypto'
-import { LineCounter, isAlias, isCollection, isScalar, parseDocument, visit, type Document } from 'yaml'
+import { LineCounter, isAlias, isCollection, isPair, isScalar, parseDocument, visit, type Document } from 'yaml'
 import { z } from 'zod'
 import { OrchestratorError, TaskId, TaskSpec, validatePlan } from './model.js'
 
@@ -61,7 +61,9 @@ export function parseFlowSource(source: string, file: string): ParsedFlow {
   const issues: FlowIssue[] = doc.errors.map(e => ({ path: '', message: e.message.split('\n')[0], ...e.linePos?.[0] }))
   visit(doc, (_key, node) => {
     const at = (offset = 0): { line: number; col: number } => lines.linePos(offset)
-    if (isAlias(node)) issues.push({ path: '', message: 'Aliases are not allowed in a flow.', ...at(node.range?.[0]) })
+    // toJS() would stringify (and warn with) a collection key's content, which may be a secret.
+    if (isPair(node) && !isScalar(node.key)) issues.push({ path: '', message: 'Keys must be plain names.', ...at((node.key as { range?: [number, number, number] } | null)?.range?.[0]) })
+    else if (isAlias(node)) issues.push({ path: '', message: 'Aliases are not allowed in a flow.', ...at(node.range?.[0]) })
     else if (isScalar(node) || isCollection(node)) {
       if (node.anchor) issues.push({ path: '', message: 'Anchors are not allowed in a flow.', ...at(node.range?.[0]) })
       if (node.tag) issues.push({ path: '', message: 'Tags are not allowed in a flow.', ...at(node.range?.[0]) })
@@ -77,7 +79,8 @@ export function parseFlowSource(source: string, file: string): ParsedFlow {
   if (!parsed.success) for (const issue of parsed.error.issues) {
     // `approval` already has its own message; other unknown keys next to it are still reported.
     if (issue.code === 'unrecognized_keys') {
-      const keys = issue.keys.filter(key => key !== 'approval')
+      const isTask = issue.path.length === 2 && issue.path[0] === 'tasks'
+      const keys = isTask ? issue.keys.filter(key => key !== 'approval') : issue.keys
       if (keys.length) issues.push({ path: pathText(issue.path), message: `Unknown keys: ${keys.join(', ')}`, ...locate(doc, lines, [...issue.path, keys[0]]) })
     } else issues.push({ path: pathText(issue.path), message: issue.message, ...locate(doc, lines, issue.path) })
   }

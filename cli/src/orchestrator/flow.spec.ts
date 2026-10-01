@@ -1,5 +1,5 @@
 // cli/src/orchestrator/flow.spec.ts
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { FlowError, compileFlow, inputEnvName, parseFlowSource, RUN_STEP_DEFAULT_TIMEOUT_MS } from './flow.js'
 
 const launch = `spec: 1
@@ -106,5 +106,21 @@ tasks:
     expect(message).toContain('Unknown dependency: ghost')
     expect(message).toContain('needs harness and prompt')
     expect(issues(() => parseFlowSource('spec: 1\nname: x\ntasks: [{ id: a, approval: ok, when: x }]\n', 'f.yaml'))).toMatch(/Approval steps are not supported yet[\s\S]*Unknown keys: when/)
+  })
+  it('never echoes values through conversion warnings and rejects non-plain keys', () => {
+    const secret = 'SECRET_VALUE_123'
+    const warn = vi.spyOn(process, 'emitWarning').mockImplementation(() => undefined)
+    const log = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const message = issues(() => parseFlowSource(`spec: 1\nname: x\ninputs:\n  key:\n    default: { { ${secret}: x }: y }\ntasks: [{ id: a, run: "true" }]\n`, 'flow.yaml'))
+      expect(message).toContain('Keys must be plain names.')
+      expect(message).toContain('flow.yaml:5:')
+      expect(message).not.toContain(secret)
+      expect(JSON.stringify([...warn.mock.calls, ...log.mock.calls])).not.toContain(secret)
+    } finally { warn.mockRestore(); log.mockRestore() }
+  })
+  it('reports approval outside a task as an ordinary unknown key', () => {
+    expect(issues(() => parseFlowSource('spec: 1\nname: x\napproval: x\ntasks: [{ id: a, run: "true" }]\n', 'flow.yaml'))).toMatch(/flow\.yaml:3:.*Unknown keys: approval/)
+    expect(issues(() => parseFlowSource('spec: 1\nname: x\ninputs: { key: { approval: x } }\ntasks: [{ id: a, run: "true" }]\n', 'flow.yaml'))).toMatch(/flow\.yaml:3:.*Unknown keys: approval/)
   })
 })
