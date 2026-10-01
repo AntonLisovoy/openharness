@@ -7,7 +7,7 @@ import { env } from '../config/env.js'
 import { readAuthSession } from '../lib/authSession.js'
 import { installedHarnessCatalog, orchestratorEngineSupported } from './catalog.js'
 import { compileFlow, FlowError, parseFlowSource, type FlowIssue } from './flow.js'
-import { OrchestratorError } from './model.js'
+import { OrchestratorError, StartSpec } from './model.js'
 import type { HarnessChoice } from './prompts.js'
 
 export function localOrchestratorRequest(port: number, machineId: string, payload: Record<string, unknown>, timeoutMs = 30_000): Promise<Record<string, unknown>> {
@@ -173,17 +173,20 @@ export async function flowRunCommand(argv: readonly string[], overrides: Partial
     const warnings = [...compiled.warnings]
     if (located.byName && compiled.name !== basename(located.path, extname(located.path))) warnings.push(`${basename(located.path)} declares name ${compiled.name}.`)
     for (const warning of warnings) io.err(`warning: ${warning}\n`)
+    const start = {
+      id: randomBytes(16).toString('hex'), engine, cwd, bypassPermission: args.bypassPermission,
+      prompt: compiled.description ? `${compiled.name}: ${compiled.description}` : `Flow ${compiled.name}`,
+      ...(args.parallelism !== undefined ? { parallelism: args.parallelism } : {}),
+      flow: { source, path: located.path }, inputs: args.inputs,
+    }
+    const checked = StartSpec.safeParse(start)
+    if (!checked.success) throw new Error(`The daemon would refuse this run:\n${checked.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('\n')}`)
     if (args.dryRun) {
       io.out(`${JSON.stringify({ flow: { name: compiled.name, path: located.path, sha256: parsed.sha256 }, engine, inputs: compiled.inputs, warnings, tasks: compiled.tasks }, null, 2)}\n`)
       return 0
     }
     const { port, machineId } = daemonTarget(args.port, args.machine)
-    const reply = await io.request(port, machineId, {
-      action: 'start', id: randomBytes(16).toString('hex'), engine, cwd, bypassPermission: args.bypassPermission,
-      prompt: compiled.description ? `${compiled.name}: ${compiled.description}` : `Flow ${compiled.name}`,
-      ...(args.parallelism !== undefined ? { parallelism: args.parallelism } : {}),
-      flow: { source, path: located.path }, inputs: args.inputs,
-    })
+    const reply = await io.request(port, machineId, { action: 'start', ...start })
     io.out(`${JSON.stringify(summarizeOrchestratorReply(reply), null, 2)}\n`)
     return reply.error ? 1 : 0
   } catch (error) {

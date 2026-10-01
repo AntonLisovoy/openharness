@@ -204,15 +204,29 @@ describe('flow run command', () => {
     expect(err.join('')).toContain('machine identity are required')
     expect(request).toHaveBeenCalledTimes(1)
   })
+  it('refuses what the daemon would refuse, naming the input but never its value', async () => {
+    const request = vi.fn()
+    const huge = 'x'.repeat(32_769)
+    writeFileSync(join(dir, '.harness/flows/big.yaml'), 'spec: 1\nname: big\ninputs: { word: { required: true } }\ntasks: [{ id: a, run: "true", timeout: 1m }]\n')
+    for (const extra of [['--dry-run'], []]) {
+      err = []
+      expect(await flowRunCommand(['big', '--input', `word=${huge}`, ...extra], io({ request }))).toBe(1)
+      expect(err.join('')).toContain('inputs.word')
+      expect(err.join('')).not.toContain('xxxx')
+    }
+    expect(request).not.toHaveBeenCalled()
+  })
   it('reports untyped failures safely', async () => {
     expect(await flowRunCommand(['demo', '--dry-run', '--input', 'word=x'], io({ catalog: () => { throw 'boom' } }))).toBe(1)
     expect(err.join('')).toBe('Flow run failed.\n')
   })
   it('uses the process streams and the installed catalog by default', async () => {
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
     vi.spyOn(process, 'cwd').mockReturnValue(dir)
     expect(await flowRunCommand(['demo', '--dry-run', '--input', 'word=x'], { home: join(dir, 'home'), catalog: () => catalog })).toBe(0)
     expect(write).toHaveBeenCalledWith(expect.stringContaining('"name": "demo"'))
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('warning: Task a has neither outputs nor timeout'))
   })
   it('routes run through the orchestrator command', async () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
