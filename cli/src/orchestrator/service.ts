@@ -325,7 +325,8 @@ export class OrchestratorService {
       task.agentId = result.agentId
       task.engine = engine
       if ((task as Task).state === 'cancelled' || (run as Run).state === 'cancelled') this.deps.cancel(result.agentId)
-      else if (task.state === 'launching') { task.state = 'running'; this.armDeadline(run, task) }
+      // After a stop the agent stays recorded as launching: the next daemon shows it as uncertain, and arms nothing now.
+      else if (task.state === 'launching' && !this.stopped) { task.state = 'running'; this.armDeadline(run, task) }
     } catch (error) {
       if (task.state !== 'cancelled') {
         task.uncertain = creating && (!(error instanceof OrchestratorError) || ['SPAWN_FAILED', 'REGISTRATION_FAILED'].includes(error.code))
@@ -351,13 +352,13 @@ export class OrchestratorService {
     if (handle.pid !== undefined) task.pid = handle.pid
     task.state = 'running'
     this.armDeadline(run, task)
-    void handle.done.then(async result => {
+    this.background(run, handle.done.then(async result => {
       this.steps.delete(key)
       await this.settleAuto(run, task, attempt, result.code === 0 && !result.error
         ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: ['stdout.log', 'stderr.log'] }
         : { failed: stepFailure(result) })
       this.pump(run) // a failed attempt's retry waits for its process to exit
-    })
+    }))
     this.launched(run)
   }
   private armDeadline(run: Run, task: Task): void {
@@ -384,7 +385,11 @@ export class OrchestratorService {
     step?.handle.stop()
     if (agentId) this.deps.cancel(agentId)
   }
-  /** Daemon-initiated results (step exit, outputs, timeout): wait out a settle in flight, then act only if still current. */
+  /**
+   * Daemon-initiated results (step exit, outputs, timeout): wait out a settle in flight, then act only if still current.
+   * True when this outcome took the attempt. A failure takes it before anything can throw, so a save that then fails
+   * (logged) still counts: the caller must stop what it timed out.
+   */
   private async settleAuto(run: Run, task: Task, attempt: number, outcome: Outcome): Promise<boolean> {
     const key = this.attemptKey(run, task, attempt)
     await this.finishing.get(key) // never rejects: it only says the settle in flight has ended
@@ -392,7 +397,7 @@ export class OrchestratorService {
     try { await this.settle(run, task, attempt, outcome); return true }
     catch (error) {
       console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${(error as Error).message}`)
-      return false
+      return 'failed' in outcome
     }
   }
   private task(run: Run, id: string, attempt?: number): Task {
