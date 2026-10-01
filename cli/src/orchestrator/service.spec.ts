@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as filesystem from 'node:fs/promises'
@@ -10,7 +10,7 @@ import { orchestratorRequest } from './wire.js'
 
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return { ...actual, rm: vi.fn(actual.rm), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile) }
+  return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile) }
 })
 
 const id = '0123456789abcdef0123456789abcdef'
@@ -59,6 +59,24 @@ describe('durable orchestrator lifecycle', () => {
     await expect(service.finish(id, 'part', 1, 'done', ['part.step'])).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
     expect(tasks()[0].state).toBe('cancelled')
     expect(service.snapshot(id).state).toBe('active')
+  })
+  it('never saves a stale attempt into the artifact folder of the attempt that replaced it', async () => {
+    await start(); await active()
+    service.plan(id, [task('part')])
+    const part = await running('part')
+    writeFileSync(join(part.cwd, 'part.step'), 'cad')
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+    let raced = false
+    vi.mocked(filesystem.mkdir).mockImplementation(async (path, options) => {
+      if (!raced && String(path).endsWith(join('artifacts', 'part'))) { raced = true; service.cancel(id, 'part'); service.retry(id, 'part') }
+      return actual.mkdir(path, options)
+    })
+    await expect(service.finish(id, 'part', 1, 'done', ['part.step'])).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    const second = await vi.waitFor(async () => { const t = tasks()[0]; expect(t).toMatchObject({ attempt: 2, state: 'running' }); return t })
+    expect(existsSync(join(root, 'projects', id, 'artifacts', 'part', 'attempt-2'))).toBe(false)
+    writeFileSync(join(second.cwd, 'part.step'), 'cad2')
+    await service.finish(id, 'part', 2, 'done again', ['part.step'])
+    expect(tasks()[0]).toMatchObject({ state: 'succeeded', attempt: 2 })
   })
   it('validates every dependency and harness before launching any task', async () => {
     await start(); await active()

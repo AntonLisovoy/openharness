@@ -215,7 +215,7 @@ export class OrchestratorService {
     this.changed(run)
     this.pump(run)
   }
-  private artifactRoot(run: Run, task: Task): string { return join(run.root, 'artifacts', task.id, `attempt-${task.attempt}`) }
+  private artifactRoot(run: Run, task: Task, attempt = task.attempt): string { return join(run.root, 'artifacts', task.id, `attempt-${attempt}`) }
   private pump(run: Run): void {
     if (this.stopped || run.state !== 'active' || this.pumping.has(run.id)) return
     this.pumping.add(run.id)
@@ -291,12 +291,13 @@ export class OrchestratorService {
     const operation = (async () => {
       if ('failed' in outcome) { task.state = 'failed'; task.error = outcome.failed; task.summary = outcome.failed }
       else {
+        const destination = this.artifactRoot(run, task, attempt)
         const staging = join(run.root, 'artifacts', `${task.id}-${randomBytes(8).toString('hex')}.staging`)
         try {
           const artifacts = await snapshotArtifacts(task.cwd, staging, outcome.paths)
           requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
           await mkdir(join(run.root, 'artifacts', task.id), { recursive: true, mode: 0o700 })
-          await rename(staging, this.artifactRoot(run, task))
+          await rename(staging, destination)
           requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
           task.artifacts = artifacts
           task.state = 'succeeded'
