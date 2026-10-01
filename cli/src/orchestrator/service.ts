@@ -386,14 +386,15 @@ export class OrchestratorService {
     if (agentId) this.deps.cancel(agentId)
   }
   /**
-   * Daemon-initiated results (step exit, outputs, timeout): wait out a settle in flight, then act only if still current.
+   * Daemon-initiated results (step exit, outputs, timeout): wait out every settle in flight, then act only if still current.
+   * Another contender taking the attempt first is no reason to give up: its save may fail and leave the attempt running.
    * True when this outcome took the attempt. A failure takes it before anything can throw, so a save that then fails
    * (logged) still counts: the caller must stop what it timed out.
    */
   private async settleAuto(run: Run, task: Task, attempt: number, outcome: Outcome): Promise<boolean> {
     const key = this.attemptKey(run, task, attempt)
-    await this.finishing.get(key) // never rejects: it only says the settle in flight has ended
-    if (this.stopped || this.finishing.has(key) || run.state !== 'active' || task.attempt !== attempt || !['running', 'launching'].includes(task.state)) return false
+    while (this.finishing.has(key)) await this.finishing.get(key) // never rejects: it only says that settle has ended
+    if (this.stopped || run.state !== 'active' || task.attempt !== attempt || !['running', 'launching'].includes(task.state)) return false
     try { await this.settle(run, task, attempt, outcome); return true }
     catch (error) {
       console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${(error as Error).message}`)
