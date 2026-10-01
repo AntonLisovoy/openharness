@@ -627,6 +627,12 @@ tasks:
     service.retry(flowId, 'bad')
     await until('bad', 'failed', 2)
   })
+  it('drops the stopped-flow advice once the project is cancelled', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: bad, run: 'exit 4' }\n`)
+    await vi.waitFor(() => expect(snap().error).toBe('Flow stopped: bad (failed). Retry a task or cancel the project.'))
+    service.cancel(flowId)
+    expect(snap()).toMatchObject({ state: 'cancelled', error: null })
+  })
   it('launches agent tasks on any supported engine and refuses director-only operations', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: a, harness: 'engine:codex', prompt: 'Write a.md', outputs: { files: [a.md] } }\n  - { id: b, harness: test/cad, prompt: 'Model it', timeout: 5m }\n`)
     await until('a', 'running'); await until('b', 'running')
