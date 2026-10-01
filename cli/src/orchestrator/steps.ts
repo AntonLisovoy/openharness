@@ -16,7 +16,7 @@ function describe(error: unknown): string {
   const code = (error as NodeJS.ErrnoException).code
   if (code === 'ENOENT') return 'the shell could not be found (ENOENT)'
   if (code === 'EACCES') return 'the shell is not executable (EACCES)'
-  return (error as Error).message
+  return `the shell could not start (${code ?? 'unknown error'})`
 }
 /** Why a step failed: how it ended plus the end of its output, never the script. */
 export function stepFailure(result: StepResult): string {
@@ -25,11 +25,12 @@ export function stepFailure(result: StepResult): string {
   return (detail ? `${how}: ${detail.slice(-(TAIL - how.length - 2))}` : how).slice(0, TAIL)
 }
 
-function capture(stream: Readable | null, file: string, onError: (error: Error) => void): { tail(): string; close(): Promise<void> } {
+function capture(stream: Readable | null, file: string, onFail: (message: string) => void): { tail(): string; close(): Promise<void> } {
   const out = createWriteStream(file, { mode: 0o600 })
-  out.on('error', onError)
+  out.on('error', failure => onFail(`could not write ${basename(file)}: ${failure.message}`))
   const decoder = new StringDecoder('utf8')
   let bytes = 0, tail = ''
+  stream?.on('error', failure => onFail(`could not read the step output: ${failure.message}`))
   stream?.on('data', (chunk: Buffer) => {
     tail = (tail + decoder.write(chunk)).slice(-TAIL)
     if (bytes >= STEP_LOG_LIMIT) return
@@ -56,9 +57,9 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
   let error: string | null = null, killing = false
   // killPidGroup's SIGKILL is not tied to the leader: descendants that ignore SIGTERM still go.
   const stop = (): void => { if (child.pid !== undefined && !killing) { killing = true; killPidGroup(child.pid, graceMs) } }
-  const writeFailed = (failure: Error & { path?: unknown }): void => { error ??= `could not write ${basename(String(failure.path))}: ${failure.message}`; stop() }
-  const stdout = capture(child.stdout, join(opts.cwd, 'stdout.log'), writeFailed)
-  const stderr = capture(child.stderr, join(opts.cwd, 'stderr.log'), writeFailed)
+  const failed = (message: string): void => { error ??= message; stop() }
+  const stdout = capture(child.stdout, join(opts.cwd, 'stdout.log'), failed)
+  const stderr = capture(child.stderr, join(opts.cwd, 'stderr.log'), failed)
   const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
   const done = new Promise<StepResult>(resolve => {
     let settled = false
