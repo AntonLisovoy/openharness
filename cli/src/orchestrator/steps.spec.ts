@@ -20,16 +20,16 @@ describe('shell steps', () => {
 
   it('runs in the task folder with env inputs that stay literal', async () => {
     const result = await startStep('pwd; printf "%s" "$HARNESS_INPUT_X"; echo warn >&2', { cwd, env: { HARNESS_INPUT_X: '$(echo pwned)"\'' }, spawn: sh }).done
-    expect(result).toMatchObject({ code: 0, signal: null, error: null })
+    expect(result).toMatchObject({ code: 0, signal: null, error: null, started: true })
     expect(readFileSync(join(cwd, 'stdout.log'), 'utf8')).toContain(`$(echo pwned)"'`)
     expect(readFileSync(join(cwd, 'stderr.log'), 'utf8')).toBe('warn\n')
   })
   it('reports failures with the output tail, never the script, within 2000 chars', async () => {
     const result = await startStep('echo secret-script >/dev/null; echo boom >&2; exit 3', { cwd, env: {}, spawn: sh }).done
     expect(stepFailure(result)).toBe('exit 3: boom')
-    expect(stepFailure({ code: 1, signal: null, error: null, stdoutTail: 'only stdout\n', stderrTail: '' })).toBe('exit 1: only stdout')
-    expect(stepFailure({ code: null, signal: 'SIGTERM', error: null, stdoutTail: '', stderrTail: '' })).toBe('stopped by SIGTERM')
-    expect(stepFailure({ code: 1, signal: null, error: null, stdoutTail: '', stderrTail: 'x'.repeat(5000) })).toHaveLength(2000)
+    expect(stepFailure({ code: 1, signal: null, error: null, started: true, stdoutTail: 'only stdout\n', stderrTail: '' })).toBe('exit 1: only stdout')
+    expect(stepFailure({ code: null, signal: 'SIGTERM', error: null, started: true, stdoutTail: '', stderrTail: '' })).toBe('stopped by SIGTERM')
+    expect(stepFailure({ code: 1, signal: null, error: null, started: true, stdoutTail: '', stderrTail: 'x'.repeat(5000) })).toHaveLength(2000)
   })
   it('stops descendants that ignore SIGTERM, even after the shell is gone', async () => {
     const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' & wait`, { cwd, env: {}, spawn: sh, graceMs: 200 })
@@ -58,7 +58,7 @@ describe('shell steps', () => {
   })
   it('turns spawn failures into worded results', async () => {
     const thrown = (error: Error): StepSpawner => () => { throw error }
-    expect((await startStep('true', { cwd, env: {}, spawn: thrown(Object.assign(new Error('x'), { code: 'ENOENT' })) }).done).error).toBe('the shell could not be found (ENOENT)')
+    expect(await startStep('true', { cwd, env: {}, spawn: thrown(Object.assign(new Error('x'), { code: 'ENOENT' })) }).done).toMatchObject({ error: 'the shell could not be found (ENOENT)', started: false })
     expect((await startStep('true', { cwd, env: {}, spawn: thrown(Object.assign(new Error('x'), { code: 'EACCES' })) }).done).error).toBe('the shell is not executable (EACCES)')
     const plain = startStep('true', { cwd, env: {}, spawn: thrown(new Error('weird')) })
     plain.stop() // no process: a no-op
@@ -67,14 +67,14 @@ describe('shell steps', () => {
     expect(nul.error).toMatch(/^the shell could not start \(ERR_/)
     expect(nul.error).not.toContain('secret')
     const missing: StepSpawner = (_s, o) => spawn(join(cwd, 'missing-shell'), [], { cwd: o.cwd, stdio: 'ignore' }) // async ENOENT, no pipes
-    expect(await startStep('true', { cwd, env: {}, spawn: missing }).done).toMatchObject({ code: 127, error: 'the shell could not be found (ENOENT)' })
+    expect(await startStep('true', { cwd, env: {}, spawn: missing }).done).toMatchObject({ code: 127, error: 'the shell could not be found (ENOENT)', started: false })
   })
   it('keeps an error reported by a process that did start', async () => {
     const fake = Object.assign(new EventEmitter(), { pid: 999_999, stdout: null, stderr: null }) as unknown as ChildProcess
     const step = startStep('true', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
     fake.emit('error', new Error('kill failed'))
     fake.emit('exit', 1, null); fake.emit('close', 1, null)
-    expect(await step.done).toMatchObject({ code: 1, error: 'the shell could not start (unknown error)' })
+    expect(await step.done).toMatchObject({ code: 1, error: 'the shell could not start (unknown error)', started: true })
   })
   it('settles once when a process that never started also reports an exit', async () => {
     const fake = Object.assign(new EventEmitter(), { pid: undefined, stdout: null, stderr: null }) as unknown as ChildProcess
