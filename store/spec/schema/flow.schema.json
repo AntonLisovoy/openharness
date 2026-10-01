@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harness.autonomous.ai/dsh/spec/1/flow.schema.json",
+  "title": "Orchestrator flow (.harness/flows/*.yaml), spec 1",
+  "type": "object",
+  "properties": {
+    "spec": {
+      "type": "number",
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,63}$"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "engine": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "inputs": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]{0,31}$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "required": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "string",
+            "maxLength": 32768
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "tasks": {
+      "minItems": 1,
+      "maxItems": 64,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,63}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "harness": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 129
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 24000
+          },
+          "run": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 24000
+          },
+          "outputs": {
+            "type": "object",
+            "properties": {
+              "files": {
+                "minItems": 1,
+                "maxItems": 16,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256,
+                  "pattern": "^(?!\\/)(?!(?:.*\\/)?\\.\\.(?:\\/|$))[^\\\\\\0]+$"
+                }
+              },
+              "verdict": {
+                "type": "string",
+                "const": "ready"
+              }
+            },
+            "required": [
+              "files"
+            ],
+            "additionalProperties": false
+          },
+          "timeout": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]{0,5}[smh]$"
+          },
+          "retry": {
+            "type": "object",
+            "properties": {
+              "max_attempts": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              }
+            },
+            "required": [
+              "max_attempts"
+            ],
+            "additionalProperties": false
+          },
+          "depends_on": {
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,63}$"
+            }
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "spec",
+    "name",
+    "tasks"
+  ],
+  "additionalProperties": false
+}

@@ -231,3 +231,9 @@ Initial contract. Lifted from the `.board.json` (Circuit) and `.episode.json` (T
 - **Mechanism:** the selected daemon validates compatibility, refreshes availability, and resolves
   credentials after reserving the creation receipt and before preparing a project. Receipt identity
   contains the model/grid pair, never a rotating credential. Unavailable models refuse launch.
+
+## 2026-10-01 — orchestrator flows
+- **Change:** `schema/flow.schema.json`: a flow file (`<project>/.harness/flows/*.yaml` or `~/.harness/flows/`) declares an orchestrator task graph: `inputs`, and `tasks` that are either an agent task (`harness` + `prompt`, optional `outputs`) or a shell step (`run`), with `depends_on`, `timeout` and `retry.max_attempts`. `harness orchestrator run <flow>` runs it without a director; `--dry-run` only validates.
+- **Why:** a graph that worked once can be run again with different inputs, reviewed as a file, and checked by plain commands instead of prose acceptance criteria.
+- **Backward compatible:** yes. New file, new optional fields on the orchestrator's own state; harness manifests, viewers and verdicts are unchanged. `verdict.ready` is read only when a flow opts in with `outputs.verdict: ready`.
+- **Mechanism:** YAML 1.2 (JSON is valid) parsed as plain data (no anchors, aliases or tags), then the same strict validation as the schema.
