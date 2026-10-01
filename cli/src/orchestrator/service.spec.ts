@@ -577,9 +577,10 @@ describe('flow runs', () => {
     }
     service = new OrchestratorService(deps)
   })
-  const leftovers: number[] = []
+  const leftovers: number[] = [], others: OrchestratorService[] = []
   afterEach(() => {
     vi.mocked(fs.writeFileSync).mockReset() // back to the real write
+    for (const other of others.splice(0)) other.stop()
     service.stop(); vi.useRealTimers(); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true })
     for (const pid of leftovers.splice(0)) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
   })
@@ -982,6 +983,49 @@ tasks:
     service.recover()
     await vi.waitFor(() => expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
     expect(cancelled).toEqual([a.agentId])
+  })
+  /** A second daemon over a copy of a running step's state, as if the first had crashed with this pid recorded. */
+  const afterCrash = async (pid: number | undefined): Promise<{ recovered: OrchestratorService; step: () => Task }> => {
+    await startFlow(steps({ id: 's', run: 'sleep 30', retry: { max_attempts: 1 } }))
+    await until('s', 'running')
+    const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
+    saved.tasks[0].pid = pid
+    const dir = join(root, 'state-after-crash')
+    mkdirSync(dir, { mode: 0o700 }); writeFileSync(join(dir, `${flowId}.json`), JSON.stringify(saved), { mode: 0o600 })
+    const recovered = new OrchestratorService({ ...deps, stateDir: dir })
+    others.push(recovered)
+    recovered.recover()
+    return { recovered, step: () => (recovered.snapshot(flowId) as unknown as Run).tasks[0] }
+  }
+  const exitedPid = async (command: string, args: string[]): Promise<{ pid: number; exited: Promise<unknown> }> => {
+    const child = spawn(command, args, { stdio: 'ignore' })
+    leftovers.push(child.pid!)
+    return { pid: child.pid!, exited: new Promise(resolve => child.once('exit', resolve)) }
+  }
+  it('fails a crashed step whose process already exited, and lets it be retried by hand', async () => {
+    const gone = await exitedPid('true', [])
+    await gone.exited
+    const { recovered, step } = await afterCrash(gone.pid)
+    expect(step()).toMatchObject({ state: 'failed', uncertain: false, error: `Interrupted by a daemon restart (pid ${gone.pid} had already exited). Retry to run it again.` })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(step()).toMatchObject({ state: 'failed', attempt: 1 }) // never retried automatically
+    recovered.retry(flowId, 's')
+    await vi.waitFor(() => expect(step()).toMatchObject({ state: 'running', attempt: 2 }))
+  })
+  it('refuses to retry a crashed step while its process lives, and accepts once it exited', async () => {
+    const live = await exitedPid('sleep', ['30'])
+    const { recovered, step } = await afterCrash(live.pid)
+    expect(step()).toMatchObject({ state: 'blocked', uncertain: true })
+    expect(() => recovered.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE', message: expect.stringContaining(`pid ${live.pid}`) }))
+    process.kill(live.pid, 'SIGKILL')
+    await live.exited
+    recovered.retry(flowId, 's')
+    await vi.waitFor(() => expect(step()).toMatchObject({ state: 'running', attempt: 2, uncertain: false }))
+  })
+  it('refuses to retry a crashed step whose pid was never recorded', async () => {
+    const { recovered, step } = await afterCrash(undefined)
+    expect(step()).toMatchObject({ state: 'blocked', uncertain: true })
+    expect(() => recovered.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE', message: expect.stringContaining('pid unknown') }))
   })
   it('recovers nothing twice and leaves deadlines of inactive projects alone', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: agent, harness: test/cad, prompt: p, timeout: 1h }]\n`)
