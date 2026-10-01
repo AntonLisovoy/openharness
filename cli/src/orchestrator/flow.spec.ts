@@ -1,6 +1,8 @@
 // cli/src/orchestrator/flow.spec.ts
+import { readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
-import { FlowError, compileFlow, inputEnvName, parseFlowSource, RUN_STEP_DEFAULT_TIMEOUT_MS } from './flow.js'
+import { z } from 'zod'
+import { FlowError, FlowFile, compileFlow, inputEnvName, parseFlowSource, RUN_STEP_DEFAULT_TIMEOUT_MS } from './flow.js'
 
 const launch = `spec: 1
 name: product-launch
@@ -122,5 +124,15 @@ tasks:
   it('reports approval outside a task as an ordinary unknown key', () => {
     expect(issues(() => parseFlowSource('spec: 1\nname: x\napproval: x\ntasks: [{ id: a, run: "true" }]\n', 'flow.yaml'))).toMatch(/flow\.yaml:3:.*Unknown keys: approval/)
     expect(issues(() => parseFlowSource('spec: 1\nname: x\ninputs: { key: { approval: x } }\ntasks: [{ id: a, run: "true" }]\n', 'flow.yaml'))).toMatch(/flow\.yaml:3:.*Unknown keys: approval/)
+  })
+})
+
+describe('published flow schema', () => {
+  it('matches the runtime validator', () => {
+    const file = JSON.parse(readFileSync(new URL('../../../store/spec/schema/flow.schema.json', import.meta.url), 'utf8'))
+    const { $id, title, ...rest } = file
+    expect($id).toBe('https://harness.autonomous.ai/dsh/spec/1/flow.schema.json')
+    expect(title).toBe('Orchestrator flow (.harness/flows/*.yaml), spec 1')
+    expect(rest).toEqual(z.toJSONSchema(FlowFile, { io: 'input' }))
   })
 })

@@ -119,6 +119,10 @@ one final truth.
 Lifted from Circuit's `.board.json` and TV's `.episode.json` sidecars (same severity gate). Circuit
 writes it beside the sidecar in `circuitpy.generation`; Workshop writes it from `verify_project`.
 
+## Orchestrator flows (`.harness/flows/*.yaml`)
+
+A flow pins an orchestrator task graph; the schema is `schema/flow.schema.json`. A task is either an agent task (`harness`: an installed harness id or `engine:<engine>`, plus `prompt`) or a shell step (`run`). `$inputs.<name>` is replaced in prompts only; a shell step reads `HARNESS_INPUT_<NAME>` from its environment, together with `HARNESS_PROJECT_DIR`, `HARNESS_FLOW_DIR`, `HARNESS_RUN_ID`, `HARNESS_TASK_ID` and `HARNESS_ATTEMPT`. An agent task with `outputs` finishes when its worker's turn ends and every glob matches a file in its folder (and, with `verdict: ready`, `.harness/verdict.json` says `ready: true`); a shell step succeeds on exit 0 and keeps `stdout.log`/`stderr.log`. `timeout` bounds one attempt; `retry.max_attempts` is the number of extra attempts.
+
 ## Wire (daemon ↔ desktop)
 
 - `agent_create` payload gains `dsh?: string`. Refused with `INVALID_DSH` when not installed on
