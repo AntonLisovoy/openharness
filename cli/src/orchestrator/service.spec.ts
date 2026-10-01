@@ -644,6 +644,15 @@ tasks:
     expect(await until('a', 'failed')).toMatchObject({ error: 'the shell could not be found (ENOENT)' })
     expect(state('a').pid).toBeUndefined()
   })
+  it('never retries a step whose shell could not start', async () => {
+    const spawner = vi.fn<StepSpawner>(() => { throw Object.assign(new Error('x'), { code: 'ENOENT' }) })
+    deps.spawnStep = spawner
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true', retry: { max_attempts: 2 } }]\n`)
+    await until('a', 'failed')
+    await vi.waitFor(() => expect(snap().error).toBe('Flow stopped: a (failed). Retry a task or cancel the project.'))
+    expect(state('a').attempt).toBe(1)
+    expect(spawner).toHaveBeenCalledTimes(1)
+  })
   it('records steps it stopped on a graceful daemon stop', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'sleep 30' }]\n`)
     await until('slow', 'running')

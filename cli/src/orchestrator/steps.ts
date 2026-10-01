@@ -7,7 +7,8 @@ import type { Readable } from 'node:stream'
 import { killPidGroup, spawnDshCommand } from '../dsh/shell.js'
 
 export type StepSpawner = (script: string, opts: { cwd: string; env: Record<string, string> }) => ChildProcess
-export interface StepResult { code: number | null; signal: NodeJS.Signals | null; error: string | null; stdoutTail: string; stderrTail: string }
+/** `started` is false when the shell itself could not start: a launch error, never retried automatically. */
+export interface StepResult { code: number | null; signal: NodeJS.Signals | null; error: string | null; started: boolean; stdoutTail: string; stderrTail: string }
 export interface StepHandle { pid: number | undefined; done: Promise<StepResult>; stop(): void }
 export const STEP_LOG_LIMIT = 8 * 1024 * 1024
 const TAIL = 2000
@@ -52,7 +53,7 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
   let child: ChildProcess
   try { child = spawner(script, { cwd: opts.cwd, env: opts.env }) }
   catch (error) {
-    return { pid: undefined, stop: () => {}, done: Promise.resolve({ code: 127, signal: null, error: describe(error), stdoutTail: '', stderrTail: '' }) }
+    return { pid: undefined, stop: () => {}, done: Promise.resolve({ code: 127, signal: null, error: describe(error), started: false, stdoutTail: '', stderrTail: '' }) }
   }
   let error: string | null = null, killing = false
   // killPidGroup's SIGKILL is not tied to the leader: descendants that ignore SIGTERM still go.
@@ -70,7 +71,7 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
       await Promise.race([closed, new Promise(r => setTimeout(r, graceMs).unref())])
       child.stdout?.destroy(); child.stderr?.destroy()
       await Promise.all([stdout.close(), stderr.close()])
-      resolve({ code: error && code === null ? 127 : code, signal, error, stdoutTail: stdout.tail(), stderrTail: stderr.tail() })
+      resolve({ code: error && code === null ? 127 : code, signal, error, started: child.pid !== undefined, stdoutTail: stdout.tail(), stderrTail: stderr.tail() })
     }
     child.on('error', e => { error ??= describe(e); if (child.pid === undefined) void finish(null, null) })
     child.on('exit', (code, signal) => { void finish(code, signal) })
