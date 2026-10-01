@@ -810,6 +810,31 @@ tasks:
     expect(cancelled).toEqual([])
     expect(internals().deadlines.size).toBe(0)
   })
+  it('keeps a timeout queued behind automatic finishes whose saves fail', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, outputs: { files: [out.txt] }, timeout: 1h }]\n`)
+    const a = await until('a', 'running')
+    writeFileSync(join(a.cwd, 'out.txt'), 'x')
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let reached!: () => void
+    const inRename = new Promise<void>(resolve => { reached = resolve })
+    vi.mocked(filesystem.rename)
+      .mockImplementationOnce(async () => { reached(); await gate; throw new Error('disk full') })
+      .mockRejectedValueOnce(new Error('disk full again'))
+    service.ingest({ type: 'turn_ended', agentId: a.agentId, payload: {} }) // owns the attempt
+    await inRename
+    const checks = vi.mocked(outputsModule.checkOutputs)
+    service.ingest({ type: 'turn_ended', agentId: a.agentId, payload: {} }) // queues first
+    await checks.mock.results.at(-1)!.value // its settle is now waiting
+    const run = internals().runs.get(flowId)!
+    const expiring = internals().expire(run, run.tasks[0], 1) // queues second
+    release()
+    await expiring
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] a attempt 1: disk full again'))
+    expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+    expect(cancelled).toEqual([a.agentId])
+  })
   it('ignores an expiry that belongs to an older attempt', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
     await until('a', 'running')
