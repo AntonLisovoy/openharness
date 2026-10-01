@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,7 +15,8 @@ const alive = (pid: number): boolean => { try { process.kill(pid, 0); return tru
 describe('shell steps', () => {
   let cwd: string
   beforeEach(() => { cwd = mkdtempSync(join(tmpdir(), 'steps-')) })
-  afterEach(() => { vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
+  const pids: number[] = []
+  afterEach(() => { for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
 
   it('runs in the task folder with env inputs that stay literal', async () => {
     const result = await startStep('pwd; printf "%s" "$HARNESS_INPUT_X"; echo warn >&2', { cwd, env: { HARNESS_INPUT_X: '$(echo pwned)"\'' }, spawn: sh }).done
@@ -30,9 +32,11 @@ describe('shell steps', () => {
     expect(stepFailure({ code: 1, signal: null, error: null, stdoutTail: '', stderrTail: 'x'.repeat(5000) })).toHaveLength(2000)
   })
   it('stops descendants that ignore SIGTERM, even after the shell is gone', async () => {
-    const step = startStep('(trap "" TERM; sleep 30) & echo $! > child.pid; wait', { cwd, env: {}, spawn: sh, graceMs: 200 })
-    await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+/))
+    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' & wait`, { cwd, env: {}, spawn: sh, graceMs: 200 })
+    await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+\n/))
     const child = Number(readFileSync(join(cwd, 'child.pid'), 'utf8'))
+    pids.push(child)
+    await new Promise(r => setTimeout(r, 100)) // exec'd: the ignored-TERM disposition is inherited by sleep
     step.stop()
     await step.done
     await vi.waitFor(() => expect(alive(child)).toBe(false), { timeout: 3000 })
@@ -42,7 +46,7 @@ describe('shell steps', () => {
     expect(result).toMatchObject({ code: 0, stdoutTail: 'done\n' })
   })
   it('caps each log and keeps a readable tail', async () => {
-    const result = await startStep(`printf 'ab'; head -c ${STEP_LOG_LIMIT + 4096} /dev/zero | tr '\\0' 'a'; printf 'é-end'`, { cwd, env: {}, spawn: sh }).done
+    const result = await startStep(`head -c ${STEP_LOG_LIMIT + 4096} /dev/zero | tr '\\0' 'a'; printf 'é-end'`, { cwd, env: {}, spawn: sh }).done
     expect(statSync(join(cwd, 'stdout.log')).size).toBeLessThan(STEP_LOG_LIMIT + 100)
     expect(readFileSync(join(cwd, 'stdout.log'), 'utf8').endsWith('[output truncated]\n')).toBe(true)
     expect(result.stdoutTail.endsWith('é-end')).toBe(true)
@@ -58,7 +62,10 @@ describe('shell steps', () => {
     expect((await startStep('true', { cwd, env: {}, spawn: thrown(Object.assign(new Error('x'), { code: 'EACCES' })) }).done).error).toBe('the shell is not executable (EACCES)')
     const plain = startStep('true', { cwd, env: {}, spawn: thrown(new Error('weird')) })
     plain.stop() // no process: a no-op
-    expect((await plain.done).error).toBe('weird')
+    expect((await plain.done).error).toBe('the shell could not start (unknown error)')
+    const nul = await startStep('echo secret\0script', { cwd, env: {}, spawn: sh }).done
+    expect(nul.error).toMatch(/^the shell could not start \(ERR_/)
+    expect(nul.error).not.toContain('secret')
     const missing: StepSpawner = (_s, o) => spawn(join(cwd, 'missing-shell'), [], { cwd: o.cwd, stdio: 'ignore' }) // async ENOENT, no pipes
     expect(await startStep('true', { cwd, env: {}, spawn: missing }).done).toMatchObject({ code: 127, error: 'the shell could not be found (ENOENT)' })
   })
@@ -67,7 +74,7 @@ describe('shell steps', () => {
     const step = startStep('true', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
     fake.emit('error', new Error('kill failed'))
     fake.emit('exit', 1, null); fake.emit('close', 1, null)
-    expect(await step.done).toMatchObject({ code: 1, error: 'kill failed' })
+    expect(await step.done).toMatchObject({ code: 1, error: 'the shell could not start (unknown error)' })
   })
   it('settles once when a process that never started also reports an exit', async () => {
     const fake = Object.assign(new EventEmitter(), { pid: undefined, stdout: null, stderr: null }) as unknown as ChildProcess
@@ -75,6 +82,26 @@ describe('shell steps', () => {
     fake.emit('error', Object.assign(new Error('x'), { code: 'ENOENT' }))
     fake.emit('exit', 1, null); fake.emit('close', 1, null)
     expect(await step.done).toMatchObject({ code: 127, error: 'the shell could not be found (ENOENT)' })
+  })
+  it('stops the step when its output stream errors', async () => {
+    const stdout = new PassThrough()
+    const fake = Object.assign(new EventEmitter(), { pid: 999_999, stdout, stderr: null }) as unknown as ChildProcess
+    const step = startStep('true', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
+    stdout.emit('error', new Error('pipe broke'))
+    fake.emit('exit', null, 'SIGTERM'); fake.emit('close', null, 'SIGTERM')
+    expect(await step.done).toMatchObject({ code: 127, error: 'could not read the step output: pipe broke' })
+  })
+  it('truncates at the exact limit when a chunk straddles it', async () => {
+    const stdout = new PassThrough()
+    const fake = Object.assign(new EventEmitter(), { pid: 999_999, stdout, stderr: null }) as unknown as ChildProcess
+    const step = startStep('true', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
+    stdout.write(Buffer.alloc(STEP_LOG_LIMIT - 2, 'a')); stdout.write(Buffer.alloc(10, 'b')); stdout.write('ignored')
+    await new Promise(r => setImmediate(r))
+    fake.emit('exit', 0, null); fake.emit('close', 0, null)
+    await step.done
+    const log = readFileSync(join(cwd, 'stdout.log'), 'utf8')
+    expect(log.endsWith('bb\n[output truncated]\n')).toBe(true)
+    expect(log.length).toBe(STEP_LOG_LIMIT + '\n[output truncated]\n'.length)
   })
   it('uses the login-shell spawner by default', async () => {
     const spy = vi.spyOn(shell, 'spawnDshCommand').mockImplementation((script, opts) => sh(script, { cwd: opts.cwd, env: opts.env ?? {} }))
