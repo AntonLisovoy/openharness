@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { WebSocketServer } from 'ws'
 import * as authSession from '../lib/authSession.js'
-import { summarizeOrchestratorReply, parseOrchestratorArgs, localOrchestratorRequest, orchestratorCommand } from './command.js'
+import { summarizeOrchestratorReply, parseOrchestratorArgs, localOrchestratorRequest, orchestratorCommand, flowRunCommand, parseFlowArgs, resolveFlowPath } from './command.js'
 
 describe('orchestrator tool output', () => {
   it('keeps large projects readable without discarding worker results or mutating UI state', () => {
@@ -113,5 +116,107 @@ describe('real loopback orchestrator transport', () => {
     expect(error).toHaveBeenCalled()
     await new Promise<void>(resolve => peer.ws.close(() => resolve()))
     await expect(localOrchestratorRequest(peer.port, 'machine', { action: 'list' })).rejects.toThrow(/ECONNREFUSED/)
+  })
+})
+
+describe('flow run command', () => {
+  let dir: string, out: string[], err: string[]
+  const catalog = [{ id: 'test/cad', name: 'cad', description: '', engine: 'claude', viewer: false }]
+  const io = (extra: Record<string, unknown> = {}) => ({ cwd: dir, home: join(dir, 'home'), out: (t: string) => { out.push(t) }, err: (t: string) => { err.push(t) }, catalog: () => catalog, engineSupported: (e: string) => ['claude', 'codex'].includes(e), ...extra })
+  const flow = 'spec: 1\nname: demo\ninputs: { word: { required: true } }\ntasks:\n  - { id: a, harness: test/cad, prompt: "Say $inputs.word" }\n  - { id: b, run: "true", depends_on: [a] }\n'
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'flow-cli-')); out = []; err = []; mkdirSync(join(dir, '.harness/flows'), { recursive: true }); writeFileSync(join(dir, '.harness/flows/demo.yaml'), flow) })
+  afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }) })
+
+  it('parses options and inputs on the first =', () => {
+    expect(parseFlowArgs(['demo', '--input', 'q=a=b', '--input', 'e=', '--dry-run', '--cwd', '/p', '--engine', 'codex', '--parallelism', '2', '--bypass-permission', '--port', '9', '--machine', 'm']))
+      .toEqual({ flow: 'demo', inputs: { q: 'a=b', e: '' }, dryRun: true, bypassPermission: true, cwd: '/p', engine: 'codex', parallelism: 2, port: 9, machine: 'm' })
+  })
+  it.each([
+    [['demo', '--input', 'q=1', '--input', 'q=2'], 'Duplicate input: q'],
+    [['demo', '--input', 'novalue'], '--input name=value'],
+    [['demo', '--input'], '--input name=value'],
+    [['demo', '--cwd'], '--cwd needs a value'],
+    [['demo', '--parallelism', 'x'], '--parallelism takes a whole number from 1 to 6'],
+    [['demo', '--parallelism', '9'], '--parallelism takes a whole number from 1 to 6'],
+    [['demo', '--wat'], 'Unknown option: --wat'],
+    [['demo', 'extra'], 'Usage: harness orchestrator run'],
+    [[], 'Usage: harness orchestrator run'],
+  ])('rejects %j', (argv, message) => { expect(() => parseFlowArgs(argv)).toThrow(message) })
+  it('finds flows by path, in the project, then at home, and refuses ambiguity', () => {
+    const isFile = (p: string) => existsSync(p) && statSync(p).isFile()
+    expect(resolveFlowPath('.harness/flows/demo.yaml', dir, join(dir, 'home'), isFile)).toEqual({ path: join(dir, '.harness/flows/demo.yaml'), byName: false })
+    expect(resolveFlowPath('demo', dir, join(dir, 'home'), isFile)).toEqual({ path: join(dir, '.harness/flows/demo.yaml'), byName: true })
+    mkdirSync(join(dir, 'home/.harness/flows'), { recursive: true }); writeFileSync(join(dir, 'home/.harness/flows/mine.yml'), flow)
+    expect(resolveFlowPath('mine', dir, join(dir, 'home'), isFile).path).toBe(join(dir, 'home/.harness/flows/mine.yml'))
+    writeFileSync(join(dir, '.harness/flows/demo.json'), '{}')
+    expect(() => resolveFlowPath('demo', dir, join(dir, 'home'), isFile)).toThrow('keep one')
+    expect(() => resolveFlowPath('nope', dir, join(dir, 'home'), isFile)).toThrow('No flow named nope')
+    expect(() => resolveFlowPath('./missing.yaml', dir, join(dir, 'home'), isFile)).toThrow('No flow file at ./missing.yaml')
+  })
+  it('dry-runs without a daemon or machine identity', async () => {
+    const request = vi.fn()
+    expect(await flowRunCommand(['demo', '--input', 'word=hi', '--dry-run'], io({ request }))).toBe(0)
+    expect(request).not.toHaveBeenCalled()
+    const printed = JSON.parse(out.join(''))
+    expect(printed).toMatchObject({ flow: { name: 'demo', path: join(dir, '.harness/flows/demo.yaml') }, engine: 'claude', inputs: { word: 'hi' }, warnings: [expect.stringContaining('Task a')] })
+    expect(printed.tasks.map((t: { id: string }) => t.id)).toEqual(['a', 'b'])
+    expect(err.join('')).toContain('warning: Task a has neither outputs nor timeout')
+  })
+  it.each([
+    [['demo', '--dry-run'], {}, 'Missing required input: word'],
+    [['demo', '--dry-run', '--input', 'word=x'], { catalog: () => [] }, 'test/cad is not an installed harness on this machine'],
+    [['demo', '--dry-run', '--input', 'word=x', '--engine', 'gemini'], {}, 'gemini cannot run orchestrator work here'],
+  ])('reports %j problems on stderr with exit 1', async (argv, extra, message) => {
+    expect(await flowRunCommand(argv, io(extra))).toBe(1)
+    expect(err.join('')).toContain(message)
+  })
+  it('checks engine harnesses and warns when a file name and flow name differ', async () => {
+    writeFileSync(join(dir, '.harness/flows/other.yaml'), 'spec: 1\nname: renamed\nengine: codex\ndescription: Two steps\ntasks: [{ id: a, harness: "engine:gemini", prompt: p }]\n')
+    expect(await flowRunCommand(['other', '--dry-run'], io())).toBe(1)
+    expect(err.join('')).toContain('engine:gemini cannot run orchestrator work here')
+    err = []
+    writeFileSync(join(dir, '.harness/flows/other.yaml'), 'spec: 1\nname: renamed\nengine: codex\ndescription: Two steps\ntasks: [{ id: a, harness: "engine:claude", prompt: p, timeout: 5m }]\n')
+    expect(await flowRunCommand(['other', '--dry-run'], io())).toBe(0)
+    expect(err.join('')).toContain('other.yaml declares name renamed')
+    expect(JSON.parse(out.join(''))).toMatchObject({ engine: 'codex' })
+  })
+  it('starts the flow on the daemon and prints the project', async () => {
+    const request = vi.fn(async () => ({ project: { id: 'p', state: 'active', tasks: [], messages: [] } }))
+    expect(await flowRunCommand(['demo', '--input', 'word=hi', '--port', '1234', '--machine', 'm', '--engine', 'codex', '--parallelism', '2'], io({ request }))).toBe(0)
+    const [port, machine, payload] = request.mock.calls[0] as unknown as [number, string, Record<string, unknown>]
+    expect([port, machine]).toEqual([1234, 'm'])
+    expect(payload).toMatchObject({ action: 'start', engine: 'codex', parallelism: 2, prompt: 'Flow demo', cwd: dir, bypassPermission: false, inputs: { word: 'hi' }, flow: { path: join(dir, '.harness/flows/demo.yaml'), source: flow } })
+    expect(payload.id).toMatch(/^[a-f0-9]{32}$/)
+    expect(JSON.parse(out.join(''))).toMatchObject({ project: { id: 'p' } })
+    writeFileSync(join(dir, '.harness/flows/described.yaml'), 'spec: 1\nname: described\ndescription: Two steps\ntasks: [{ id: a, run: "true" }]\n')
+    request.mockResolvedValueOnce({ error: 'ENGINE_UNSUPPORTED', detail: 'no' } as never)
+    expect(await flowRunCommand(['described', '--port', '1234', '--machine', 'm'], io({ request }))).toBe(1)
+    expect((request.mock.calls[1] as unknown as [number, string, Record<string, unknown>])[2]).toMatchObject({ prompt: 'described: Two steps' })
+    expect('parallelism' in (request.mock.calls[1] as unknown as [number, string, Record<string, unknown>])[2]).toBe(false)
+  })
+  it('falls back to the saved identity and default port, and refuses without either', async () => {
+    const request = vi.fn(async () => ({ project: { id: 'p', tasks: [], messages: [] } }))
+    const session = vi.spyOn(authSession, 'readAuthSession').mockReturnValue({ machineId: 'saved' } as ReturnType<typeof authSession.readAuthSession>)
+    expect(await flowRunCommand(['demo', '--input', 'word=hi'], io({ request }))).toBe(0)
+    expect((request.mock.calls[0] as unknown as [number, string])[1]).toBe('saved')
+    session.mockReturnValue(null as ReturnType<typeof authSession.readAuthSession>)
+    expect(await flowRunCommand(['demo', '--input', 'word=hi'], io({ request }))).toBe(1)
+    expect(err.join('')).toContain('machine identity are required')
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+  it('reports untyped failures safely', async () => {
+    expect(await flowRunCommand(['demo', '--dry-run', '--input', 'word=x'], io({ catalog: () => { throw 'boom' } }))).toBe(1)
+    expect(err.join('')).toBe('Flow run failed.\n')
+  })
+  it('uses the process streams and the installed catalog by default', async () => {
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    vi.spyOn(process, 'cwd').mockReturnValue(dir)
+    expect(await flowRunCommand(['demo', '--dry-run', '--input', 'word=x'], { home: join(dir, 'home'), catalog: () => catalog })).toBe(0)
+    expect(write).toHaveBeenCalledWith(expect.stringContaining('"name": "demo"'))
+  })
+  it('routes run through the orchestrator command', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(await orchestratorCommand(['--port', '1', 'run'])).toBe(1)
+    expect(spy).toHaveBeenCalledWith(expect.stringContaining('Usage: harness orchestrator run'))
   })
 })
