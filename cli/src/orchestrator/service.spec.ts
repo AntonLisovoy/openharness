@@ -758,4 +758,159 @@ tasks:
     await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] part attempt 1: outputs not checked'))
     expect(state('part').state).toBe('running')
   })
+
+  const internals = () => service as unknown as {
+    runs: Map<string, Run>; deadlines: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> } }>
+    expire(run: Run, task: Task, attempt: number): Promise<void>
+  }
+  it('times out a step, kills it, and retries it a bounded number of times', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'echo "$HARNESS_ATTEMPT" >> "$HARNESS_PROJECT_DIR/attempts"; sleep 30', timeout: 1s, retry: { max_attempts: 1 } }]\n`)
+    await until('slow', 'failed', 2)
+    expect(state('slow').error).toBe('Timed out after 1s.')
+    expect(readFileSync(join(project, 'attempts'), 'utf8')).toBe('1\n2\n')
+    expect(snap().messages.some(m => m.text === 'Task slow attempt 1 failed; retrying (attempt 2 of 2).')).toBe(true)
+    // While the retry was due the flow was never reported as stopped.
+    expect(snap().messages.filter(m => m.text.startsWith('Task slow attempt')).map(m => m.text.split('\n')[0])).toEqual([
+      'Task slow attempt 1 failed. Timed out after 1s.', 'Task slow attempt 1 failed; retrying (attempt 2 of 2).', 'Task slow attempt 2 failed. Timed out after 1s.',
+    ])
+    expect(internals().deadlines.size).toBe(0)
+  }, 15_000)
+  it('times out an agent task, cancels its worker after winning, and retries', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h, retry: { max_attempts: 2 } }]\n`)
+    const a = await until('a', 'running')
+    await vi.advanceTimersByTimeAsync(60 * 60_000 + 10)
+    await until('a', 'running', 2)
+    expect(cancelled).toEqual([a.agentId])
+    expect(snap().messages.some(m => m.text.includes('Timed out after 1h.'))).toBe(true)
+  })
+  it('still times out a step left running when its result could not be saved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(filesystem.rename).mockRejectedValueOnce(new Error('disk full'))
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true' }]\n`)
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] a attempt 1: disk full'), { timeout: 5000 })
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    expect(state('a').state).toBe('running')
+    expect(internals().deadlines.size).toBe(1) // the default 10m deadline is still armed
+    const run = internals().runs.get(flowId)!
+    await internals().expire(run, run.tasks[0], 1)
+    expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 10m.' })
+    expect(internals().deadlines.size).toBe(0)
+  })
+  it('lets a finish that is already saving win over the timeout', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
+    const a = await until('a', 'running')
+    writeFileSync(join(a.cwd, 'out.txt'), 'x')
+    let release!: () => void
+    const realCopy = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).copyFile
+    vi.mocked(filesystem.copyFile).mockImplementationOnce(async (from, to) => { await new Promise<void>(r => { release = r }); return realCopy(from, to) })
+    const finishing = service.finish(flowId, 'a', 1, 'done', ['out.txt'])
+    const run = internals().runs.get(flowId)!
+    const expiring = internals().expire(run, run.tasks[0], 1)
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    release()
+    await finishing; await expiring
+    expect(state('a').state).toBe('succeeded')
+    expect(cancelled).toEqual([])
+    expect(internals().deadlines.size).toBe(0)
+  })
+  it('ignores an expiry that belongs to an older attempt', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
+    await until('a', 'running')
+    await service.finish(flowId, 'a', 1, 'nope', [], true)
+    service.retry(flowId, 'a')
+    await until('a', 'running', 2)
+    const run = internals().runs.get(flowId)!
+    await internals().expire(run, run.tasks[0], 1)
+    expect(state('a')).toMatchObject({ state: 'running', attempt: 2 })
+    expect(cancelled).toEqual([])
+  })
+  it('retries a worker failure exactly max_attempts times, and never without retry', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, retry: { max_attempts: 3 } }, { id: b, harness: test/cad, prompt: p }]\n`)
+    for (const attempt of [1, 2, 3, 4]) {
+      await until('a', 'running', attempt)
+      await service.finish(flowId, 'a', attempt, `gave up ${attempt}`, [], true)
+    }
+    await until('b', 'running')
+    await service.finish(flowId, 'b', 1, 'gave up', [], true)
+    expect(state('a')).toMatchObject({ state: 'failed', attempt: 4 })
+    expect(state('b')).toMatchObject({ state: 'failed', attempt: 1 })
+    expect(launches).toHaveLength(5)
+  })
+  it('waits for a failed step to exit before retrying, and lets cancel or a manual retry take over', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: s, run: 'trap "" TERM; while :; do sleep 1; done', timeout: 1s, retry: { max_attempts: 2 } }]\n`)
+    await until('s', 'failed', 1)
+    const exited = internals().steps.values().next().value!.handle.done
+    expect(() => service.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'TASK_STOPPING' }))
+    service.cancel(flowId, 's') // drops the due retry; the failed attempt stays failed
+    await exited
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    expect(state('s')).toMatchObject({ state: 'failed', attempt: 1 })
+    service.retry(flowId, 's')
+    await until('s', 'running', 2)
+  }, 15_000)
+  it('does not retry while the failed attempt is still launching', async () => {
+    let finishLaunch!: () => void
+    deps.create = async input => { launches.push(input); await new Promise<void>(r => { finishLaunch = r }); agents.add('late'); return { agentId: 'late' } }
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, retry: { max_attempts: 1 } }]\n`)
+    await until('a', 'launching')
+    await vi.waitFor(() => expect(finishLaunch).toBeTypeOf('function'))
+    await service.finish(flowId, 'a', 1, 'reported early', [], true)
+    expect(launches).toHaveLength(1)
+    expect(state('a')).toMatchObject({ state: 'failed', attempt: 1 })
+    finishLaunch()
+    await until('a', 'launching', 2)
+  })
+  it('recovers after a crash: steps become uncertain, deadlines are enforced', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'sleep 30' }, { id: agent, harness: test/cad, prompt: p, timeout: 1h }, { id: nopid, run: 'sleep 30' }]\n`)
+    const slow = await until('slow', 'running'); await until('agent', 'running'); await until('nopid', 'running')
+    const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
+    saved.tasks.find((t: Task) => t.id === 'agent').deadline = Date.now() - 1
+    delete saved.tasks.find((t: Task) => t.id === 'nopid').pid
+    // A second daemon over a copy of the state: the first keeps owning its processes until afterEach stops it.
+    const recovered = new OrchestratorService({ ...deps, stateDir: join(root, 'state-after-crash') })
+    mkdirSync(join(root, 'state-after-crash'), { mode: 0o700 }); writeFileSync(join(root, 'state-after-crash', `${flowId}.json`), JSON.stringify(saved), { mode: 0o600 })
+    recovered.recover()
+    const after = (taskId: string) => (recovered.snapshot(flowId) as unknown as Run).tasks.find(t => t.id === taskId)!
+    expect(after('slow')).toMatchObject({ state: 'blocked', uncertain: true, error: expect.stringContaining(`pid ${slow.pid}`) })
+    expect(after('nopid').error).toContain('pid unknown')
+    expect(() => recovered.retry(flowId, 'slow')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    await vi.waitFor(() => expect(after('agent')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
+    expect(cancelled).toEqual([state('agent').agentId])
+    recovered.stop()
+  })
+  it('recovers nothing twice and leaves deadlines of inactive projects alone', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: agent, harness: test/cad, prompt: p, timeout: 1h }]\n`)
+    await until('agent', 'running')
+    service.cancel(flowId)
+    const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
+    saved.tasks[0].state = 'running'; saved.tasks[0].deadline = Date.now() - 1 // a cancelled project is never expired
+    const recovered = new OrchestratorService({ ...deps, stateDir: join(root, 'state-after-crash') })
+    mkdirSync(join(root, 'state-after-crash'), { mode: 0o700 }); writeFileSync(join(root, 'state-after-crash', `${flowId}.json`), JSON.stringify(saved), { mode: 0o600 })
+    recovered.recover(); recovered.recover()
+    expect((recovered as unknown as { deadlines: Map<string, unknown> }).deadlines.size).toBe(0)
+    recovered.stop()
+  })
+  it('enforces a deadline that came due while the project was paused once it is resumed', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
+    const a = await until('a', 'running')
+    service.stop()
+    const file = join(deps.stateDir, `${flowId}.json`), saved = JSON.parse(readFileSync(file, 'utf8'))
+    saved.state = 'paused'; saved.tasks[0].deadline = Date.now() - 1
+    writeFileSync(file, JSON.stringify(saved))
+    service = new OrchestratorService(deps)
+    expect(snap().state).toBe('paused')
+    expect(internals().deadlines.size).toBe(0)
+    service.resume(flowId)
+    await vi.waitFor(() => expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
+    expect(cancelled).toEqual([a.agentId])
+  })
+  it('clears pending deadlines and retries when the daemon stops', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
+    await until('a', 'running')
+    service.resume(flowId) // an armed deadline is not armed twice
+    expect(internals().deadlines.size).toBe(1)
+    service.stop()
+    expect(internals().deadlines.size).toBe(0)
+  })
 })
