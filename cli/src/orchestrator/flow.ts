@@ -21,10 +21,13 @@ const FlowTask = z.strictObject({
   title: z.string().trim().min(1).max(100).optional(),
   harness: z.string().min(1).max(129).optional(),
   prompt: z.string().trim().min(1).max(24_000).optional(),
-  run: z.string().trim().min(1).max(24_000).optional(),
-  outputs: z.strictObject({ files: z.array(Glob).min(1).max(16), verdict: z.literal('ready').optional() }).optional(),
-  timeout: z.string().regex(/^[1-9][0-9]{0,5}[smh]$/, 'timeout looks like 90s, 45m or 2h').optional(),
-  retry: z.strictObject({ max_attempts: z.number().int().min(1).max(5) }).optional(),
+  run: z.string().trim().min(1).max(24_000).describe('Shell command, run in the task folder in its own process group. Exit 0 is success. Inputs are in HARNESS_INPUT_<NAME>; $inputs is not substituted here.').optional(),
+  outputs: z.strictObject({ files: z.array(Glob).min(1).max(16), verdict: z.literal('ready').optional() })
+    .describe('Agent tasks: when the worker ends a turn and every glob matches a file in the task folder (and .harness/verdict.json says ready, if asked), the task finishes.').optional(),
+  timeout: z.string().regex(/^[1-9][0-9]{0,5}[smh]$/, 'timeout looks like 90s, 45m or 2h')
+    .describe('Limit for one attempt, at most 24h. Shell steps default to 10m; agent tasks have no default.').optional(),
+  retry: z.strictObject({ max_attempts: z.number().int().min(1).max(6) })
+    .describe('Automatic retries: max_attempts is the number of attempts in all, the first attempt included. Without retry a failed task is not run again automatically.').optional(),
   depends_on: z.array(TaskId).max(32).optional(),
 })
 export const FlowFile = z.strictObject({

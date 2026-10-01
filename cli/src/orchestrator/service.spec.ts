@@ -819,7 +819,7 @@ tasks:
     expire(run: Run, task: Task, attempt: number): Promise<void>
   }
   it('times out a step, kills it, and retries it a bounded number of times', async () => {
-    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'echo "$HARNESS_ATTEMPT" >> "$HARNESS_PROJECT_DIR/attempts"; sleep 30', timeout: 1s, retry: { max_attempts: 1 } }]\n`)
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'echo "$HARNESS_ATTEMPT" >> "$HARNESS_PROJECT_DIR/attempts"; sleep 30', timeout: 1s, retry: { max_attempts: 2 } }]\n`)
     await until('slow', 'failed', 2)
     expect(state('slow').error).toBe('Timed out after 1s.')
     expect(readFileSync(join(project, 'attempts'), 'utf8')).toBe('1\n2\n')
@@ -905,16 +905,19 @@ tasks:
     expect(state('a')).toMatchObject({ state: 'running', attempt: 2 })
     expect(cancelled).toEqual([])
   })
-  it('retries a worker failure exactly max_attempts times, and never without retry', async () => {
-    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, retry: { max_attempts: 3 } }, { id: b, harness: test/cad, prompt: p }]\n`)
-    for (const attempt of [1, 2, 3, 4]) {
+  it('runs a failing worker at most max_attempts times in all, and never retries without retry', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, retry: { max_attempts: 3 } }, { id: b, harness: test/cad, prompt: p }, { id: c, harness: test/cad, prompt: p, retry: { max_attempts: 1 } }]\n`)
+    for (const attempt of [1, 2, 3]) {
       await until('a', 'running', attempt)
       await service.finish(flowId, 'a', attempt, `gave up ${attempt}`, [], true)
     }
-    await until('b', 'running')
-    await service.finish(flowId, 'b', 1, 'gave up', [], true)
-    expect(state('a')).toMatchObject({ state: 'failed', attempt: 4 })
+    for (const id of ['b', 'c']) {
+      await until(id, 'running')
+      await service.finish(flowId, id, 1, 'gave up', [], true)
+    }
+    expect(state('a')).toMatchObject({ state: 'failed', attempt: 3 })
     expect(state('b')).toMatchObject({ state: 'failed', attempt: 1 })
+    expect(state('c')).toMatchObject({ state: 'failed', attempt: 1 })
     expect(launches).toHaveLength(5)
   })
   it('waits for a failed step to exit before retrying, and lets cancel or a manual retry take over', async () => {
@@ -931,7 +934,7 @@ tasks:
   }, 15_000)
   it('starts a retry only once the failed attempt\'s leftovers are gone', async () => {
     const child = join(project, 'child.pid'), overlap = join(project, 'overlap')
-    await startFlow(steps({ id: 's', run: `[ "$HARNESS_ATTEMPT" = 1 ] || { kill -0 "$(cat ${child})" 2>/dev/null && touch ${overlap}; exit 0; }; ${stubborn(child)} sleep 0.3; exit 1`, retry: { max_attempts: 1 } }))
+    await startFlow(steps({ id: 's', run: `[ "$HARNESS_ATTEMPT" = 1 ] || { kill -0 "$(cat ${child})" 2>/dev/null && touch ${overlap}; exit 0; }; ${stubborn(child)} sleep 0.3; exit 1`, retry: { max_attempts: 2 } }))
     await pidIn(child)
     await until('s', 'succeeded', 2)
     expect(existsSync(overlap)).toBe(false)
@@ -946,7 +949,7 @@ tasks:
   it('does not retry while the failed attempt is still launching', async () => {
     let finishLaunch!: () => void
     deps.create = async input => { launches.push(input); await new Promise<void>(r => { finishLaunch = r }); agents.add('late'); return { agentId: 'late' } }
-    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, retry: { max_attempts: 1 } }]\n`)
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, retry: { max_attempts: 2 } }]\n`)
     await until('a', 'launching')
     await vi.waitFor(() => expect(finishLaunch).toBeTypeOf('function'))
     await service.finish(flowId, 'a', 1, 'reported early', [], true)
@@ -992,7 +995,7 @@ tasks:
   })
   /** A second daemon over a copy of a running step's state, as if the first had crashed with this pid recorded. */
   const afterCrash = async (pid: number | undefined): Promise<{ recovered: OrchestratorService; step: () => Task }> => {
-    await startFlow(steps({ id: 's', run: 'sleep 30', retry: { max_attempts: 1 } }))
+    await startFlow(steps({ id: 's', run: 'sleep 30', retry: { max_attempts: 2 } }))
     await until('s', 'running')
     const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
     saved.tasks[0].pid = pid

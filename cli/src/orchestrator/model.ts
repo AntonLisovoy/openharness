@@ -15,7 +15,7 @@ export const TaskSpec = z.object({
   run: text.optional(),
   outputs: Outputs.optional(),
   timeoutMs: z.number().int().min(1000).max(86_400_000).optional(),
-  retry: z.object({ maxAttempts: z.number().int().min(1).max(5) }).optional(),
+  retry: z.object({ maxAttempts: z.number().int().min(1).max(6) }).optional(),
 })
 export const StartSpec = z.object({
   id: RunId,

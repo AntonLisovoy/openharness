@@ -83,6 +83,14 @@ tasks:
     expect(issues(() => compile('spec: 1\nname: x\ntasks: [{ id: a, run: "true", depends_on: [ghost] }]\n'))).toContain('Unknown dependency: ghost')
     expect(issues(() => compile(`spec: 1\nname: x\ninputs: { big: {} }\ntasks: [{ id: a, harness: engine:claude, prompt: "$inputs.big" }]\n`, { big: 'y'.repeat(24_001) }))).toContain('tasks[0]')
   })
+  it('counts retry.max_attempts as all attempts, the first included', () => {
+    const retry = (n: number) => `spec: 1\nname: x\ntasks: [{ id: a, run: "true", retry: { max_attempts: ${n} } }]\n`
+    expect(compile(retry(1)).tasks[0].retry).toEqual({ maxAttempts: 1 })
+    expect(compile(retry(6)).tasks[0].retry).toEqual({ maxAttempts: 6 })
+    for (const n of [0, 7]) expect(issues(() => compile(retry(n)))).toContain('max_attempts')
+    const items = (flowJsonSchema() as { properties: { tasks: { items: { properties: { retry: { description?: string } } } } } }).properties.tasks.items
+    expect(items.properties.retry.description).toMatch(/first attempt included/)
+  })
   it('rejects output globs that leave the task folder', () => {
     for (const glob of ['/etc/passwd', '../x', 'a/../../b', 'a\\\\b']) {
       expect(issues(() => parseFlowSource(`spec: 1\nname: x\ntasks: [{ id: a, harness: engine:claude, prompt: p, outputs: { files: ["${glob}"] } }]\n`, 'f.yaml'))).toContain('outputs')
