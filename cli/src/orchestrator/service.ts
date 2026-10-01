@@ -38,6 +38,11 @@ export interface OrchestratorDependencies {
 // A daemon stop is not a result.
 type Outcome = { summary: string; paths: string[] } | { failed: string; retryable?: boolean }
 
+/** True when no process has this pid any more (one we may not signal still exists). */
+const exited = (pid: number): boolean => {
+  try { process.kill(pid, 0); return false } catch (error) { return (error as NodeJS.ErrnoException).code === 'ESRCH' }
+}
+
 /** Owns tasks, not terminals. A tab closing has no effect on this service. */
 export class OrchestratorService {
   private readonly runs = new Map<string, Run>()
@@ -73,8 +78,14 @@ export class OrchestratorService {
           task.uncertain = true
           task.error = 'Launch was interrupted by a daemon restart. Inspect existing agents; automatic retry could duplicate work.'
         }
-        // The process may still be running unsupervised; a silent re-run could do its work twice.
+        // The process may still be running unsupervised; a silent re-run could do its work twice. One known to have
+        // exited simply failed, and is retried only by hand.
         for (const task of run.tasks) if (task.state === 'running' && task.run !== undefined) {
+          if (task.pid !== undefined && exited(task.pid)) {
+            task.state = 'failed'
+            task.error = `Interrupted by a daemon restart (pid ${task.pid} had already exited). Retry to run it again.`
+            continue
+          }
           task.state = 'blocked'
           task.uncertain = true
           task.error = `The daemon restarted while this step was running (pid ${task.pid ?? 'unknown'}). Make sure it stopped before retrying.`
@@ -464,7 +475,7 @@ export class OrchestratorService {
     }
   }
   private requeue(run: Run, task: Task): void {
-    task.attempt++; task.state = 'queued'; task.error = null; task.agentId = null; task.cwd = ''; task.artifacts = []; task.inputs = {}
+    task.attempt++; task.state = 'queued'; task.error = null; task.uncertain = false; task.agentId = null; task.cwd = ''; task.artifacts = []; task.inputs = {}
     delete task.deadline; delete task.pid; delete task.engine
     for (const next of run.tasks) if (next.state === 'blocked' && !next.uncertain) { next.state = 'queued'; next.error = null }
     this.changed(run)
@@ -475,7 +486,11 @@ export class OrchestratorService {
     requireThat(!this.launching.has(`${id}/${taskId}`), 'TASK_STARTING', 'Wait for the previous launch to settle before retrying this task.')
     const key = this.attemptKey(run, task)
     requireThat(!this.steps.has(key), 'TASK_STOPPING', 'The previous attempt is still stopping; retry when it has ended.')
-    requireThat(!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state), 'RETRY_UNSAFE', 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
+    // A step left running by a crashed daemon is safe to replace once its process is gone.
+    const orphan = task.uncertain && task.run !== undefined
+    requireThat((orphan && task.pid !== undefined && exited(task.pid)) || (!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state)), 'RETRY_UNSAFE', orphan
+      ? `This step may still be running from before the daemon restart (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`
+      : 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
     requireThat(!run.tasks.some(t => t.dependsOn.includes(task.id) && ['running', 'launching', 'succeeded'].includes(t.state)), 'RESULT_IN_USE', 'Add a new revision task instead; downstream work already consumed this attempt.')
     this.retryDue.delete(key)
     this.requeue(run, task); this.pump(run); this.dispatchPending(run)
