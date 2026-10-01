@@ -51,6 +51,8 @@ export class OrchestratorService {
   // Attempts that failed and are replaced once nothing of them is still running (see releaseRetries).
   private readonly retryDue = new Set<string>()
   private loaded = false
+  // Saved deadlines are enforced only once the daemon can act on them (see recover).
+  private ready = false
   private stopped = false
   constructor(private readonly deps: OrchestratorDependencies) {}
 
@@ -83,7 +85,6 @@ export class OrchestratorService {
         }
         run.directorWorking = false
         this.runs.set(run.id, run)
-        if (run.state === 'active') this.restoreDeadlines(run)
       } catch (error) {
         // Keep corrupt files untouched and refuse a new start with the same id.
         console.warn(`[orchestrator] could not read ${name}: ${error instanceof Error ? error.message : 'invalid state'}`)
@@ -126,8 +127,15 @@ export class OrchestratorService {
     if (run.messages.length > 200) run.messages.splice(0, run.messages.length - 200)
     return message
   }
-  /** Called once at daemon start, after agent callbacks exist: the service is otherwise created lazily, and deadlines must not wait for a request. */
-  recover(): void { this.load() }
+  /**
+   * Called once at daemon start, after agent callbacks exist: the service is otherwise created lazily, and deadlines must
+   * not wait for a request. Loading alone (an early role lookup) never enforces a saved deadline.
+   */
+  recover(): void {
+    this.load()
+    this.ready = true
+    for (const run of this.runs.values()) if (run.state === 'active') this.restoreDeadlines(run)
+  }
   catalog(): HarnessChoice[] { return this.deps.catalog() }
   /**
    * What an agent is to a project: a specialist (`worker`), the Director (with whether work is still
@@ -369,6 +377,7 @@ export class OrchestratorService {
   }
   /** Saved deadlines without a timer: after a restart, or one that came due (and was ignored) while the project was paused. */
   private restoreDeadlines(run: Run): void {
+    if (!this.ready) return
     for (const task of run.tasks) if (task.state === 'running' && task.deadline !== undefined && !this.deadlines.has(this.attemptKey(run, task))) this.scheduleDeadline(run, task)
   }
   private scheduleDeadline(run: Run, task: Task): void {
