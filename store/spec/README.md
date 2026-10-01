@@ -167,7 +167,7 @@ CLI: `harness dsh install <id|git-url|path> [--link] [--ref <ref>] [--path <fold
 store/
   README.md            what a package is, the tiers, how to build and publish, the shelf's rules
   spec/README.md       this contract, frozen; CHANGES.md is append-only
-  spec/schema/         harness.schema.json, verdict.schema.json
+  spec/schema/         harness.schema.json, verdict.schema.json, flow.schema.json
   starter/             tier 0: manifest + AGENTS.md + one skill; the CLI's test fixture
   agents/<name>/       built-in harnesses: harness.json + store.json, each its own registry entry
   viewers/<name>/      built-in viewer packages, the same way
@@ -177,4 +177,4 @@ cli/src/dsh/           manifest, install, materialize, viewer, verdict, probe, r
 desktop/lib/dsh/       catalog, web pane, verdict chip
 ```
 
-Normative schemas: [`schema/harness.schema.json`](schema/harness.schema.json), [`schema/verdict.schema.json`](schema/verdict.schema.json).
+Normative schemas: [`schema/harness.schema.json`](schema/harness.schema.json), [`schema/verdict.schema.json`](schema/verdict.schema.json), [`schema/flow.schema.json`](schema/flow.schema.json).
