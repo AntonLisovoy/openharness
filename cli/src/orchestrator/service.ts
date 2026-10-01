@@ -485,7 +485,6 @@ export class OrchestratorService {
       task.state = 'cancelled'
       if (task.agentId) agents.push(task.agentId)
     }
-    this.changed(run)
     if (!taskId && run.directorId) agents.push(run.directorId)
     for (const message of run.messages) {
       if (taskId && !agents.includes(message.targetAgentId ?? '')) continue
@@ -494,9 +493,10 @@ export class OrchestratorService {
       message.delivery = revoked ? 'failed' : 'unknown'
       message.deliveryReason = revoked ? 'Cancelled before delivery.' : 'Stopped after dispatch; inspect the agent before resending.'
     }
-    this.changed(run)
+    // Stop first: a save that fails (and throws to the caller) must not leave a process running without its deadline.
     for (const task of tasks) this.steps.get(this.attemptKey(run, task))?.handle.stop()
     for (const agent of agents) this.deps.cancel(agent)
+    this.changed(run)
     this.pump(run)
   }
   resume(id: string): void {
@@ -634,15 +634,18 @@ export class OrchestratorService {
   }
   stop(): void {
     this.stopped = true
-    for (const { run, task, attempt, handle } of this.steps.values()) {
-      handle.stop({ now: true }) // the daemon exits right after: no grace period anything could outlive it by
-      if (task.attempt !== attempt || task.state !== 'running') continue
-      task.state = 'failed'; task.error = 'Stopped with the daemon.'
-      this.save(run)
-    }
-    this.steps.clear()
+    // Kill everything before saving anything: the daemon exits right after, and a failed save must not keep a step alive.
+    for (const { handle } of this.steps.values()) handle.stop({ now: true })
     for (const timer of this.deadlines.values()) clearTimeout(timer)
     this.deadlines.clear(); this.retryDue.clear()
-    for (const id of this.dirty.keys()) this.save(this.runs.get(id)!)
+    const unsaved = new Set([...this.dirty.keys()].map(id => this.runs.get(id)!))
+    for (const { run, task, attempt } of this.steps.values()) if (task.attempt === attempt && task.state === 'running') {
+      task.state = 'failed'; task.error = 'Stopped with the daemon.'
+      unsaved.add(run)
+    }
+    this.steps.clear()
+    for (const run of unsaved) {
+      try { this.save(run) } catch (error) { console.warn(`[orchestrator] could not save ${run.id}: ${(error as Error).message}`) }
+    }
   }
 }
