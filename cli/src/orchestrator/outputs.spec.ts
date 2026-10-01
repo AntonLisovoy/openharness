@@ -67,11 +67,13 @@ describe('checkOutputs', () => {
     expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false, missing: ['.harness/verdict.json with ready: true'] })
     vi.restoreAllMocks()
   })
-  it('rejects verdict when read text exceeds size bound', async () => {
+  it('rejects verdict when read buffer exceeds size bound', async () => {
     write('a.step')
     write('.harness/verdict.json', JSON.stringify({ spec: 1, ready: true }))
     const readFileMock = fsp.readFile as any
-    readFileMock.mockResolvedValueOnce('x'.repeat(1024 * 1024 + 1))
+    const verdictJson = JSON.stringify({ spec: 1, ready: true, pad: 'é'.repeat(600_000) })
+    const buffer = Buffer.from(verdictJson, 'utf8')
+    readFileMock.mockResolvedValueOnce(buffer)
     expect(await checkOutputs(cwd, { files: ['a.step'], verdict: 'ready' })).toMatchObject({ ok: false, missing: ['.harness/verdict.json with ready: true'] })
     vi.restoreAllMocks()
   })
