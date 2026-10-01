@@ -51,9 +51,9 @@ async function verdictReady(cwd: string): Promise<boolean> {
   if (!fileInfo.isFile() || fileInfo.size > MAX_VERDICT_BYTES) return false
 
   try {
-    const text = await readFile(verdictFile, 'utf8')
-    if (text.length > MAX_VERDICT_BYTES) return false
-    return parseVerdict(text)?.ready === true
+    const buffer = await readFile(verdictFile)
+    if (buffer.length > MAX_VERDICT_BYTES) return false
+    return parseVerdict(buffer.toString('utf8'))?.ready === true
   } catch {
     return false
   }
