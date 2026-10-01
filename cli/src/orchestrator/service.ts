@@ -43,7 +43,7 @@ export class OrchestratorService {
   private readonly pumping = new Set<string>()
   private readonly launching = new Set<string>()
   private readonly assistantMessages = new Map<string, string>()
-  private readonly steps = new Map<string, { run: Run; task: Task; handle: StepHandle }>()
+  private readonly steps = new Map<string, { run: Run; task: Task; attempt: number; handle: StepHandle }>()
   private loaded = false
   private stopped = false
   constructor(private readonly deps: OrchestratorDependencies) {}
@@ -281,7 +281,7 @@ export class OrchestratorService {
     try {
       await mkdir(task.cwd, { recursive: true, mode: 0o700 })
       for (const input of inputs) await materializeInputs(this.artifactRoot(run, input), join(task.cwd, 'inputs', input.id), input.artifacts)
-      if (task.state !== 'launching' || run.state !== 'active') return
+      if (this.stopped || task.state !== 'launching' || run.state !== 'active') return
       if (task.run !== undefined) return this.launchStep(run, task)
       const harness = this.catalog().find(h => h.id === task.harness)
       const own = this.ownEngine(task.harness)
@@ -319,7 +319,7 @@ export class OrchestratorService {
   private launchStep(run: Run, task: Task): void {
     const attempt = task.attempt, key = this.attemptKey(run, task)
     const handle = startStep(task.run!, { cwd: task.cwd, env: this.stepEnv(run, task), spawn: this.deps.spawnStep })
-    this.steps.set(key, { run, task, handle })
+    this.steps.set(key, { run, task, attempt, handle })
     if (handle.pid !== undefined) task.pid = handle.pid
     task.state = 'running'
     void handle.done.then(async result => {
@@ -360,7 +360,7 @@ export class OrchestratorService {
   /** The only way an attempt ends. Serialized per attempt; success re-checks after the rename so a cancel wins. */
   private async settle(run: Run, task: Task, attempt: number, outcome: Outcome): Promise<void> {
     const key = this.attemptKey(run, task, attempt)
-    const current = (): boolean => run.state === 'active' && ['running', 'launching'].includes(task.state) && task.attempt === attempt
+    const current = (): boolean => !this.stopped && run.state === 'active' && ['running', 'launching'].includes(task.state) && task.attempt === attempt
     const operation = (async () => {
       if ('failed' in outcome) { task.state = 'failed'; task.error = outcome.failed; task.summary = outcome.failed }
       else {
@@ -533,8 +533,9 @@ export class OrchestratorService {
   }
   stop(): void {
     this.stopped = true
-    for (const { run, task, handle } of this.steps.values()) {
+    for (const { run, task, attempt, handle } of this.steps.values()) {
       handle.stop()
+      if (task.attempt !== attempt || task.state !== 'running') continue
       task.state = 'failed'; task.error = 'Stopped with the daemon.'
       this.save(run)
     }
