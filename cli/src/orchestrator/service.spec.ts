@@ -540,6 +540,10 @@ describe('durable orchestrator lifecycle', () => {
 })
 
 const sh: StepSpawner = (script, opts) => spawn('/bin/sh', ['-c', script], { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
+// A descendant that ignores SIGTERM, with its output redirected so the step's pipes close without it.
+const steps = (...tasks: object[]): string => JSON.stringify({ spec: 1, name: 'demo', tasks }) // JSON is YAML: no quoting puzzles
+const stubborn = (file: string) => `sh -c 'trap "" TERM; echo $$ > "${file}"; exec sleep 30' >/dev/null 2>&1 &`
 
 describe('flow runs', () => {
   let root: string, project: string, service: OrchestratorService, deps: OrchestratorDependencies
@@ -566,7 +570,17 @@ describe('flow runs', () => {
     }
     service = new OrchestratorService(deps)
   })
-  afterEach(() => { service.stop(); vi.useRealTimers(); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }) })
+  const leftovers: number[] = []
+  afterEach(() => {
+    service.stop(); vi.useRealTimers(); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true })
+    for (const pid of leftovers.splice(0)) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
+  })
+  const pidIn = async (file: string): Promise<number> => {
+    const pid = await vi.waitFor(() => { const text = readFileSync(file, 'utf8'); expect(text).toMatch(/^\d+\n$/); return Number(text) }, { timeout: 5000 })
+    leftovers.push(pid)
+    await new Promise(r => setTimeout(r, 100)) // exec'd: the ignored-TERM disposition is inherited by sleep
+    return pid
+  }
 
   it('runs a pinned graph without a director and completes it', async () => {
     const source = `spec: 1
@@ -883,6 +897,20 @@ tasks:
     service.retry(flowId, 's')
     await until('s', 'running', 2)
   }, 15_000)
+  it('starts a retry only once the failed attempt\'s leftovers are gone', async () => {
+    const child = join(project, 'child.pid'), overlap = join(project, 'overlap')
+    await startFlow(steps({ id: 's', run: `[ "$HARNESS_ATTEMPT" = 1 ] || { kill -0 "$(cat ${child})" 2>/dev/null && touch ${overlap}; exit 0; }; ${stubborn(child)} sleep 0.3; exit 1`, retry: { max_attempts: 1 } }))
+    await pidIn(child)
+    await until('s', 'succeeded', 2)
+    expect(existsSync(overlap)).toBe(false)
+  }, 15_000)
+  it('kills steps outright on a daemon stop, leftovers that ignore SIGTERM included', async () => {
+    const child = join(project, 'child.pid')
+    await startFlow(steps({ id: 's', run: `${stubborn(child)} wait` }))
+    const pid = await pidIn(child)
+    service.stop()
+    await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 1000 })
+  })
   it('does not retry while the failed attempt is still launching', async () => {
     let finishLaunch!: () => void
     deps.create = async input => { launches.push(input); await new Promise<void>(r => { finishLaunch = r }); agents.add('late'); return { agentId: 'late' } }

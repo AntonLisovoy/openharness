@@ -635,7 +635,7 @@ export class OrchestratorService {
   stop(): void {
     this.stopped = true
     for (const { run, task, attempt, handle } of this.steps.values()) {
-      handle.stop()
+      handle.stop({ now: true }) // the daemon exits right after: no grace period anything could outlive it by
       if (task.attempt !== attempt || task.state !== 'running') continue
       task.state = 'failed'; task.error = 'Stopped with the daemon.'
       this.save(run)

@@ -41,6 +41,36 @@ describe('shell steps', () => {
     await step.done
     await vi.waitFor(() => expect(alive(child)).toBe(false), { timeout: 3000 })
   })
+  it('ends only once the leftovers of its group are gone, even with their output redirected', async () => {
+    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' >/dev/null 2>&1 & sleep 0.3; exit 1`, { cwd, env: {}, spawn: sh, graceMs: 300 })
+    await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+\n/))
+    const child = Number(readFileSync(join(cwd, 'child.pid'), 'utf8'))
+    pids.push(child)
+    expect(await step.done).toMatchObject({ code: 1, error: null })
+    expect(alive(child)).toBe(false)
+  })
+  it('kills the whole group at once when stopped now', async () => {
+    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' & wait`, { cwd, env: {}, spawn: sh, graceMs: 30_000 })
+    await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+\n/))
+    const child = Number(readFileSync(join(cwd, 'child.pid'), 'utf8'))
+    pids.push(child)
+    await new Promise(r => setTimeout(r, 100)) // exec'd: the ignored-TERM disposition is inherited by sleep
+    step.stop({ now: true })
+    await vi.waitFor(() => expect(alive(child)).toBe(false), { timeout: 1000 })
+    step.stop() // a graceful stop afterwards changes nothing
+    expect(await step.done).toMatchObject({ signal: 'SIGKILL', error: null })
+  })
+  it('says so when it cannot confirm its group stopped', async () => {
+    const kill = process.kill.bind(process)
+    vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (signal === 0) throw Object.assign(new Error('not permitted'), { code: 'EPERM' })
+      return kill(pid, signal)
+    })
+    const fake = Object.assign(new EventEmitter(), { pid: 999_999, stdout: null, stderr: null }) as unknown as ChildProcess
+    const step = startStep('true', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
+    fake.emit('exit', 0, null); fake.emit('close', 0, null)
+    expect(await step.done).toMatchObject({ code: 0, error: 'processes it started could not be confirmed stopped' })
+  })
   it('does not wait forever for pipes a leftover process keeps open', async () => {
     const result = await startStep('(trap "" TERM; sleep 30) & echo done', { cwd, env: {}, spawn: sh, graceMs: 200 }).done
     expect(result).toMatchObject({ code: 0, stdoutTail: 'done\n' })
