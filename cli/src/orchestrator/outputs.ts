@@ -1,6 +1,6 @@
-import { lstat, readdir } from 'node:fs/promises'
+import { lstat, opendir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { readVerdictFile } from '../dsh/verdict.js'
+import { parseVerdict } from '../dsh/verdict.js'
 import { OrchestratorError, type Outputs } from './model.js'
 
 export type OutputsCheck = { ok: true; files: string[] } | { ok: false; missing: string[] }
@@ -25,7 +25,8 @@ async function listFiles(root: string): Promise<string[]> {
   const files: string[] = []
   let seen = 0
   const walk = async (dir: string, prefix: string, depth: number): Promise<void> => {
-    for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const dirHandle = await opendir(dir)
+    for await (const entry of dirHandle) {
       if (++seen > MAX_ENTRIES) throw new OrchestratorError('OUTPUTS_TOO_LARGE', `The task folder has more than ${MAX_ENTRIES} entries to search.`)
       const path = prefix ? `${prefix}/${entry.name}` : entry.name
       if (entry.isFile()) files.push(path)
@@ -36,9 +37,26 @@ async function listFiles(root: string): Promise<string[]> {
   return files
 }
 async function verdictReady(cwd: string): Promise<boolean> {
-  const file = join(cwd, '.harness', 'verdict.json')
-  const info = await lstat(file).catch(() => null)
-  return !!info?.isFile() && info.size <= MAX_VERDICT_BYTES && readVerdictFile(file)?.ready === true
+  const harnessDir = join(cwd, '.harness')
+  const verdictFile = join(harnessDir, 'verdict.json')
+
+  // Check .harness is a real directory (not symlink)
+  let harnessInfo
+  try { harnessInfo = await lstat(harnessDir) } catch { return false }
+  if (!harnessInfo.isDirectory()) return false
+
+  // Check verdict.json is a regular file (not symlink) and within size bound
+  let fileInfo
+  try { fileInfo = await lstat(verdictFile) } catch { return false }
+  if (!fileInfo.isFile() || fileInfo.size > MAX_VERDICT_BYTES) return false
+
+  try {
+    const text = await readFile(verdictFile, 'utf8')
+    if (text.length > MAX_VERDICT_BYTES) return false
+    return parseVerdict(text)?.ready === true
+  } catch {
+    return false
+  }
 }
 
 export async function checkOutputs(cwd: string, outputs: Outputs): Promise<OutputsCheck> {
