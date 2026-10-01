@@ -662,4 +662,41 @@ tasks:
     expect(await explicit).toMatchObject({ message: 'disk full' })
     await until('a', 'succeeded')
   })
+  it('starts nothing when the daemon stops while a step is being prepared', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const spawned = vi.fn(sh)
+    deps.spawnStep = spawned
+    const realMkdir = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).mkdir
+    vi.mocked(filesystem.mkdir).mockImplementationOnce(async (...args: Parameters<typeof realMkdir>) => { await gate; return realMkdir(...args) })
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true' }]\n`)
+    service.stop()
+    release()
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(spawned).not.toHaveBeenCalled()
+    expect(launches).toHaveLength(0)
+  })
+  it('does not record success for a step whose result is being saved when the daemon stops', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const realRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let reached!: () => void
+    const inRename = new Promise<void>(resolve => { reached = resolve })
+    vi.mocked(filesystem.rename).mockImplementationOnce(async (from, to) => { reached(); await gate; return realRename(from, to) })
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true' }]\n`)
+    await inRename
+    service.stop()
+    release()
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(state('a').state).not.toBe('succeeded')
+  })
+  it('keeps a cancelled step cancelled when the daemon stops right after', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'sleep 30' }]\n`)
+    await until('slow', 'running')
+    service.cancel(flowId)
+    service.stop()
+    const saved = JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))
+    expect(saved.tasks[0]).toMatchObject({ state: 'cancelled' })
+  })
 })
