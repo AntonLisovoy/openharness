@@ -9,7 +9,7 @@ import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
 import { compileFlow, inputEnvName, parseFlowSource } from './flow.js'
 import { checkOutputs } from './outputs.js'
-import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Task } from './model.js'
+import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
 import { directorPrompt, workerPrompt, type HarnessChoice } from './prompts.js'
 import { startStep, stepFailure, type StepHandle, type StepSpawner } from './steps.js'
 
@@ -373,10 +373,12 @@ export class OrchestratorService {
     task.state = 'running'
     this.armDeadline(run, task)
     this.background(run, handle.done.then(async result => {
-      this.steps.delete(key)
       await this.settleAuto(run, task, attempt, result.code === 0 && !result.error
         ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: ['stdout.log', 'stderr.log'] }
         : { failed: stepFailure(result), retryable: result.started })
+      // A failed attempt (exit, timeout) keeps its logs too, saved while the step still blocks a retry.
+      if (result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt)
+      this.steps.delete(key)
       this.pump(run) // a failed attempt's retry waits for its process to exit
     }))
     this.launched(run)
@@ -448,18 +450,9 @@ export class OrchestratorService {
     const operation = async (): Promise<void> => {
       if ('failed' in outcome) { task.state = 'failed'; task.error = outcome.failed; task.summary = outcome.failed }
       else {
-        const destination = this.artifactRoot(run, task, attempt)
-        const staging = join(run.root, 'artifacts', `${task.id}-${randomBytes(8).toString('hex')}.staging`)
-        try {
-          const artifacts = await snapshotArtifacts(task.cwd, staging, outcome.paths)
-          requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
-          await mkdir(join(run.root, 'artifacts', task.id), { recursive: true, mode: 0o700 })
-          await rename(staging, destination)
-          requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
-          task.artifacts = artifacts
-          task.state = 'succeeded'
-          task.summary = outcome.summary
-        } finally { await rm(staging, { recursive: true, force: true }).catch(() => {}) }
+        task.artifacts = await this.saveAttempt(run, task, attempt, outcome.paths, () => requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.'))
+        task.state = 'succeeded'
+        task.summary = outcome.summary
       }
       // Only an attempt that really ended loses its deadline: a result that could not be saved leaves the step to time out.
       clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
@@ -472,6 +465,26 @@ export class OrchestratorService {
     try { await operation() } finally {
       ended(); this.finishing.delete(key)
       if (this.retryDue.has(key)) this.pump(run)
+    }
+  }
+  /** Snapshot paths of the task folder into the attempt's artifact folder; `check` runs after each slow step. */
+  private async saveAttempt(run: Run, task: Task, attempt: number, paths: string[], check: () => void = () => {}): Promise<Artifact[]> {
+    const staging = join(run.root, 'artifacts', `${task.id}-${randomBytes(8).toString('hex')}.staging`)
+    try {
+      const artifacts = await snapshotArtifacts(task.cwd, staging, paths)
+      check()
+      await mkdir(join(run.root, 'artifacts', task.id), { recursive: true, mode: 0o700 })
+      await rename(staging, this.artifactRoot(run, task, attempt))
+      check()
+      return artifacts
+    } finally { await rm(staging, { recursive: true, force: true }).catch(() => {}) }
+  }
+  private async keepLogs(run: Run, task: Task, attempt: number): Promise<void> {
+    try {
+      task.artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'])
+      this.changed(run)
+    } catch (error) {
+      console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${(error as Error).message}`)
     }
   }
   private requeue(run: Run, task: Task): void {

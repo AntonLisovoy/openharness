@@ -621,6 +621,9 @@ tasks:
   it('fails a step with its exit code and stops the flow with a readable error', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: bad, run: 'echo nope >&2; exit 4' }\n  - { id: after, run: 'true', depends_on: [bad] }\n`)
     expect((await until('bad', 'failed')).error).toBe('exit 4: nope')
+    // A failed attempt keeps its logs as artifacts once its process is gone.
+    await vi.waitFor(() => expect(state('bad').artifacts.map(a => a.path)).toEqual(['stdout.log', 'stderr.log']))
+    expect(readFileSync(join(snap().root, 'artifacts', 'bad', 'attempt-1', 'stderr.log'), 'utf8')).toBe('nope\n')
     await until('after', 'blocked')
     await vi.waitFor(() => expect(snap().error).toBe('Flow stopped: bad (failed), after (blocked). Retry a task or cancel the project.'))
     expect(snap().state).toBe('active')
@@ -823,6 +826,8 @@ tasks:
     await until('slow', 'failed', 2)
     expect(state('slow').error).toBe('Timed out after 1s.')
     expect(readFileSync(join(project, 'attempts'), 'utf8')).toBe('1\n2\n')
+    await vi.waitFor(() => expect(state('slow').artifacts.map(a => a.path)).toEqual(['stdout.log', 'stderr.log']))
+    expect(existsSync(join(snap().root, 'artifacts', 'slow', 'attempt-1', 'stdout.log'))).toBe(true)
     expect(snap().messages.some(m => m.text === 'Task slow attempt 1 failed; retrying (attempt 2 of 2).')).toBe(true)
     // While the retry was due the flow was never reported as stopped.
     expect(snap().messages.filter(m => m.text.startsWith('Task slow attempt')).map(m => m.text.split('\n')[0])).toEqual([
@@ -838,6 +843,14 @@ tasks:
     await until('a', 'running', 2)
     expect(cancelled).toEqual([a.agentId])
     expect(snap().messages.some(m => m.text.includes('Timed out after 1h.'))).toBe(true)
+  })
+  it('still fails a step whose logs could not be kept, and says why', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.mocked(filesystem.rename).mockRejectedValueOnce(new Error('disk full'))
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'exit 2' }]\n`)
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[orchestrator] a attempt 1: logs not kept: disk full'), { timeout: 5000 })
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    expect(state('a')).toMatchObject({ state: 'failed', error: 'exit 2', artifacts: [] })
   })
   it('still times out a step left running when its result could not be saved', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
