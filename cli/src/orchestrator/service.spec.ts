@@ -905,6 +905,30 @@ tasks:
     await vi.waitFor(() => expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
     expect(cancelled).toEqual([a.agentId])
   })
+  it('stops a timed-out step even when the failure cannot be saved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: s, run: 'sleep 30' }]\n`)
+    await until('s', 'running')
+    const exited = internals().steps.values().next().value!.handle.done
+    const run = internals().runs.get(flowId)!
+    const backup = join(root, 'state-backup')
+    renameSync(deps.stateDir, backup); writeFileSync(deps.stateDir, 'blocked directory')
+    try { await internals().expire(run, run.tasks[0], 1) } finally { unlinkSync(deps.stateDir); renameSync(backup, deps.stateDir) }
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] s attempt 1: ENOTDIR/))
+    await exited // the process was terminated, not left to outlive its deadline
+    expect(state('s')).toMatchObject({ state: 'failed', error: 'Timed out after 10m.' })
+  }, 15_000)
+  it('does not mark a worker running or arm its deadline once the daemon has stopped', async () => {
+    let resolve!: (value: { agentId: string }) => void
+    deps.create = () => new Promise(r => { resolve = r })
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
+    await vi.waitFor(() => expect(resolve).toBeTypeOf('function'))
+    service.stop()
+    resolve({ agentId: 'late' })
+    await vi.waitFor(() => expect(state('a').agentId).toBe('late'))
+    expect(state('a').state).toBe('launching')
+    expect(internals().deadlines.size).toBe(0)
+  })
   it('clears pending deadlines and retries when the daemon stops', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
     await until('a', 'running')
