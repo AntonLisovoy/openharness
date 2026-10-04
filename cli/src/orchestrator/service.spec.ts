@@ -82,7 +82,7 @@ describe('durable orchestrator lifecycle', () => {
     // The release pump could not save blocking `next`: the run is paused rather than left active with nothing to wake it.
     expect(run.tasks.find(t => t.id === 'next')!.state).toBe('queued')
     expect(run).toMatchObject({ state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) })
-    service.resume(id)
+    await service.resume(id)
     expect(run.tasks.find(t => t.id === 'next')!.state).toBe('blocked')
   })
   it('does not mark a task succeeded when it is cancelled while its artifacts are being saved', async () => {
@@ -399,7 +399,7 @@ describe('durable orchestrator lifecycle', () => {
     saved.state = 'starting'; saved.directorId = null; saved.tasks[0].state = 'launching'
     writeFileSync(file, JSON.stringify(saved)); service = new OrchestratorService(deps)
     expect(service.snapshot(id)).toMatchObject({ state: 'paused', directorAvailable: false, tasks: [{ state: 'blocked', uncertain: true }] })
-    expect(() => service.resume(id)).toThrow(/original director/)
+    await expect(service.resume(id)).rejects.toThrow(/original director/)
     expect(launches).toHaveLength(2)
   })
   it.each([new Error('Engine not authenticated'), 'unknown process refusal'])('records a director creation failure without hiding it: %s', async failure => {
@@ -438,7 +438,7 @@ describe('durable orchestrator lifecycle', () => {
     service.complete(id, 'Done'); service.chat(id, '2'.repeat(32), 'Create a revision')
     expect(service.snapshot(id).state).toBe('active')
     service.plan(id, [task('revision', ['notes'], 'engine:claude')]); await running('revision')
-    service.cancel(id); service.resume(id)
+    service.cancel(id); await service.resume(id)
     expect(service.snapshot(id).state).toBe('active')
     expect(tasks()[0].state).toBe('succeeded'); expect(tasks()[1].state).toBe('cancelled')
     expect(launches).toHaveLength(3)
@@ -717,7 +717,7 @@ tasks:
     expect(() => service.plan(flowId, [task('x')])).toThrow(expect.objectContaining({ code: 'FLOW_PINNED' }))
     expect(() => service.chat(flowId, 'c'.repeat(32), 'hi')).toThrow(expect.objectContaining({ code: 'DIRECTOR_UNAVAILABLE' }))
     service.cancel(flowId, 'b')
-    service.resume(flowId)
+    await service.resume(flowId)
     expect(snap().state).toBe('active')
   })
   it('validates the whole flow before creating anything', async () => {
@@ -1143,7 +1143,7 @@ tasks:
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] a attempt 1: ENOSPC/))
     // The retry could not be saved: the run pauses, and resuming starts the retry.
     expect(live()).toMatchObject({ state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) })
-    service.resume(flowId)
+    await service.resume(flowId)
     await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'running', attempt: 2 }))
   })
   it('runs what follows a reported result once, even when a change observer fails', async () => {
@@ -1331,7 +1331,7 @@ tasks:
     const dir = join(root, 'state-after-crash')
     mkdirSync(dir, { mode: 0o700 }); writeFileSync(join(dir, `${flowId}.json`), JSON.stringify(saved), { mode: 0o600 })
     const recovered = new OrchestratorService({ ...deps, stateDir: dir }); others.push(recovered)
-    recovered.recover()
+    await recovered.recover()
     const after = (taskId: string) => (recovered as unknown as { runs: Map<string, Run> }).runs.get(flowId)!.tasks.find(t => t.id === taskId)!
     expect(after('slow')).toMatchObject({ state: 'blocked', uncertain: true, error: expect.stringContaining(`pid ${left.pid}`) })
     expect(after('nopid').error).toContain('pid unknown')
@@ -1352,7 +1352,7 @@ tasks:
     expect(internals().deadlines.size).toBe(0)
     expect(state('a').state).toBe('running')
     expect(cancelled).toEqual([])
-    service.recover()
+    await service.recover()
     await vi.waitFor(() => expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
     expect(cancelled).toEqual([a.agentId])
   })
@@ -1367,7 +1367,7 @@ tasks:
     service.stop() // the original daemon is gone before the next one starts
     const recovered = new OrchestratorService({ ...deps, stateDir: dir })
     others.push(recovered)
-    recovered.recover()
+    await recovered.recover()
     return { recovered, step: () => (recovered as unknown as { runs: Map<string, Run> }).runs.get(flowId)!.tasks[0] }
   }
   const exitedPid = async (command: string, args: string[]): Promise<{ pid: number; exited: Promise<unknown> }> => {
@@ -1425,7 +1425,7 @@ tasks:
     saved.tasks[0].state = 'running'; saved.tasks[0].deadline = Date.now() - 1 // a cancelled project is never expired
     const recovered = new OrchestratorService({ ...deps, stateDir: join(root, 'state-after-crash') })
     mkdirSync(join(root, 'state-after-crash'), { mode: 0o700 }); writeFileSync(join(root, 'state-after-crash', `${flowId}.json`), JSON.stringify(saved), { mode: 0o600 })
-    recovered.recover(); recovered.recover()
+    await recovered.recover(); await recovered.recover()
     expect((recovered as unknown as { deadlines: Map<string, unknown> }).deadlines.size).toBe(0)
     recovered.stop()
   })
@@ -1437,10 +1437,10 @@ tasks:
     saved.state = 'paused'; saved.tasks[0].deadline = Date.now() - 1
     writeFileSync(file, JSON.stringify(saved))
     service = new OrchestratorService(deps)
-    service.recover()
+    await service.recover()
     expect(snap().state).toBe('paused')
     expect(internals().deadlines.size).toBe(0)
-    service.resume(flowId)
+    await service.resume(flowId)
     await vi.waitFor(() => expect(state('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
     expect(cancelled).toEqual([a.agentId])
   })
@@ -1471,7 +1471,7 @@ tasks:
   it('clears pending deadlines and retries when the daemon stops', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: p, timeout: 1h }]\n`)
     await until('a', 'running')
-    service.recover(); service.resume(flowId) // an armed deadline is not armed twice
+    await service.recover(); await service.resume(flowId) // an armed deadline is not armed twice
     expect(internals().deadlines.size).toBe(1)
     service.stop()
     expect(internals().deadlines.size).toBe(0)
@@ -1565,7 +1565,7 @@ tasks:
     await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: check, run: 'true' }\n  - { id: fix, run: 'true', depends_on: [check], when: 'check.state == failed' }\n`)
     await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
     expect(live().tasks.map(t => t.state)).toEqual(['succeeded', 'queued'])
-    recover(); service.resume(flowId)
+    recover(); await service.resume(flowId)
     expect(live()).toMatchObject({ state: 'completed' })
     expect(liveTask('fix').state).toBe('skipped')
   })
@@ -1575,7 +1575,7 @@ tasks:
     await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: bad, run: 'exit 4' }\n  - { id: after, run: 'true', depends_on: [bad] }\n`)
     await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
     expect(live().tasks.map(t => t.state)).toEqual(['failed', 'queued'])
-    recover(); service.resume(flowId)
+    recover(); await service.resume(flowId)
     expect(liveTask('after').state).toBe('blocked')
     expect(live()).toMatchObject({ state: 'active', error: 'Flow stopped: bad (failed), after (blocked). Retry a task or cancel the project.' })
   })
@@ -1587,7 +1587,7 @@ tasks:
     await service.finish(flowId, 'a', 1, 'done', []) // the result itself was saved: no error for its reporter
     expect(liveTask('a').state).toBe('succeeded')
     expect(live()).toMatchObject(pausedByDisk)
-    recover(); service.resume(flowId)
+    recover(); await service.resume(flowId)
     expect(live()).toMatchObject({ state: 'completed', error: null })
     expect(live().messages.at(-1)!.text).toBe('Flow demo completed: 1 tasks succeeded.')
   })

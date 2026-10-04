@@ -18,7 +18,7 @@ export async function orchestratorRequest(service: OrchestratorService, payload:
         break
       case 'retry': service.retry(id, TaskId.parse(payload.taskId)); break
       case 'cancel': service.cancel(id, payload.taskId === undefined ? undefined : TaskId.parse(payload.taskId)); break
-      case 'resume': service.resume(id); break
+      case 'resume': await service.resume(id); break
       case 'complete': service.complete(id, z.string().parse(payload.summary)); break
       case 'message': service.chat(id, RunId.parse(payload.messageId), z.string().parse(payload.text)); break
       case 'steer': service.steer(id, TaskId.parse(payload.taskId), z.number().int().min(1).parse(payload.attempt), RunId.parse(payload.messageId), z.string().parse(payload.text)); break

@@ -187,7 +187,7 @@ export class OrchestratorService {
    * Called once at daemon start, after agent callbacks exist: the service is otherwise created lazily, and deadlines must
    * not wait for a request. Loading alone (an early role lookup) never enforces a saved deadline.
    */
-  recover(): void {
+  async recover(): Promise<void> {
     this.load()
     this.ready = true
     for (const run of this.runs.values()) if (run.state === 'active') this.restoreDeadlines(run)
@@ -678,7 +678,7 @@ export class OrchestratorService {
     this.changed(run)
     this.pump(run)
   }
-  resume(id: string): void {
+  async resume(id: string): Promise<void> {
     const run = this.get(id)
     requireThat(run.flow || (run.directorId && this.deps.agent(run.directorId)), 'DIRECTOR_UNAVAILABLE', 'Inspect or restart the original director before resuming; no duplicate will be launched.')
     requireThat(run.state !== 'starting', 'PROJECT_STARTING', 'The director is still starting.')

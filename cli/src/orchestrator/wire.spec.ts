@@ -27,6 +27,17 @@ describe('orchestrator RPC boundary', () => {
     expect(reply).toEqual({ project: { id } })
     expect(service[method as string]).toHaveBeenCalledWith(...args as unknown[])
   })
+  it('answers resume only once the service has finished resuming', async () => {
+    const service = makeService()
+    let release!: () => void
+    service.resume.mockImplementation((() => new Promise<void>(r => { release = r })) as never)
+    let answered = false
+    const reply = orchestratorRequest(service as unknown as OrchestratorService, { action: 'resume', id }).then(r => { answered = true; return r })
+    await vi.waitFor(() => expect(service.resume).toHaveBeenCalled())
+    expect(answered).toBe(false)
+    release()
+    expect(await reply).toEqual({ project: { id } })
+  })
   it('supports whole-project cancellation and reports validation errors without dispatch', async () => {
     const service = makeService(), wire = (payload: Record<string, unknown>) => orchestratorRequest(service as unknown as OrchestratorService, payload)
     await wire({ action: 'cancel', id }); expect(service.cancel).toHaveBeenCalledWith(id, undefined)

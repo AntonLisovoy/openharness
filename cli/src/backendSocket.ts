@@ -686,8 +686,8 @@ export class BackendSocket {
   orchestratorRoleOf(agentId: string): ReturnType<OrchestratorService['roleOf']> {
     return this.orchestration().roleOf(agentId)
   }
-  /** Load saved orchestrator projects now, so their deadlines run without waiting for a request. */
-  orchestratorRecover(): void { this.orchestration().recover() }
+  /** Load saved orchestrator projects now, so their deadlines run without waiting for a request; resolves once saved projects were reconciled. */
+  orchestratorRecover(): Promise<void> { return this.orchestration().recover() }
   private orchestration(): OrchestratorService {
     return this.orchestratorService ??= new OrchestratorService({
       stateDir: join(env.ADAPTER_DATA_DIR, 'orchestrator'),
