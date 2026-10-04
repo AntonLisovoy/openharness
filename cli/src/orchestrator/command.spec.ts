@@ -185,6 +185,10 @@ describe('flow run command', () => {
     expect(err.join('')).toContain('other.yaml declares name renamed')
     expect(JSON.parse(out.join(''))).toMatchObject({ engine: 'codex' })
   })
+  it('needs no harness for approval and cancel tasks', async () => {
+    writeFileSync(join(dir, '.harness/flows/other.yaml'), 'spec: 1\nname: other\ntasks: [{ id: ok, approval: Ship? }, { id: stop, cancel: no, depends_on: [ok] }]\n')
+    expect(await flowRunCommand(['other', '--dry-run'], io({ catalog: () => [] }))).toBe(0)
+  })
   it('starts the flow on the daemon and prints the project', async () => {
     const request = vi.fn(async () => ({ project: { id: 'p', state: 'active', tasks: [], messages: [] } }))
     expect(await flowRunCommand(['demo', '--input', 'word=hi', '--port', '1234', '--machine', 'm', '--engine', 'codex', '--parallelism', '2'], io({ request }))).toBe(0)

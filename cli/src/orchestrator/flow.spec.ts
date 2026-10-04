@@ -49,8 +49,7 @@ describe('flow compilation', () => {
     ['a tag', 'spec: 1\nname: x\ntasks:\n  - id: a\n    run: !!str true\n', 'Tags are not allowed'],
     ['a duplicate key', 'spec: 1\nname: x\nname: y\ntasks: [{ id: a, run: "true" }]\n', 'flow.yaml:3:'],
     ['two documents', 'spec: 1\n---\nspec: 1\n', 'flow.yaml:'],
-    ['an unknown key', 'spec: 1\nname: x\ntasks: [{ id: a, run: "true", when: x }]\n', 'flow.yaml:3:'],
-    ['an approval step', 'spec: 1\nname: x\ntasks: [{ id: a, approval: "ok?" }]\n', 'Approval steps are not supported yet'],
+    ['an unknown key', 'spec: 1\nname: x\ntasks: [{ id: a, run: "true", colour: x }]\n', 'flow.yaml:3:'],
     ['a wrong spec', 'spec: 2\nname: x\ntasks: [{ id: a, run: "true" }]\n', 'spec'],
     ['an empty file', '', 'expected object'],
   ])('rejects %s with a located message', (_name, source, expected) => {
@@ -71,7 +70,7 @@ tasks:
   - { id: three, run: "echo $HARNESS_INPUT_NOPE", outputs: { files: [x] } }
   - { id: four, harness: engine:claude, prompt: "use $inputs.zzz", timeout: 25h, depends_on: [ghost] }
 `, { nope: '1' }))
-    for (const part of ['Unknown input: nope', 'both required and have a default', 'HARNESS_INPUT_A', 'not both', 'needs harness and prompt',
+    for (const part of ['Unknown input: nope', 'both required and have a default', 'HARNESS_INPUT_A', 'exactly one of run, harness + prompt, approval or cancel',
       'Duplicate task id: two', 'reserved', 'Unknown input: HARNESS_INPUT_NOPE', 'outputs apply to agent tasks', 'Unknown input: $inputs.zzz', '24h']) {
       expect(message).toContain(part)
     }
@@ -128,8 +127,8 @@ tasks:
     expect(message).toContain('flow.yaml:4:')
     expect(message).toContain('timeout is limited to 24h')
     expect(message).toContain('Unknown dependency: ghost')
-    expect(message).toContain('needs harness and prompt')
-    expect(issues(() => parseFlowSource('spec: 1\nname: x\ntasks: [{ id: a, approval: ok, when: x }]\n', 'f.yaml'))).toMatch(/Approval steps are not supported yet[\s\S]*Unknown keys: when/)
+    expect(message).toContain('A task has exactly one of run, harness + prompt, approval or cancel.')
+    expect(issues(() => compile('spec: 1\nname: x\ntasks: [{ id: a, approval: ok, when: x }]\n'))).toBe('flow.yaml:3:38: tasks[0] (a): when: Write one comparison, like "review.verdict.errors == 0".')
   })
   it('never echoes values through conversion warnings and rejects non-plain keys', () => {
     const secret = 'SECRET_VALUE_123'
@@ -149,6 +148,109 @@ tasks:
   })
 })
 
+describe('flow task kinds, conditions and trigger rules', () => {
+  const compileTasks = (tasks: string, inputs = '') => compileFlow(parseFlowSource(`spec: 1\nname: demo\n${inputs}tasks:\n${tasks}`, 'f.yaml'), {})
+  const errors = (tasks: string, inputs = '') => issues(() => compileTasks(tasks, inputs))
+  it('compiles approvals, cancel steps, conditions and trigger rules', () => {
+    const flow = compileTasks(`  - { id: review, harness: test/cad, prompt: Review, outputs: { files: [r.md], verdict: ready } }
+  - { id: ok, approval: "Ship?", depends_on: [review], when: "review.verdict.errors == 0", timeout: 24h }
+  - id: choose
+    approval: { message: "Pick", decisions: [{ id: ship, label: Ship it }, { id: rework }] }
+    depends_on: [ok]
+  - { id: stop, cancel: "Rework asked", depends_on: [choose], when: "choose.decision == rework" }
+  - { id: report, run: "true", depends_on: [review], trigger_rule: all_done, retry: { max_attempts: 3, delay: 5s } }
+`)
+    expect(flow.tasks.find(t => t.id === 'ok')).toMatchObject({ harness: 'approval', prompt: 'Ship?', approval: { message: 'Ship?' }, when: 'review.verdict.errors == 0', timeoutMs: 86_400_000 })
+    expect(flow.tasks.find(t => t.id === 'ok')!.approval!.decisions).toBeUndefined()
+    expect(flow.tasks.find(t => t.id === 'choose')!.approval!.decisions).toEqual([{ id: 'ship', label: 'Ship it' }, { id: 'rework', label: 'rework' }])
+    expect(flow.tasks.find(t => t.id === 'stop')).toEqual({ id: 'stop', title: 'stop', dependsOn: ['choose'], harness: 'cancel', prompt: 'Rework asked', cancel: 'Rework asked', when: 'choose.decision == rework' })
+    expect(flow.tasks.find(t => t.id === 'report')).toMatchObject({ triggerRule: 'all_done', retry: { maxAttempts: 3, delayMs: 5000 } })
+    expect(flow.warnings).toEqual([])
+  })
+  it('substitutes inputs in approval messages and cancel reasons, and rejects unknown ones', () => {
+    const inputs = 'inputs: { issue: { default: "#7" } }\n'
+    const flow = compileTasks(`  - { id: ok, approval: { message: "Ship $inputs.issue?", decisions: [{ id: ship }] } }\n  - { id: stop, cancel: "Stop $inputs.issue", depends_on: [ok] }\n`, inputs)
+    expect(flow.tasks[0]).toMatchObject({ prompt: 'Ship #7?', approval: { message: 'Ship #7?' } })
+    expect(flow.tasks[1]).toMatchObject({ prompt: 'Stop #7', cancel: 'Stop #7' })
+    const message = errors(`  - { id: ok, approval: "Ship $inputs.nope?" }\n  - { id: stop, cancel: "Stop $inputs.zip" }\n`, inputs)
+    expect(message).toContain('Unknown input: $inputs.nope')
+    expect(message).toContain('Unknown input: $inputs.zip')
+  })
+  it('compiles a loop and an idle timeout on an agent task', () => {
+    const flow = compileTasks(`  - { id: fix, harness: test/cad, prompt: Fix, loop: { until_run: "npm test", max_iterations: 3 }, idle_timeout: 15m }\n`)
+    expect(flow.tasks[0]).toMatchObject({ loop: { untilRun: 'npm test', maxIterations: 3 }, idleTimeoutMs: 900_000 })
+    expect(flow.warnings).toEqual([])
+  })
+  it('accepts a declared HARNESS_INPUT in until_run', () => {
+    const flow = compileTasks(`  - { id: fix, harness: test/cad, prompt: Fix, timeout: 1h, loop: { until_run: "test $HARNESS_INPUT_X", max_iterations: 2 } }\n`, 'inputs: { x: {} }\n')
+    expect(flow.tasks[0].loop).toEqual({ untilRun: 'test $HARNESS_INPUT_X', maxIterations: 2 })
+  })
+  it('rejects a when on something that is not a direct dependency', () => {
+    expect(errors(`  - { id: a, run: "true" }\n  - { id: b, run: "true", depends_on: [a] }\n  - { id: c, run: "true", depends_on: [b], when: "a.state == failed" }\n`))
+      .toContain('f.yaml:6:50: tasks[2] (c): when: a is not a direct dependency of c.')
+    expect(errors(`  - { id: a, run: "true", when: "a.state == failed" }\n`)).toContain('when: a is not a direct dependency of a.')
+  })
+  it('rejects keys on the wrong kind', () => {
+    expect(errors(`  - { id: a, run: "true", loop: { until_run: "true", max_iterations: 1 } }\n`)).toContain('loop applies to agent tasks.')
+    expect(errors(`  - { id: a, run: "true", idle_timeout: 1m }\n`)).toContain('idle_timeout applies to agent tasks.')
+    expect(errors(`  - { id: a, approval: x, outputs: { files: [x] } }\n`)).toContain('outputs apply to agent tasks.')
+    expect(errors(`  - { id: a, cancel: x, timeout: 1m }\n`)).toContain('timeout does not apply to cancel tasks.')
+    expect(errors(`  - { id: a, approval: x, retry: { max_attempts: 2 } }\n`)).toContain('retry does not apply to approval or cancel tasks.')
+    expect(errors(`  - { id: a, cancel: x, retry: { max_attempts: 2 } }\n`)).toContain('retry does not apply to approval or cancel tasks.')
+    expect(errors(`  - { id: a, approval: x, run: "true" }\n`)).toContain('A task has exactly one of run, harness + prompt, approval or cancel.')
+    expect(errors(`  - { id: a, approval: x, cancel: y }\n`)).toContain('A task has exactly one of run, harness + prompt, approval or cancel.')
+    expect(errors(`  - { id: a, harness: approval, prompt: x }\n`)).toContain('"approval" is reserved; use the approval key instead.')
+    expect(errors(`  - { id: a, harness: cancel, prompt: x }\n`)).toContain('"cancel" is reserved; use the cancel key instead.')
+    expect(errors(`  - { id: a, harness: run, prompt: x }\n`)).toContain('"run" is reserved; use the run key instead.')
+  })
+  it('checks the keys that are present even when the kind is ambiguous', () => {
+    const message = errors(`  - { id: a, approval: x, cancel: y, loop: { until_run: "true", max_iterations: 1 }, timeout: 1m, retry: { max_attempts: 2 } }\n`)
+    expect(message).toContain('exactly one of')
+    expect(message).toContain('loop applies to agent tasks.')
+    expect(message).not.toContain('timeout does not apply') // the approval part allows a timeout
+    expect(message).toContain('retry does not apply to approval or cancel tasks.')
+    expect(errors(`  - { id: a, run: "true", approval: x, retry: { max_attempts: 2 } }\n`)).not.toContain('retry does not apply')
+  })
+  it('warns about a verdict nobody promised and an unbounded loop', () => {
+    const flow = compileTasks(`  - { id: a, harness: test/cad, prompt: x, loop: { until_run: "true", max_iterations: 2 } }\n  - { id: b, run: "true", depends_on: [a], when: "a.verdict.ready == true" }\n`)
+    expect(flow.warnings).toEqual([
+      'Task a loops without timeout or idle_timeout; it may run until someone stops it.',
+      'Task b: when reads the verdict of a, which does not declare outputs.verdict: ready.',
+    ])
+  })
+  it('accepts state conditions on any kind and decisions declared by an approval', () => {
+    const flow = compileTasks(`  - { id: c, approval: { message: m, decisions: [{ id: ship }] } }\n  - { id: d, run: "true", depends_on: [c], when: "c.decision == ship" }\n  - { id: e, cancel: x, depends_on: [c, d], when: "c.state != succeeded" }\n`)
+    expect(flow.tasks.map(t => t.when)).toEqual([undefined, 'c.decision == ship', 'c.state != succeeded'])
+    expect(flow.warnings).toEqual([])
+  })
+  it.each([
+    ['retry delay over 60s', `  - { id: a, run: "true", retry: { max_attempts: 2, delay: 2m } }\n`, 'retry.delay is 1s to 60s.'],
+    ['idle_timeout over 24h', `  - { id: a, harness: test/cad, prompt: p, idle_timeout: 25h }\n`, 'idle_timeout is limited to 24h.'],
+    ['$inputs in until_run', `  - { id: a, harness: test/cad, prompt: p, loop: { until_run: "test $inputs.x", max_iterations: 2 } }\n`, 'Use "$HARNESS_INPUT_X" in until_run'],
+    ['an unknown HARNESS_INPUT in until_run', `  - { id: a, harness: test/cad, prompt: p, loop: { until_run: "test $HARNESS_INPUT_Y", max_iterations: 2 } }\n`, 'Unknown input: HARNESS_INPUT_Y'],
+    ['a decision that is not declared', `  - { id: c, approval: { message: m, decisions: [{ id: ship }] } }\n  - { id: d, run: "true", depends_on: [c], when: "c.decision == rework" }\n`, 'when: c has no decision rework.'],
+    ['a decision on an approval without decisions', `  - { id: c, approval: m }\n  - { id: d, run: "true", depends_on: [c], when: "c.decision == ship" }\n`, 'when: c has no decisions to compare.'],
+    ['a decision on a shell step', `  - { id: c, run: "true" }\n  - { id: d, run: "true", depends_on: [c], when: "c.decision == ship" }\n`, 'when: c has no decisions to compare.'],
+    ['a verdict of an approval', `  - { id: c, approval: m }\n  - { id: d, run: "true", depends_on: [c], when: "c.verdict.ready == true" }\n`, 'when: c writes no verdict.'],
+    ['a verdict of a cancel step', `  - { id: c, cancel: m }\n  - { id: d, run: "true", depends_on: [c], when: "c.verdict.errors > 0" }\n`, 'when: c writes no verdict.'],
+    ['a duplicate decision id', `  - { id: c, approval: { message: m, decisions: [{ id: ship }, { id: ship }] } }\n`, 'approval.decisions: duplicate id ship.'],
+    ['a glob into .harness/loop/', `  - { id: a, harness: test/cad, prompt: p, outputs: { files: [".harness/loop/1.stdout.log"] } }\n`, 'outputs cannot name .harness/loop/, the loop check logs.'],
+    ['a syntax error in when', `  - { id: a, run: "true" }\n  - { id: b, run: "true", depends_on: [a], when: "a.state" }\n`, 'when: Write one comparison'],
+    ['a malformed duration', `  - { id: a, run: "true", timeout: 5d }\n`, 'a duration looks like 90s, 45m or 2h'],
+    ['a malformed decision id', `  - { id: c, approval: { message: m, decisions: [{ id: Ship }] } }\n`, 'a decision id looks like ship or needs-work'],
+    ['an unknown trigger rule', `  - { id: a, run: "true", trigger_rule: any }\n`, 'trigger_rule'],
+  ])('rejects %s', (_name, tasks, expected) => { expect(errors(tasks)).toContain(expected) })
+  it('keeps the phase-1 warning for agent tasks without outputs or timeout, but not for loops', () => {
+    expect(compileTasks(`  - { id: a, harness: test/cad, prompt: p }\n`).warnings).toEqual(['Task a has neither outputs nor timeout; it finishes only when its worker calls finish or fail.'])
+    expect(compileTasks(`  - { id: a, harness: test/cad, prompt: p, loop: { until_run: "true", max_iterations: 2 }, timeout: 1h }\n`).warnings).toEqual([])
+    expect(compileTasks(`  - { id: a, harness: test/cad, prompt: p, loop: { until_run: "true", max_iterations: 2 }, idle_timeout: 1h }\n`).warnings).toEqual([])
+  })
+  it('publishes four task kinds in the schema', () => {
+    const items = (flowJsonSchema() as { properties: { tasks: { items: { oneOf: unknown[] } } } }).properties.tasks.items
+    expect(items.oneOf).toHaveLength(4)
+  })
+})
+
 describe('published flow schema', () => {
   it('matches the runtime validator', () => {
     const file = JSON.parse(readFileSync(new URL('../../../store/spec/schema/flow.schema.json', import.meta.url), 'utf8'))
@@ -157,16 +259,20 @@ describe('published flow schema', () => {
     expect(title).toBe('Orchestrator flow (.harness/flows/*.yaml), spec 1')
     expect(rest).toEqual(flowJsonSchema())
   })
-  it('says a task is either a shell step or an agent task', () => {
+  it('says a task is a shell step, an agent task, an approval or a cancel step', () => {
     const items = (flowJsonSchema() as { properties: { tasks: { items: Record<string, unknown> } } }).properties.tasks.items
+    const not = (...keys: string[]) => ({ anyOf: keys.map(k => ({ required: [k] })) })
     expect(items.oneOf).toEqual([
-      expect.objectContaining({ required: ['id', 'run'], not: { anyOf: [{ required: ['harness'] }, { required: ['prompt'] }, { required: ['outputs'] }] } }),
-      expect.objectContaining({ required: ['id', 'harness', 'prompt'], not: { required: ['run'] } }),
+      expect.objectContaining({ required: ['id', 'run'], not: not('harness', 'prompt', 'outputs', 'approval', 'cancel', 'loop', 'idle_timeout') }),
+      expect.objectContaining({ required: ['id', 'harness', 'prompt'], not: not('run', 'approval', 'cancel') }),
+      expect.objectContaining({ required: ['id', 'approval'], not: not('run', 'harness', 'prompt', 'outputs', 'retry', 'cancel', 'loop', 'idle_timeout') }),
+      expect.objectContaining({ required: ['id', 'cancel'], not: not('run', 'harness', 'prompt', 'outputs', 'retry', 'timeout', 'approval', 'loop', 'idle_timeout') }),
     ])
   })
   it.each([
-    ['no action', '{ id: a }', 'needs harness and prompt'],
-    ['run with agent fields', '{ id: a, run: "true", harness: engine:claude, prompt: p }', 'not both'],
+    ['no action', '{ id: a }', 'A task has exactly one of run, harness + prompt, approval or cancel.'],
+    ['run with agent fields', '{ id: a, run: "true", harness: engine:claude, prompt: p }', 'A task has exactly one of run, harness + prompt, approval or cancel.'],
+    ['a harness without a prompt', '{ id: a, harness: engine:claude }', 'A task has exactly one of run, harness + prompt, approval or cancel.'],
     ['run with outputs', '{ id: a, run: "true", outputs: { files: [x] } }', 'outputs apply to agent tasks'],
   ])('rejects a task with %s, as the schema does', (_name, item, expected) => {
     expect(issues(() => compile(`spec: 1\nname: x\ntasks: [${item}]\n`))).toContain(expected)
