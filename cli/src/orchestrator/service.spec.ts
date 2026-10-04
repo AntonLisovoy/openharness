@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -15,7 +16,7 @@ import { orchestratorRequest } from './wire.js'
 
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile), writeFile: vi.fn(actual.writeFile) }
+  return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), open: vi.fn(actual.open), copyFile: vi.fn(actual.copyFile), writeFile: vi.fn(actual.writeFile) }
 })
 
 vi.mock('node:fs', async importOriginal => {
@@ -3272,6 +3273,30 @@ tasks:
     })
   })
 
+  const flowDir = () => { const d = join(project, '.harness/flows'); mkdirSync(d, { recursive: true }); return d }
+  it('records the scripts a shell step names', async () => {
+    writeFileSync(join(flowDir(), 's.sh'), 'echo hi')
+    await startFlow(steps({ id: 's', run: 'sh "$HARNESS_FLOW_DIR/s.sh"' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('succeeded'))
+    expect(liveTask('s').scripts).toEqual([{ path: join(flowDir(), 's.sh'), sha256: createHash('sha256').update('echo hi').digest('hex') }])
+  })
+  it('does not start a step cancelled while its scripts are hashed', async () => {
+    writeFileSync(join(flowDir(), 's.sh'), 'echo hi')
+    const spawned = vi.fn(sh); deps.spawnStep = spawned
+    const realOpen = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).open
+    let release: (() => void) | undefined
+    vi.mocked(filesystem.open).mockImplementation(async (path, flags, mode) => {
+      if (String(path).endsWith('s.sh') && !release) await new Promise<void>(r => { release = r })
+      return realOpen(path, flags, mode)
+    })
+    await startFlow(steps({ id: 's', run: 'sh "$HARNESS_FLOW_DIR/s.sh"' }))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    service.cancel(flowId, 's')
+    release!()
+    await vi.waitFor(() => expect(internals().launching.size).toBe(0))
+    expect(spawned).not.toHaveBeenCalled()
+    expect(liveTask('s').state).toBe('cancelled')
+  })
   describe('loops', () => {
     const sentTo = (agent: string) => sends.filter(([a]) => a === agent).map(([, text]) => text)
     const turn = (type: 'turn_started' | 'turn_ended', extra: Record<string, unknown> = {}) => service.ingest({ type, agentId: 'agent-1', payload: {}, ...extra })
@@ -3285,6 +3310,58 @@ tasks:
       return order
     }
 
+    it('records the scripts of the last loop check, even when the check ends first', async () => {
+      writeFileSync(join(flowDir(), 'c.sh'), 'exit 1')
+      const realOpen = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).open
+      let release: (() => void) | undefined
+      vi.mocked(filesystem.open).mockImplementation(async (path, flags, mode) => {
+        if (String(path).endsWith('c.sh') && !release) await new Promise<void>(r => { release = r })
+        return realOpen(path, flags, mode)
+      })
+      await startFlow(loopFlow('sh "$HARNESS_FLOW_DIR/c.sh"'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      await (internals().checks.values().next().value as { handle: { done: Promise<unknown> } }).handle.done // the check itself has ended
+      expect(checked().phase).toBe('checking') // its result waits for the hashes
+      release!()
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1 }))
+      expect(liveTask('fix').scripts).toEqual([{ path: join(flowDir(), 'c.sh'), sha256: createHash('sha256').update('exit 1').digest('hex') }])
+    })
+    it('applies a passing check seen before the deadline on resume, although its scripts were still hashed when the run paused', async () => {
+      writeFileSync(join(flowDir(), 'c.sh'), 'exit 0')
+      const realOpen = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).open
+      let release: (() => void) | undefined
+      vi.mocked(filesystem.open).mockImplementation(async (path, flags, mode) => {
+        if (String(path).endsWith('c.sh') && !release) await new Promise<void>(r => { release = r })
+        return realOpen(path, flags, mode)
+      })
+      await startFlow(loopFlow('sh "$HARNESS_FLOW_DIR/c.sh"'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1)) // the check has passed; its result waits for the hashes
+      const seen = [...internals().pending.values()][0].at
+      live().state = 'paused'; liveTask('fix').deadline = seen + 1 // ahead when the result was seen
+      await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(seen + 1)) // passed before the resume
+      const resumed = service.resume(flowId)
+      release!()
+      await resumed
+      expect(liveTask('fix')).toMatchObject({ state: 'succeeded', scripts: [{ path: join(flowDir(), 'c.sh') }] })
+      expect(internals().pending.size).toBe(0)
+    })
+    it('clears the scripts of the last loop check when it names none any more', async () => {
+      writeFileSync(join(flowDir(), 'c.sh'), 'exit 1')
+      await startFlow(loopFlow('sh "$HARNESS_FLOW_DIR/c.sh"'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().completed).toBe(1))
+      expect(liveTask('fix').scripts).toHaveLength(1)
+      rmSync(join(flowDir(), 'c.sh')) // the second check names a file that is gone: its hash result is empty
+      turn('turn_started'); turn('turn_ended')
+      await vi.waitFor(() => expect(checked().completed).toBe(2))
+      expect(liveTask('fix').scripts).toBeUndefined()
+    })
     it('checks after each turn, sends the failure back, and succeeds once the check passes', async () => {
       await startFlow(loopFlow('test -f "$HARNESS_PROJECT_DIR/fixed" || { echo still broken >&2; exit 1; }'))
       await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
@@ -3596,6 +3673,55 @@ tasks:
       expect(sentTo('agent-1').filter(t => t.startsWith('[Orchestrator update]\nCheck failed'))).toHaveLength(1)
       expect(feedback().delivery).toBe('accepted')
       expect(onDisk().messages.find(m => m.id === checked().feedbackId)!.delivery).toBe('accepted')
+    })
+    it.each(['a resume after the deadline', 'the timeout'] as const)('lets a check that passed before the deadline win over %s while its outputs are checked', async how => {
+      await startFlow(loopFlow('true', 3, { outputs: { files: ['out.txt'] } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'out.txt'), 'x')
+      const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).checkOutputs
+      let release: (() => void) | undefined
+      vi.mocked(outputsModule.checkOutputs).mockImplementationOnce(async (...args) => { await new Promise<void>(r => { release = r }); return actual(...args) })
+      turn('turn_ended')
+      await vi.waitFor(() => expect(release).toBeTypeOf('function')) // the check passed; its outputs are being looked at
+      const deadline = Date.now() + 1 // ahead when the result was seen
+      liveTask('fix').deadline = deadline
+      await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(deadline))
+      if (how === 'the timeout') await internals().expire(live(), liveTask('fix'), 1)
+      else { live().state = 'paused'; await service.resume(flowId) }
+      release!()
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'out.txt' }] }))
+      await vi.waitFor(() => expect(internals().pending.size).toBe(0))
+      expect(live().messages.some(m => m.text.includes('Timed out'))).toBe(false)
+    })
+    it('lets go of a passed check whose attempt failed while its outputs were looked at, so a retry is not held back', async () => {
+      await startFlow(loopFlow('true', 3, { outputs: { files: ['out.txt'] } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).checkOutputs
+      let release: (() => void) | undefined
+      vi.mocked(outputsModule.checkOutputs).mockImplementationOnce(async (...args) => { await new Promise<void>(r => { release = r }); return actual(...args) })
+      turn('turn_ended')
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      await service.finish(flowId, 'fix', 1, 'giving up', [], true)
+      release!()
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      expect(internals().pending.size).toBe(0)
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'giving up' })
+      service.retry(flowId, 'fix')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'running', attempt: 2 }))
+    })
+    it('lets go of a passed check whose attempt was cancelled while its success was being saved', async () => {
+      await startFlow(loopFlow('true'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const hold = holdVerdictRead() // the success owns the attempt and waits here
+      turn('turn_ended')
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      service.cancel(flowId, 'fix')
+      hold.release()
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      expect(internals().pending.size).toBe(0)
+      expect(liveTask('fix').state).toBe('cancelled')
+      service.retry(flowId, 'fix')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'running', attempt: 2 }))
     })
     it('keeps a passed check when the run pauses while its outputs are checked', async () => {
       await startFlow(loopFlow('true', 3, { outputs: { files: ['out.txt'] } }))

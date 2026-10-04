@@ -13,6 +13,7 @@ import { checkOutputs, readVerdictSnapshot } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
 import { CHECK_TIMEOUT_MS, feedbackText, runCheck, type CheckResult } from './loop.js'
 import { directorPrompt, durationLabel, formatDuration, workerPrompt, type HarnessChoice } from './prompts.js'
+import { scriptHashes } from './scripts.js'
 import { processGone, startStep, stepFailure, type StepHandle, type StepSpawner } from './steps.js'
 
 export interface AgentRuntime {
@@ -46,18 +47,23 @@ export interface OrchestratorDependencies {
  */
 /**
  * `loopDone`: the number of the loop check whose result ends the attempt. `loopPassed`: a passed check, whose summary and
- * paths are built once the result owns the attempt, from the finish recorded last.
+ * paths are built once the result owns the attempt, from the finish recorded last. `scripts`: the hashes of the scripts the
+ * check named, recorded with the result (an empty list clears the earlier ones).
  */
+type Script = { path: string; sha256: string }
 type Outcome =
-  | { summary: string; paths: string[]; keep?: string[]; loopDone?: number; loopPassed?: { number: number; max: number; files: string[]; out: string } }
-  | { failed: string; retryable?: boolean; keep?: string[]; loopDone?: number }
+  | { summary: string; paths: string[]; keep?: string[]; loopDone?: number; loopPassed?: { number: number; max: number; files: string[]; out: string }; scripts?: Script[] }
+  | { failed: string; retryable?: boolean; keep?: string[]; loopDone?: number; scripts?: Script[] }
 /** What observed an automatic result: a process exit, a timeout, declared outputs, an idle clock, a loop check, lost feedback. */
 type Source = 'exit' | 'timeout' | 'outputs' | 'idle' | 'check' | 'feedback'
 /** Something of the attempt's process group may still run (see fenceUncertain): the error to show. */
 type Uncertain = { uncertain: string }
 /** A result with no owner yet: kept in memory and applied by the next reconcile. `then` is its follow-up, run once it is saved. */
-/** `check`: a raw loop check result, applied through the loop driver again (its outcome is then only a placeholder). */
-interface Pending { run: Run; task: Task; attempt: number; outcome: Outcome | Uncertain; source: Source; at: number; then?: () => void; check?: { number: number; result: CheckResult } }
+/**
+ * `check`: a raw loop check result, applied through the loop driver again (its outcome is then only a placeholder), with
+ * the hashes of the scripts it named.
+ */
+interface Pending { run: Run; task: Task; attempt: number; outcome: Outcome | Uncertain; source: Source; at: number; then?: () => void; check?: { number: number; result: CheckResult; scripts: Promise<Script[]> } }
 interface AutoOptions { source: Source; at?: number; guard?: () => boolean; replay?: boolean; then?: () => void }
 /** Frames an engine normalizer emits for real agent work. The daemon's own frames (heartbeats, recaps, errors) are not activity. */
 export const WORKER_ACTIVITY: ReadonlySet<string> = new Set(['turn_started', 'turn_ended', 'text_delta', 'thinking_delta', 'tool_start', 'tool_end', 'user_message', 'context_compact', 'subagent_finished'])
@@ -72,9 +78,9 @@ type StepEntry = { run: Run; task: Task; attempt: number; handle: StepHandle; un
 type CheckOwner = { run: Run; task: Task; attempt: number; number: number; handle: StepHandle; uncertain?: string; lingering?: true }
 /**
  * How a check result is handled: `replay` when a reconcile applies a kept one; `pid`: the process the check ran as, named
- * when its group could not be confirmed gone.
+ * when its group could not be confirmed gone; `scripts`: the hashes of the scripts it named, saved with its result.
  */
-interface CheckCall { replay?: boolean; pid?: number }
+interface CheckCall { replay?: boolean; pid?: number; scripts: Promise<Script[]> }
 
 /** The error of an attempt whose loop check may still run. */
 const checkUncertain = (pid: number | undefined): string => `A loop check may still be running (pid ${pid ?? 'unknown'}). Make sure it stopped before retrying.`
@@ -535,6 +541,10 @@ export class OrchestratorService {
   private taskDir(_run: Run, task: Task): string { return task.cwd }
   /** Where the agent or the shell works: outputs, verdict and scripts are looked up here. Same folder until runs get a worktree. */
   private execDir(_run: Run, task: Task): string { return task.cwd }
+  /** Where the scripts a command names are looked up. */
+  private scriptDirs(run: Run, task: Task): { exec: string; project: string; flow: string } {
+    return { exec: this.execDir(run, task), project: run.cwd ?? run.root, flow: dirname(run.flow!.path) }
+  }
   /** Something of the task's current attempt is still launching, running, saving, keeping logs or waiting to be applied. */
   private busy(run: Run, task: Task): boolean {
     const key = this.attemptKey(run, task)
@@ -668,6 +678,8 @@ export class OrchestratorService {
       await rm(this.taskDir(run, task), { recursive: true, force: true })
       await mkdir(this.taskDir(run, task), { recursive: true, mode: 0o700 })
       for (const input of inputs) await materializeInputs(this.artifactRoot(run, input), join(this.taskDir(run, task), 'inputs', input.id), input.artifacts)
+      // Hashed before the last guard, so a step cancelled, paused or stopped meanwhile does not start.
+      const scripts = task.run !== undefined ? await scriptHashes(task.run, this.scriptDirs(run, task)) : []
       if (this.stopped || task.state !== 'launching' || run.state !== 'active') return
       // The run is being reconciled, which already passed this task: as after a pause, nothing starts and it is queued again.
       if (this.reconciling.has(run.id)) { interrupted = true; return }
@@ -688,7 +700,7 @@ export class OrchestratorService {
         if (task.deadline !== undefined) this.scheduleDeadline(run, task)
         return // nothing runs: the release pump after the launch moves the run on
       }
-      if (task.run !== undefined) return this.launchStep(run, task)
+      if (task.run !== undefined) return this.launchStep(run, task, scripts)
       const harness = this.catalog().find(h => h.id === task.harness)
       const own = this.ownEngine(task.harness)
       requireThat(harness || (own !== null && (own === run.engine || (!!run.flow && this.deps.supportsEngine(own)))), 'HARNESS_UNAVAILABLE', `${task.harness} is no longer installed.`)
@@ -731,7 +743,7 @@ export class OrchestratorService {
     // Reserved names are set last so a flow input can never shadow them.
     return { ...env, HARNESS_PROJECT_DIR: run.cwd ?? run.root, HARNESS_FLOW_DIR: dirname(flow.path), HARNESS_RUN_ID: run.id, HARNESS_TASK_ID: task.id, HARNESS_ATTEMPT: String(task.attempt) }
   }
-  private launchStep(run: Run, task: Task): void {
+  private launchStep(run: Run, task: Task, scripts: Script[]): void {
     const attempt = task.attempt, key = this.attemptKey(run, task)
     const handle = startStep(task.run!, { cwd: this.execDir(run, task), logs: { stdout: join(this.taskDir(run, task), STEP_LOGS[0]), stderr: join(this.taskDir(run, task), STEP_LOGS[1]) }, env: this.stepEnv(run, task), spawn: this.deps.spawnStep })
     const owned: StepEntry = { run, task, attempt, handle }
@@ -774,6 +786,7 @@ export class OrchestratorService {
         t.state = 'running'
         if (handle.pid !== undefined) t.pid = handle.pid
         t.deadline = Date.now() + t.timeoutMs! // every shell step has a time limit (10m unless the flow sets one)
+        if (scripts.length) t.scripts = scripts; else delete t.scripts
       })
     } catch (error) {
       // The process must not run unrecorded: stop it; its entry owns it until the group is gone, and its exit is kept.
@@ -914,7 +927,7 @@ export class OrchestratorService {
       return
     }
     if (entry.source === 'timeout' || (task.deadline !== undefined && entry.at >= task.deadline)) await this.expire(run, task, attempt, entry.at, true)
-    else if (entry.check) await this.finishCheck(run, task, attempt, entry.check.number, entry.check.result, entry.at, { replay: true })
+    else if (entry.check) await this.finishCheck(run, task, attempt, entry.check.number, entry.check.result, entry.at, { replay: true, scripts: entry.check.scripts })
     else await this.settleAuto(run, task, attempt, entry.outcome, { source: entry.source, at: entry.at, then: entry.then, replay: true })
   }
   /**
@@ -1002,6 +1015,7 @@ export class OrchestratorService {
     const current = (): boolean => !this.stopped && run.state === 'active' && ['running', 'launching', 'waiting'].includes(task.state) && task.attempt === attempt
     const stillCurrent = (): void => requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
     const operation = async (): Promise<boolean> => {
+      const { scripts } = outcome // kept when the outcome becomes a failure below
       // A passed loop check completes the finish recorded last; nothing can record another one while this owns the attempt.
       if ('loopPassed' in outcome && outcome.loopPassed) {
         const { number, max, files, out } = outcome.loopPassed, finish = task.loopState!.finish, passed = `(iteration ${number} of ${max}). Log: ${out}`
@@ -1029,6 +1043,7 @@ export class OrchestratorService {
         if ('failed' in outcome && outcome.retryable !== false && attempt < (task.retry?.maxAttempts ?? 1)) t.retryAt = Date.now() + this.retryDelay(task, attempt)
         if (verdict) t.verdict = verdict; else delete t.verdict
         if (outcome.loopDone !== undefined) { t.loopState!.completed = outcome.loopDone; delete t.loopState!.check }
+        if (scripts) { if (scripts.length) t.scripts = scripts; else delete t.scripts }
         // Loop feedback not handed to the worker yet is never sent once its attempt has ended.
         const feedbackId = t.loopState?.feedbackId, feedback = feedbackId ? target.messages.find(m => m.id === feedbackId && m.delivery === 'pending') : undefined
         if (feedback) { feedback.delivery = 'failed'; feedback.deliveryReason = 'The attempt ended before this feedback was delivered.' }
@@ -1504,6 +1519,8 @@ export class OrchestratorService {
     const attempt = task.attempt, key = this.attemptKey(run, task), number = task.loopState!.completed + 1
     this.commit(run, draft => Object.assign(draft.tasks.find(t => t.id === task.id)!.loopState!, { phase: 'checking', check: { startedAt: Date.now() } }))
     this.clearIdle(`${run.id}/${task.id}/`)
+    // Hashed while the check runs; its result is saved with them.
+    const scripts = scriptHashes(task.loop!.untilRun, this.scriptDirs(run, task))
     const check = runCheck(task.loop!.untilRun, {
       cwd: this.execDir(run, task), logDir: join(this.taskDir(run, task), '.harness', 'loop'), number,
       env: { ...this.stepEnv(run, task), HARNESS_ITERATION: String(number) }, spawn: this.deps.spawnStep, timeoutMs: this.checkTimeout(),
@@ -1521,7 +1538,7 @@ export class OrchestratorService {
       const result: CheckResult = unsaved && raw.kind !== 'uncertain' ? { kind: 'error', error: `its process id could not be saved (${unsaved})` } : raw
       // Recorded before the fence waits for the attempt: a daemon stop meanwhile still saves the uncertainty.
       if (result.kind === 'uncertain') entry.uncertain = checkUncertain(check.handle.pid)
-      try { await this.finishCheck(run, task, attempt, number, result, observedAt, { pid: check.handle.pid }) }
+      try { await this.finishCheck(run, task, attempt, number, result, observedAt, { pid: check.handle.pid, scripts }) }
       catch (error) { this.pause(run, error) }
       finally {
         // Only after the result was applied or kept: until then the entry keeps the attempt busy.
@@ -1536,8 +1553,8 @@ export class OrchestratorService {
    * paused, or a reconcile runs and this is not its replay, the raw result is kept (so its worker cleanup is replayed with
    * it). Terminal results settle through `settleAuto` with the worker's cancellation as follow-up; feedback is one commit.
    */
-  private async finishCheck(run: Run, task: Task, attempt: number, number: number, result: CheckResult, observedAt: number, call: CheckCall = {}): Promise<void> {
-    const { replay = false, pid } = call
+  private async finishCheck(run: Run, task: Task, attempt: number, number: number, result: CheckResult, observedAt: number, call: CheckCall): Promise<void> {
+    const { replay = false, pid, scripts } = call
     const key = this.attemptKey(run, task, attempt), agentId = task.agentId! // a loop task that ran a check has its agent
     const cancelWorker = (): void => { this.deps.cancel(agentId) }
     if (result.kind === 'uncertain') {
@@ -1548,18 +1565,39 @@ export class OrchestratorService {
     // (the receipt ends the attempt, through delivery or the reconcile's scan).
     const guard = (): boolean => task.attempt === attempt && task.loopState?.phase === 'checking' && task.loopState.completed + 1 === number && !this.feedbackFailed(run, task)
     const current = (): boolean => !this.stopped && task.state === 'running' && guard()
-    const keep = (): void => { if (!this.pending.has(key)) this.pending.set(key, { run, task, attempt, outcome: { failed: '' }, source: 'check', at: observedAt, check: { number, result } }) }
+    const keep = (): void => { if (!this.pending.has(key)) this.pending.set(key, { run, task, attempt, outcome: { failed: '' }, source: 'check', at: observedAt, check: { number, result, scripts } }) }
     /** True when the result must wait for the next reconcile: it is kept. */
     const deferred = (): boolean => {
       if (run.state === 'active' && !(this.reconciling.has(run.id) && !replay)) return false
       keep()
       return true
     }
-    if (!current() || deferred()) return
-    const max = task.loop!.maxIterations, err = `.harness/loop/${number}.stderr.log`
-    const end = async (outcome: Outcome): Promise<void> => {
-      await this.settleAuto(run, task, attempt, { ...outcome, loopDone: number }, { source: 'check', at: observedAt, guard, replay, then: cancelWorker })
+    // Kept with its observation time from now until it is settled (its scripts are hashed and its outputs looked at
+    // meanwhile): a reconcile or a timeout meanwhile applies it by that time instead of passing over it, and whoever takes
+    // it from the kept results applies it. A settlement that defers it, or a pause, leaves it kept for the next reconcile.
+    if (!current()) return
+    // A result of this attempt kept before (a timeout, an idle expiry or lost feedback whose save failed, an uncertainty)
+    // was seen first and ends the attempt when it is applied: this one is moot.
+    if (this.pending.has(key)) return
+    keep()
+    const held = this.pending.get(key)
+    /** Nobody took the kept result to apply it instead. */
+    const ours = (): boolean => this.pending.get(key) === held
+    /** Whether to go on now: still ours, still current (a stale result is dropped), and not left kept for the next reconcile. */
+    const proceed = (): boolean => {
+      if (!ours()) return false
+      if (!current()) { this.pending.delete(key); return false }
+      return !deferred()
     }
+    /** Settles through settleAuto while still kept; dropped when that did nothing (the attempt ended or moved on meanwhile). */
+    const settleKept = async (outcome: Outcome, then: () => void): Promise<void> => {
+      const result = await this.settleAuto(run, task, attempt, outcome, { source: 'check', at: observedAt, guard, replay, then })
+      if (result === false && ours()) this.pending.delete(key)
+    }
+    const hashes = await scripts // never rejects
+    if (!proceed()) return
+    const max = task.loop!.maxIterations, err = `.harness/loop/${number}.stderr.log`
+    const end = (outcome: Outcome): Promise<void> => settleKept({ ...outcome, loopDone: number, scripts: hashes }, cancelWorker)
     if (result.kind === 'timeout') return end({ failed: `The loop check timed out after ${formatDuration(this.checkTimeout())}. Log: ${err}` })
     if (result.kind === 'could-not-start') return end({ failed: `The loop check could not start: ${result.error}. There is no log: the shell never started.`, retryable: false })
     if (result.kind === 'error') return end({ failed: `The loop check failed: ${result.error}. Log: ${err}` })
@@ -1568,11 +1606,11 @@ export class OrchestratorService {
       const outputs = task.outputs
         ? await checkOutputs(this.execDir(run, task), task.outputs).catch((error: unknown) => ({ ok: false as const, missing: [`outputs not checked: ${reason(error)}`] }))
         : { ok: true as const, files: [] }
-      if (!current() || deferred()) return // paused or ended while the outputs were looked at
+      if (!proceed()) return // taken, paused or ended while the outputs were looked at
       if (outputs.ok) {
         // The summary and paths are built once the result owns the attempt: the finish acknowledged last wins. When its files
         // cannot be kept the attempt fails instead, and its worker is cancelled before a retry can create another in its folder.
-        await this.settleAuto(run, task, attempt, { summary: '', paths: [], loopDone: number, loopPassed: { number, max, files: outputs.files, out: `.harness/loop/${number}.stdout.log` } }, { source: 'check', at: observedAt, guard, replay, then: () => { if (task.attempt !== attempt || task.state !== 'succeeded') cancelWorker() } })
+        await settleKept({ summary: '', paths: [], loopDone: number, loopPassed: { number, max, files: outputs.files, out: `.harness/loop/${number}.stdout.log` }, scripts: hashes }, () => { if (task.attempt !== attempt || task.state !== 'succeeded') cancelWorker() })
         return
       }
       failure = { how: 'outputs missing', tail: `outputs missing: ${outputs.missing.join(', ')}` }
@@ -1581,15 +1619,16 @@ export class OrchestratorService {
     const feedbackId = randomBytes(16).toString('hex')
     let sent = false
     await this.exclusive(run, task, attempt, async () => {
-      if (!current() || deferred()) return
-      try {
-        this.commit(run, draft => {
-          const t = draft.tasks.find(x => x.id === task.id)!
-          Object.assign(t.loopState!, { phase: 'working', completed: number, eligibleAfter: t.loopState!.turn, feedbackId })
-          delete t.loopState!.check
-          this.appendMessage(draft, 'system', feedbackText(failure, number, max, err), { id: feedbackId, targetAgentId: agentId, delivery: 'pending' })
-        })
-      } catch (error) { keep(); throw error } // kept for the resume; the caller pauses the run
+      if (!proceed()) return
+      // A failed save leaves the result kept for the resume; the caller pauses the run.
+      this.commit(run, draft => {
+        const t = draft.tasks.find(x => x.id === task.id)!
+        Object.assign(t.loopState!, { phase: 'working', completed: number, eligibleAfter: t.loopState!.turn, feedbackId })
+        delete t.loopState!.check
+        if (hashes.length) t.scripts = hashes; else delete t.scripts // the last check's scripts, also when it names none
+        this.appendMessage(draft, 'system', feedbackText(failure, number, max, err), { id: feedbackId, targetAgentId: agentId, delivery: 'pending' })
+      })
+      this.pending.delete(key) // settled
       sent = true
     })
     if (!sent) return
