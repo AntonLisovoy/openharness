@@ -42,6 +42,25 @@ function daemonTarget(portArg?: number, machineArg?: string): { port: number; ma
   return { port, machineId }
 }
 
+export function parseAnswerArgs(action: 'approve' | 'reject', rest: string[]): { taskId: string; attempt?: number; decision?: string; comment?: string } {
+  const [taskId, ...options] = rest
+  if (!taskId || taskId.startsWith('--')) throw new Error(`Usage: harness orchestrator ${action} <project> <task> [--attempt N]${action === 'approve' ? ' [--decision ID]' : ''} [--comment TEXT]`)
+  const result: { taskId: string; attempt?: number; decision?: string; comment?: string } = { taskId }
+  for (let i = 0; i < options.length; i++) {
+    const option = options[i], value = options[i + 1]
+    if (option !== '--attempt' && option !== '--comment' && !(option === '--decision' && action === 'approve')) throw new Error(action === 'approve' ? 'approve takes --attempt, --decision and --comment.' : 'reject takes --attempt and --comment only.')
+    if (value === undefined || value.startsWith('--')) throw new Error(`${option} needs a value.`)
+    i++
+    if (option === '--attempt') {
+      const n = Number(value)
+      if (!Number.isInteger(n) || n < 1) throw new Error('--attempt takes a whole number from 1.')
+      result.attempt = n
+    } else if (option === '--comment') result.comment = value
+    else result.decision = value
+  }
+  return result
+}
+
 export function parseOrchestratorArgs(argv: readonly string[]): { port: number; machineId: string; payload: Record<string, unknown> } {
   const args: string[] = []
   let portArg: number | undefined, machineArg: string | undefined
@@ -62,16 +81,32 @@ export function parseOrchestratorArgs(argv: readonly string[]): { port: number; 
     case 'complete': payload.summary = rest[0]; break
     case 'message': Object.assign(payload, { text: rest[0], messageId: rest[1] ?? randomBytes(16).toString('hex') }); break
     case 'steer': Object.assign(payload, { taskId: rest[0], attempt: Number(rest[1]), text: rest[2], messageId: rest[3] ?? randomBytes(16).toString('hex') }); break
-    default: throw new Error('Usage: harness orchestrator [--port N --machine ID] run|list|catalog|status|plan|finish|fail|retry|cancel|resume|complete|message|steer [project-id] [arguments]')
+    case 'approve': case 'reject': Object.assign(payload, parseAnswerArgs(action, rest)); break
+    default: throw new Error('Usage: harness orchestrator [--port N --machine ID] run|list|catalog|status|plan|finish|fail|retry|cancel|resume|complete|message|steer|approve|reject [project-id] [arguments]')
   }
   return { port, machineId, payload }
 }
-export async function orchestratorCommand(argv: readonly string[]): Promise<number> {
+export async function orchestratorCommand(argv: readonly string[], deps: { request?: typeof localOrchestratorRequest } = {}): Promise<number> {
+  const request = deps.request ?? localOrchestratorRequest
   const at = argv.findIndex((arg, i) => !arg.startsWith('--') && argv[i - 1] !== '--port' && argv[i - 1] !== '--machine')
   if (argv[at] === 'run') return flowRunCommand([...argv.slice(0, at), ...argv.slice(at + 1)], { err: text => console.error(text.trimEnd()) })
   try {
     const { port, machineId, payload } = parseOrchestratorArgs(argv)
-    const reply = await localOrchestratorRequest(port, machineId, payload)
+    if ((payload.action === 'approve' || payload.action === 'reject') && payload.attempt === undefined) {
+      const status = await request(port, machineId, { action: 'status', id: payload.id })
+      if (status.error) {
+        console.log(JSON.stringify(status, null, 2))
+        return 1
+      }
+      const tasks = (status.project as { tasks?: { id: string; state: string; attempt: number }[] } | undefined)?.tasks ?? []
+      const task = tasks.find(t => t.id === payload.taskId)
+      if (task?.state !== 'waiting') {
+        console.error(`${payload.taskId} is not waiting for a decision (state ${task?.state ?? 'unknown'}).`)
+        return 1
+      }
+      payload.attempt = task.attempt
+    }
+    const reply = await request(port, machineId, payload)
     console.log(JSON.stringify(summarizeOrchestratorReply(reply), null, 2))
     return reply.error ? 1 : 0
   } catch (error) {

@@ -5,7 +5,7 @@ import type { OrchestratorService } from './service.js'
 
 const id = 'a'.repeat(32), messageId = 'b'.repeat(32)
 const makeService = () => {
-  const service = Object.fromEntries(['list', 'catalog', 'start', 'snapshot', 'plan', 'finish', 'retry', 'cancel', 'resume', 'complete', 'chat', 'steer', 'reconciled'].map(key => [key, vi.fn(() => ({ id }))]))
+  const service = Object.fromEntries(['list', 'catalog', 'start', 'snapshot', 'plan', 'finish', 'retry', 'cancel', 'resume', 'complete', 'chat', 'steer', 'answer', 'reconciled'].map(key => [key, vi.fn(() => ({ id }))]))
   service.reconciled.mockImplementation((() => Promise.resolve()) as never)
   return service
 }
@@ -30,6 +30,20 @@ describe('orchestrator RPC boundary', () => {
     const reply = await orchestratorRequest(service as unknown as OrchestratorService, { action, id, tasks: [], taskId: 'task', attempt: 1, summary: 'verified', ...(action === 'finish' ? { artifacts: ['file.step'] } : {}), messageId, text: 'hello' })
     expect(reply).toEqual({ project: { id } })
     expect(service[method as string]).toHaveBeenCalledWith(...args as unknown[])
+  })
+  it('routes approve and reject with their attempt, strictly', async () => {
+    const service = makeService()
+    const wire = (payload: Record<string, unknown>) => orchestratorRequest(service as unknown as OrchestratorService, payload)
+    expect(await wire({ action: 'approve', id, taskId: 'ok', attempt: 2, decision: 'ship', comment: 'yes', requestId: 'r' })).toEqual({ project: { id } })
+    await wire({ action: 'reject', id, taskId: 'ok', attempt: 2 })
+    expect(service.answer.mock.calls).toEqual([
+      [id, 'ok', 2, { outcome: 'approved', decision: 'ship', comment: 'yes' }],
+      [id, 'ok', 2, { outcome: 'rejected', decision: undefined, comment: undefined }],
+    ])
+    for (const bad of [{ attempt: 0 }, { attempt: 1, extra: 1 }, { attempt: 1, decision: 'ship' }, { attempt: 1, comment: 'x'.repeat(4001) }]) {
+      expect(await wire({ action: 'reject', id, taskId: 'ok', ...bad })).toMatchObject({ error: 'INVALID_REQUEST' })
+    }
+    expect(service.answer).toHaveBeenCalledTimes(2)
   })
   it('answers resume only once the service has finished resuming', async () => {
     const service = makeService()

@@ -1803,6 +1803,20 @@ tasks:
     expect(liveTask('x')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
     await service.reconciled(flowId) // nothing is being reconciled any more
   })
+  it('lets an approval answer wait for a reconcile, then finishes it', async () => {
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'ok', approval: 'Go?' }))
+    await vi.waitFor(() => { expect(liveTask('x').state).toBe('running'); expect(liveTask('ok').state).toBe('waiting') })
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead() // x's expiry holds the barrier
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    const answered = orchestratorRequest(service, { action: 'approve', id: flowId, taskId: 'ok', attempt: 1 })
+    await vi.waitFor(() => expect(internals().reconciling.size).toBe(1))
+    expect(liveTask('ok').decision).toBeUndefined() // the answer waits for the barrier
+    hold.release(); await resumed
+    expect(await answered).toMatchObject({ project: { id: flowId } })
+    expect(liveTask('ok')).toMatchObject({ state: 'succeeded', decision: { outcome: 'approved' } })
+  })
   it('stays paused when a resume cannot be saved', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p' }, { id: 'b', run: 'true' }))

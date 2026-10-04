@@ -36,6 +36,7 @@ describe('orchestrator tool output', () => {
 })
 
 describe('orchestrator argument validation', () => {
+  const id = 'a'.repeat(32)
   afterEach(() => vi.restoreAllMocks())
   const parse = (...args: string[]) => parseOrchestratorArgs(['--port', '1234', '--machine', 'local-test', ...args]).payload
   it.each(['list', 'catalog', 'status', 'resume'])('parses %s without changing its identity', action => {
@@ -53,6 +54,40 @@ describe('orchestrator argument validation', () => {
     expect(parse('message', 'project', 'hello').messageId).toMatch(/^[a-f0-9]{32}$/)
     expect(parse('message', 'project', 'hello', 'fixed').messageId).toBe('fixed')
     expect(parse('steer', 'project', 'task', '1', 'hello').messageId).toMatch(/^[a-f0-9]{32}$/)
+  })
+  it('parses approve and reject', () => {
+    expect(parse('approve', id, 'ok', '--decision', 'ship', '--comment', 'go')).toEqual({ action: 'approve', id, taskId: 'ok', decision: 'ship', comment: 'go' })
+    expect(parse('reject', id, 'ok', '--attempt', '3')).toEqual({ action: 'reject', id, taskId: 'ok', attempt: 3 })
+    expect(() => parse('reject', id, 'ok', '--decision', 'x')).toThrow('reject takes --attempt and --comment only.')
+    expect(() => parse('approve', id, 'ok', '--bogus', 'x')).toThrow('approve takes --attempt, --decision and --comment.')
+    expect(() => parse('approve', id, 'ok', '--comment')).toThrow('--comment needs a value.')
+    expect(() => parse('approve', id, 'ok', '--attempt', 'two')).toThrow('--attempt takes a whole number from 1.')
+    expect(() => parse('approve', id)).toThrow('Usage: harness orchestrator approve <project> <task> [--attempt N] [--decision ID] [--comment TEXT]')
+    expect(() => parse('reject', id, '--attempt', '1')).toThrow('Usage: harness orchestrator reject <project> <task> [--attempt N] [--comment TEXT]')
+  })
+  it('answers the current attempt when none is given, only while it waits', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const request = vi.fn()
+      .mockResolvedValueOnce({ project: { tasks: [{ id: 'ok', state: 'waiting', attempt: 2 }] } })
+      .mockResolvedValueOnce({ project: { id } })
+    expect(await orchestratorCommand(['--port', '1', '--machine', 'm', 'approve', id, 'ok'], { request })).toBe(0)
+    expect(request.mock.calls[0][2]).toEqual({ action: 'status', id })
+    expect(request.mock.calls[1][2]).toMatchObject({ action: 'approve', taskId: 'ok', attempt: 2 })
+    request.mockReset().mockResolvedValueOnce({ project: { tasks: [{ id: 'ok', state: 'succeeded', attempt: 2 }] } })
+    expect(await orchestratorCommand(['--port', '1', '--machine', 'm', 'approve', id, 'ok'], { request })).toBe(1)
+    expect(error).toHaveBeenCalledWith('ok is not waiting for a decision (state succeeded).')
+    expect(request).toHaveBeenCalledTimes(1)
+    request.mockReset().mockResolvedValueOnce({ project: { tasks: [] } })
+    expect(await orchestratorCommand(['--port', '1', '--machine', 'm', 'reject', id, 'nope'], { request })).toBe(1)
+    expect(error).toHaveBeenCalledWith('nope is not waiting for a decision (state unknown).')
+    request.mockReset().mockResolvedValueOnce({})
+    expect(await orchestratorCommand(['--port', '1', '--machine', 'm', 'reject', id, 'nope'], { request })).toBe(1)
+    request.mockReset().mockResolvedValueOnce({ error: 'PROJECT_NOT_FOUND', detail: 'x' })
+    expect(await orchestratorCommand(['--port', '1', '--machine', 'm', 'reject', id, 'ok'], { request })).toBe(1)
+    request.mockReset().mockResolvedValueOnce({ project: { id } })
+    expect(await orchestratorCommand(['--port', '1', '--machine', 'm', 'reject', id, 'ok', '--attempt', '4'], { request })).toBe(0)
+    expect(request).toHaveBeenCalledTimes(1)
   })
   it('rejects malformed JSON, unknown commands, missing identity and invalid ports', () => {
     expect(() => parse('plan', 'project', '{')).toThrow()
