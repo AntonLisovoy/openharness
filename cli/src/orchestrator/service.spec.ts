@@ -3055,4 +3055,111 @@ tasks:
       expect(live().messages.some(m => m.text.startsWith('Task ok attempt 1 succeeded'))).toBe(false)
     })
   })
+
+  describe('cancel steps', () => {
+    it('cancels the run from a cancel step before anything else can start', async () => {
+      await startFlow(`spec: 1\nname: demo\ninputs: { who: { default: me } }\ntasks:
+  - { id: check, run: 'exit 1' }
+  - { id: long, run: 'sleep 30' }
+  - { id: stop, cancel: 'check failed for $inputs.who', depends_on: [check], trigger_rule: all_done, when: 'check.state == failed' }
+  - { id: next, run: 'true', depends_on: [stop] }
+`)
+      await vi.waitFor(() => expect(live().state).toBe('cancelled'))
+      expect(live().error).toBe('Cancelled by step stop: check failed for me')
+      expect(live().tasks.map(t => [t.id, t.state])).toEqual([['check', 'failed'], ['long', 'cancelled'], ['stop', 'succeeded'], ['next', 'cancelled']])
+      expect(liveTask('stop').summary).toBe('Cancelled the run: check failed for me')
+      expect(onDisk().state).toBe('cancelled')
+      await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    })
+    it('keeps the run cancelled and stops its work even when saving the cancel fails', async () => {
+      const warn = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const g = gate('gate')
+      await startFlow(steps({ id: 'long', run: 'sleep 30' }, { id: 'gate', run: g.run }, { id: 'stop', cancel: 'now', depends_on: ['gate'] }))
+      await vi.waitFor(() => { expect(liveTask('long').state).toBe('running'); expect(liveTask('gate').state).toBe('running') })
+      failWrites(json => json.includes('"error":"Cancelled by step stop: now"'))
+      g.open()
+      await vi.waitFor(() => expect(live().state).toBe('cancelled'))
+      await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+      expect(liveTask('long').state).toBe('cancelled')
+      expect(onDisk().state).toBe('active')
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('the cancel could not be saved'))
+      await expect(service.resume(flowId)).rejects.toMatchObject({ code: 'PROJECT_INACTIVE' }) // the live run stays cancelled
+    })
+    it('ends a flow that holds only a cancel step as cancelled, not completed', async () => {
+      await startFlow(steps({ id: 'stop', cancel: 'nothing to do' }))
+      await vi.waitFor(() => expect(live().state).toBe('cancelled'))
+      expect(live().messages.some(m => m.text.includes('completed'))).toBe(false)
+    })
+    it('runs a ready cancel step before an earlier listed task whose launch cannot be saved', async () => {
+      const g = gate('gate')
+      await startFlow(steps({ id: 'gate', run: g.run }, { id: 'a', run: 'sleep 30', depends_on: ['gate'] }, { id: 'stop', cancel: 'now', depends_on: ['gate'] }))
+      await vi.waitFor(() => expect(liveTask('gate').state).toBe('running'))
+      failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks.find(t => t.id === 'a')?.state === 'launching')
+      g.open()
+      await vi.waitFor(() => expect(live().state).toBe('cancelled'))
+      expect(live().tasks.map(t => [t.id, t.state])).toEqual([['gate', 'succeeded'], ['a', 'cancelled'], ['stop', 'succeeded']])
+      expect(onDisk().state).toBe('cancelled')
+      await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+      expect(internals().launching.size).toBe(0)
+    })
+    it('runs a cancel step freed by a block before a task freed in the same pass can launch', async () => {
+      await startFlow(steps(
+        { id: 'check', run: 'exit 1' },
+        { id: 'z', run: 'sleep 30', depends_on: ['check'], trigger_rule: 'all_done' },
+        { id: 'b', run: 'true', depends_on: ['check'] },
+        { id: 'stop', cancel: 'b was blocked', depends_on: ['b'], trigger_rule: 'all_done' },
+      ))
+      await vi.waitFor(() => expect(live().state).toBe('cancelled'))
+      expect(live().tasks.map(t => [t.id, t.state])).toEqual([['check', 'failed'], ['z', 'cancelled'], ['b', 'cancelled'], ['stop', 'succeeded']])
+      expect(liveTask('z').attempt).toBe(1)
+      expect(liveTask('z').cwd).toBe('') // never prepared
+    })
+    it('runs a cancel step made ready by a reconcile before guidance that waited is delivered', async () => {
+      const sent: string[] = []
+      deps.send = (_agent, _text, id) => { sent.push(id!) }
+      await startFlow(steps(
+        { id: 'w', harness: 'test/cad', prompt: 'p' },
+        { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+        { id: 'stop', cancel: 'x is over', depends_on: ['x'], trigger_rule: 'all_done' },
+      ))
+      await vi.waitFor(() => { expect(liveTask('w').state).toBe('running'); expect(liveTask('x').state).toBe('running') })
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1 // came due while paused
+      const hold = holdVerdictRead()
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      const messageId = '6'.repeat(32)
+      service.steer(flowId, 'w', 1, messageId, 'Use millimeters') // stays pending while the reconcile runs
+      hold.release(); await resumed
+      expect(live()).toMatchObject({ state: 'cancelled', error: 'Cancelled by step stop: x is over' })
+      expect(sent).not.toContain(messageId)
+      expect(live().messages.find(m => m.id === messageId)).toMatchObject({ delivery: 'failed', deliveryReason: 'Cancelled before delivery.' })
+      expect(cancelled).toContain(liveTask('w').agentId)
+    })
+    it('skips a branch decided false before a cancel step made ready by the same decision stops the run', async () => {
+      await startFlow(steps(
+        { id: 'ok', approval: { message: 'Open the PR?', decisions: [{ id: 'ship' }, { id: 'rework' }] } },
+        { id: 'open-pr', run: 'true', depends_on: ['ok'], when: 'ok.decision == ship' },
+        { id: 'stop-if-rework', cancel: 'Rework requested', depends_on: ['ok'], when: 'ok.decision == rework' },
+      ))
+      await vi.waitFor(() => expect(liveTask('ok').state).toBe('waiting'))
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'rework' })
+      expect(live()).toMatchObject({ state: 'cancelled', error: 'Cancelled by step stop-if-rework: Rework requested' })
+      expect(live().tasks.map(t => [t.id, t.state])).toEqual([['ok', 'succeeded'], ['open-pr', 'skipped'], ['stop-if-rework', 'succeeded']])
+      expect(liveTask('open-pr').summary).toBe('Skipped: ok.decision == ship is false.')
+    })
+    it('keeps the reason of a cancel step when the cancelled project is cancelled again', async () => {
+      await startFlow(steps({ id: 'stop', cancel: 'nothing to do' }))
+      await vi.waitFor(() => expect(live().state).toBe('cancelled'))
+      service.cancel(flowId)
+      expect(live()).toMatchObject({ state: 'cancelled', error: 'Cancelled by step stop: nothing to do' })
+      expect(onDisk().error).toBe('Cancelled by step stop: nothing to do')
+    })
+    it('never moves a cancelled project to paused after a late background error', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work' }))
+      service.cancel(flowId)
+      ;(internals() as unknown as { pause(run: Run, error: unknown): void }).pause(live(), new Error('late'))
+      expect(live().state).toBe('cancelled')
+    })
+  })
 })

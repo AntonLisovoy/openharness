@@ -273,8 +273,9 @@ export class OrchestratorService {
         // waits and the lifting of the barrier are one synchronous step, so nothing can slip in between.
         while (!this.stopped && run.state === 'active' && !this.quiet(run)) await this.settleRest(run)
         this.reconciling.delete(run.id)
-        // The barrier is down: arm what came due later, deliver what waited, and move the run once.
-        if (!this.stopped && run.state === 'active') { this.restoreDeadlines(run); this.dispatchPending(run); this.pump(run) }
+        // The barrier is down: a ready cancel step goes first; otherwise arm what came due later, deliver what waited,
+        // and move the run once.
+        if (!this.stopped && run.state === 'active' && !this.cancelReady(run)) { this.restoreDeadlines(run); this.dispatchPending(run); this.pump(run) }
         finish()
       } catch (error) {
         this.reconciling.delete(run.id)
@@ -489,29 +490,52 @@ export class OrchestratorService {
     if (this.stopped || run.state !== 'active' || this.pumping.has(run.id) || this.reconciling.has(run.id)) return
     this.pumping.add(run.id)
     try {
+      // The graph transitions that start nothing come first, then a ready cancel step, before any retry or launch is saved:
+      // a failed save there must not keep it waiting.
+      if (this.advance(run)) return
       this.releaseRetries(run)
+      this.transitions(run) // a retry lifts blocks: those tasks are decided again
       const busy = this.busyIn(run)
-      // Repeat while a pass changed something: tasks are not ordered by the graph, and a later skip can free an earlier task.
-      for (let changed = true; changed && run.state === 'active';) {
-        changed = false
-        for (const task of run.tasks) {
-          if (task.state !== 'queued' || run.state !== 'active') continue
-          const next = decide(task, run.tasks, busy)
-          if (next.kind === 'wait') continue
-          if (next.kind === 'launch') {
-            if (run.tasks.filter(t => t.state === 'running' || t.state === 'launching').length >= run.parallelism) continue
-            this.startTask(run, task, task.dependsOn.map(id => run.tasks.find(t => t.id === id)!))
-          } else this.commit(run, draft => {
-            const t = draft.tasks.find(x => x.id === task.id)!
-            if (next.kind === 'block') { t.state = 'blocked'; t.error = next.reason }
-            else if (next.kind === 'skip') { t.state = 'skipped'; t.summary = next.reason }
-            else { t.state = 'failed'; t.error = next.reason; t.summary = next.reason; this.appendMessage(draft, 'system', `Task ${t.id} failed: ${next.reason}`) }
-          })
-          changed = true
-        }
+      for (const task of run.tasks) {
+        if (run.tasks.filter(t => t.state === 'running' || t.state === 'launching').length >= run.parallelism) break
+        if (task.state === 'queued' && decide(task, run.tasks, busy).kind === 'launch') this.startTask(run, task, task.dependsOn.map(id => run.tasks.find(t => t.id === id)!))
       }
       this.settleFlow(run)
     } finally { this.pumping.delete(run.id) }
+  }
+  /** The transitions that start nothing, then a ready cancel step; says whether that cancelled the run. */
+  private advance(run: Run): boolean {
+    this.transitions(run)
+    return this.cancelReady(run)
+  }
+  /**
+   * Applies every skip, block and failure the graph decides for queued tasks, one saved transition each. Tasks are not
+   * ordered by the graph, and a later skip can free an earlier task: the scan repeats until nothing moves.
+   */
+  private transitions(run: Run): void {
+    const busy = this.busyIn(run)
+    for (let moved = true; moved;) {
+      moved = false
+      for (const task of run.tasks) {
+        if (task.state !== 'queued') continue
+        const next = decide(task, run.tasks, busy)
+        if (next.kind === 'wait' || next.kind === 'launch') continue
+        this.commit(run, draft => {
+          const t = draft.tasks.find(x => x.id === task.id)!
+          if (next.kind === 'block') { t.state = 'blocked'; t.error = next.reason }
+          else if (next.kind === 'skip') { t.state = 'skipped'; t.summary = next.reason }
+          else { t.state = 'failed'; t.error = next.reason; t.summary = next.reason; this.appendMessage(draft, 'system', `Task ${t.id} failed: ${next.reason}`) }
+        })
+        moved = true
+      }
+    }
+  }
+  /** Runs a cancel step whose dependencies let it start; says whether it did (the run is then cancelled). */
+  private cancelReady(run: Run): boolean {
+    const busy = this.busyIn(run)
+    const step = run.tasks.find(t => t.state === 'queued' && t.cancel !== undefined && decide(t, run.tasks, busy).kind === 'launch')
+    if (step) this.cancelByStep(run, step)
+    return step !== undefined
   }
   private startTask(run: Run, task: Task, inputs: Task[]): void {
     // Reserve before launching: no duplicate on a concurrent status read. Saved before anything is created.
@@ -1092,8 +1116,9 @@ export class OrchestratorService {
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
     const tasks = taskId ? [this.task(run, taskId)] : run.tasks
-    // A flow's error only advises what to do next; nothing is left to do once the whole project is cancelled.
-    if (!taskId) { run.state = 'cancelled'; run.directorWorking = false; if (run.flow) run.error = null }
+    // A flow's error only advises what to do next; nothing is left to do once the whole project is cancelled. A run that
+    // is cancelled already keeps its reason (a cancel step's).
+    if (!taskId) { if (run.flow && run.state !== 'cancelled') run.error = null; run.state = 'cancelled'; run.directorWorking = false }
     const agents = this.fenceCancel(run, tasks, !taskId)
     // Stop first: a save that fails (and throws to the caller) must not leave a process running without its deadline.
     this.cleanupCancel(run, tasks, agents)
@@ -1126,6 +1151,17 @@ export class OrchestratorService {
   private cleanupCancel(run: Run, tasks: Task[], agents: string[]): void {
     for (const task of tasks) this.steps.get(this.attemptKey(run, task))?.handle.stop()
     for (const agent of agents) this.deps.cancel(agent)
+  }
+  /** A cancel step that became ready: the whole run is cancelled with its reason, in the cancellation order (fence, stop, save). */
+  private cancelByStep(run: Run, step: Task): void {
+    step.state = 'succeeded'; step.summary = `Cancelled the run: ${step.cancel}`
+    run.state = 'cancelled'; run.directorWorking = false
+    run.error = `Cancelled by step ${step.id}: ${step.cancel}`
+    const open = run.tasks.filter(t => t !== step)
+    this.cleanupCancel(run, open, this.fenceCancel(run, open, true))
+    this.message(run, 'system', run.error)
+    // The live run stays cancelled: nothing has a caller to report a failed save to.
+    try { this.changed(run) } catch (error) { console.error(`[orchestrator] ${run.id}: the cancel could not be saved: ${reason(error)}`) }
   }
   async resume(id: string): Promise<void> {
     const run = this.get(id)
@@ -1215,6 +1251,8 @@ export class OrchestratorService {
   }
   /** Storage failures must not crash the entire daemon or allow more launches. */
   private pause(run: Run, error: unknown): void {
+    // Late callbacks never move a run that ended: the error is only reported.
+    if (run.state === 'cancelled' || run.state === 'completed') { console.error(`[orchestrator] ${run.id}: ${reason(error)}`); return }
     run.state = 'paused'
     run.error = `Project paused after a background error: ${error instanceof Error ? error.message : 'unknown error'}. Inspect existing agents before resuming.`
     console.error(`[orchestrator] ${run.error}`)
