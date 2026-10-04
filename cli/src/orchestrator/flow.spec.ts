@@ -108,6 +108,21 @@ tasks:
     expect(compile(source, { constructor: 'c' }).tasks[0].prompt).toBe('[c][v]')
     expect(issues(() => compile('spec: 1\nname: x\ninputs: { constructor: { required: true } }\ntasks: [{ id: a, run: "true" }]\n'))).toContain('Missing required input: constructor')
   })
+  it('points an unknown key at the key, not its value', () => {
+    const source = 'spec: 1\nname: demo\ntasks:\n  - id: a\n    run: echo\n    colour: red\n'
+    expect(() => parseFlowSource(source, 'f.yaml')).toThrow('f.yaml:6:5: tasks[0]: Unknown keys: colour')
+  })
+  it('points a non-string unknown key at the key', () => {
+    const source = 'spec: 1\nname: demo\ntasks:\n  - id: a\n    run: echo\n    1: red\n    true: x\n'
+    expect(() => parseFlowSource(source, 'f.yaml')).toThrow('f.yaml:6:5: tasks[0]: Unknown keys: 1, true')
+  })
+  it('points a null unknown key at the key', () => {
+    expect(() => parseFlowSource('spec: 1\nname: demo\ntasks:\n  - id: a\n    run: echo\n    null: red\n', 'f.yaml')).toThrow('f.yaml:6:5: tasks[0]: Unknown keys: ')
+    expect(() => parseFlowSource('spec: 1\nname: demo\ntasks:\n  - id: a\n    run: echo\n    ~: red\n', 'f.yaml')).toThrow('f.yaml:6:5: tasks[0]: Unknown keys: ')
+  })
+  it('gives the size limit a position', () => {
+    expect(() => parseFlowSource(`# ${'x'.repeat(300 * 1024)}`, 'big.yaml')).toThrow('big.yaml:1:1: A flow file is limited to 256 KiB.')
+  })
   it('reports independent problems together, with lines', () => {
     const message = issues(() => compile('spec: 1\nname: x\ntasks:\n  - { id: a, run: "true", timeout: 30h, depends_on: [ghost] }\n  - { id: b, prompt: p }\n'))
     expect(message).toContain('flow.yaml:4:')

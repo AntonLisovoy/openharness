@@ -1,6 +1,6 @@
 // cli/src/orchestrator/flow.ts
 import { createHash } from 'node:crypto'
-import { LineCounter, isAlias, isCollection, isPair, isScalar, parseDocument, visit, type Document } from 'yaml'
+import { LineCounter, isAlias, isCollection, isPair, isScalar, parseDocument, visit, type Document, type Scalar, type YAMLMap } from 'yaml'
 import { z } from 'zod'
 import { OrchestratorError, TaskId, TaskSpec, validatePlan } from './model.js'
 
@@ -71,7 +71,7 @@ const pathText = (path: readonly PropertyKey[]): string => path.map((p, i) => ty
 
 /** Parse YAML 1.2 (JSON included) as plain data: one document, no anchors, aliases or tags. */
 export function parseFlowSource(source: string, file: string): ParsedFlow {
-  if (Buffer.byteLength(source, 'utf8') > FLOW_SOURCE_LIMIT) throw new FlowError(file, [{ path: '', message: 'A flow file is limited to 256 KiB.' }])
+  if (Buffer.byteLength(source, 'utf8') > FLOW_SOURCE_LIMIT) throw new FlowError(file, [{ path: '', message: 'A flow file is limited to 256 KiB.', line: 1, col: 1 }])
   const lines = new LineCounter()
   const doc = parseDocument(source, { lineCounter: lines, prettyErrors: true, uniqueKeys: true, merge: false, schema: 'core', version: '1.2' })
   const issues: FlowIssue[] = doc.errors.map(e => ({ path: '', message: e.message.split('\n')[0], ...e.linePos?.[0] }))
@@ -97,7 +97,7 @@ export function parseFlowSource(source: string, file: string): ParsedFlow {
     if (issue.code === 'unrecognized_keys') {
       const isTask = issue.path.length === 2 && issue.path[0] === 'tasks'
       const keys = isTask ? issue.keys.filter(key => key !== 'approval') : issue.keys
-      if (keys.length) issues.push({ path: pathText(issue.path), message: `Unknown keys: ${keys.join(', ')}`, ...locate(doc, lines, [...issue.path, keys[0]]) })
+      if (keys.length) issues.push({ path: pathText(issue.path), message: `Unknown keys: ${keys.join(', ')}`, ...locateKey(doc, lines, issue.path, String(keys[0])) })
     } else issues.push({ path: pathText(issue.path), message: issue.message, ...locate(doc, lines, issue.path) })
   }
   if (issues.length || !parsed.success) throw new FlowError(file, issues)
@@ -109,6 +109,16 @@ function locate(doc: Document, lines: LineCounter, path: readonly PropertyKey[])
     if (node?.range) return lines.linePos(node.range[0])
   }
   return {}
+}
+
+/**
+ * Position of the key itself (`colour:`), not of its value. An unknown key is always a plain scalar key of a parsed map
+ * (non-scalar keys were rejected above). Validation sees keys as strings, so `1:` or `true:` are matched by their text and a null key (`null:`, `~:`) by the empty string yaml turns it into.
+ */
+function locateKey(doc: Document, lines: LineCounter, path: readonly PropertyKey[], key: string): { line: number; col: number } {
+  const parent = (path.length ? doc.getIn(path as unknown[], true) : doc.contents) as YAMLMap
+  const pair = parent.items.find(item => isScalar(item.key) && (item.key.value === null ? '' : String(item.key.value)) === key)!
+  return lines.linePos((pair.key as Scalar).range![0])
 }
 
 const references = (text: string, pattern: RegExp): string[] => [...text.matchAll(pattern)].map(m => m[1])
