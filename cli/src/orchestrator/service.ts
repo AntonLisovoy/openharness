@@ -7,7 +7,7 @@ import type { AgentEngine } from '../engines/types.js'
 import { readPrivateStateFile, secureStateDirectory } from '../lib/secureState.js'
 import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
-import { compileFlow, inputEnvName, parseFlowSource } from './flow.js'
+import { FlowError, checkFlowHarnesses, compileFlow, harnessIssueCode, inputEnvName, parseFlowSource } from './flow.js'
 import { checkOutputs } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
 import { directorPrompt, durationLabel, workerPrompt, type HarnessChoice } from './prompts.js'
@@ -186,6 +186,12 @@ export class OrchestratorService {
 
   async start(raw: unknown): Promise<Record<string, unknown>> {
     const spec = StartSpec.parse(raw)
+    const parsed = spec.flow ? parseFlowSource(spec.flow.source, spec.flow.path) : null
+    const flow = parsed ? compileFlow(parsed, spec.inputs ?? {}) : null
+    if (parsed && flow) {
+      const issues = checkFlowHarnesses(parsed, flow, spec.engine, this.catalog(), e => this.deps.supportsEngine(e))
+      if (issues.length) throw new FlowError(spec.flow!.path, issues, harnessIssueCode(issues))
+    }
     requireThat(this.deps.supportsEngine(spec.engine), 'ENGINE_UNSUPPORTED', 'This engine cannot start with an orchestrator prompt.')
     this.load()
     const fingerprint = createHash('sha256').update(JSON.stringify(spec)).digest('hex')
@@ -195,9 +201,6 @@ export class OrchestratorService {
       return this.snapshot(prior.id)
     }
     requireThat(!existsSync(join(this.deps.stateDir, `${spec.id}.json`)), 'CORRUPT_STATE', 'A saved project with this id could not be read. Its data was preserved.')
-    const parsed = spec.flow ? parseFlowSource(spec.flow.source, spec.flow.path) : null
-    const flow = parsed ? compileFlow(parsed, spec.inputs ?? {}) : null
-    if (flow) for (const task of flow.tasks) this.checkHarness(spec.engine, task, true)
     let parent = this.deps.workspaceDir
     let cwd: string | undefined
     if (spec.cwd) {
@@ -258,7 +261,7 @@ export class OrchestratorService {
     // A scope rule, not a sandbox: shell steps and automatic completion come from a file the user runs.
     requireThat(tasks.every(t => t.run === undefined && t.outputs === undefined && t.timeoutMs === undefined && t.retry === undefined), 'FLOW_ONLY', 'run, outputs, timeoutMs and retry are only available in flow files.')
     validatePlan(run.tasks, tasks)
-    for (const task of tasks) this.checkHarness(run.engine, task, false)
+    for (const task of tasks) this.checkHarness(run.engine, task)
     this.addTasks(run, tasks)
     this.changed(run)
     this.pump(run)
@@ -269,10 +272,9 @@ export class OrchestratorService {
     }
   }
   private ownEngine(harness: string): string | null { return harness.startsWith('engine:') ? harness.slice('engine:'.length) : null }
-  private checkHarness(engine: string, task: TaskSpec, flow: boolean): void {
-    if (task.run !== undefined) return
+  private checkHarness(engine: string, task: TaskSpec): void {
     const own = this.ownEngine(task.harness)
-    const ok = own !== null ? own === engine || (flow && this.deps.supportsEngine(own)) : this.catalog().some(h => h.id === task.harness && this.deps.supportsEngine(h.engine))
+    const ok = own !== null ? own === engine : this.catalog().some(h => h.id === task.harness && this.deps.supportsEngine(h.engine))
     requireThat(ok, 'HARNESS_UNAVAILABLE', `${task.harness} is not an installed, supported harness.`)
   }
   private artifactRoot(run: Run, task: Task, attempt = task.attempt): string { return join(run.root, 'artifacts', task.id, `attempt-${attempt}`) }

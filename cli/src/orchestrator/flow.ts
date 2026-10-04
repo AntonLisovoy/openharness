@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { LineCounter, isAlias, isCollection, isPair, isScalar, parseDocument, visit, type Document, type Scalar, type YAMLMap } from 'yaml'
 import { z } from 'zod'
 import { OrchestratorError, TaskId, TaskSpec, validatePlan } from './model.js'
+import type { HarnessChoice } from './prompts.js'
 
 export const FLOW_SOURCE_LIMIT = 256 * 1024
 export const RUN_STEP_DEFAULT_TIMEOUT_MS = 10 * 60_000
@@ -61,10 +62,31 @@ export interface ParsedFlow {
 export interface CompiledFlow { name: string; description?: string; engine?: string; inputs: Record<string, string>; tasks: TaskSpec[]; warnings: string[] }
 
 export class FlowError extends OrchestratorError {
-  constructor(readonly file: string, readonly issues: FlowIssue[]) {
-    super('INVALID_FLOW', issues.map(i => `${file}${i.line ? `:${i.line}:${i.col}` : ''}: ${i.path ? `${i.path}: ` : ''}${i.message}`).join('\n'))
+  constructor(readonly file: string, readonly issues: FlowIssue[], code = 'INVALID_FLOW') {
+    super(code, issues.map(i => `${file}${i.line ? `:${i.line}:${i.col}` : ''}: ${i.path ? `${i.path}: ` : ''}${i.message}`).join('\n'))
   }
 }
+/**
+ * Harness and engine eligibility of a compiled flow, with file positions. Shared by start and --dry-run.
+ * An engine problem has path `engine`; every other issue is a harness problem.
+ */
+export function checkFlowHarnesses(parsed: ParsedFlow, compiled: CompiledFlow, engine: string, catalog: HarnessChoice[], engineSupported: (engine: string) => boolean): FlowIssue[] {
+  const issues: FlowIssue[] = []
+  if (!engineSupported(engine)) issues.push({ path: 'engine', message: `${engine} cannot run orchestrator work here.`, ...(compiled.engine === engine ? parsed.at(['engine']) : {}) })
+  const installed = new Set(catalog.filter(h => engineSupported(h.engine)).map(h => h.id))
+  compiled.tasks.forEach((task, index) => {
+    if (task.run !== undefined) return
+    const own = task.harness.startsWith('engine:') ? task.harness.slice('engine:'.length) : null
+    if (own !== null ? !engineSupported(own) : !installed.has(task.harness)) issues.push({
+      path: `tasks[${index}] (${task.id})`,
+      message: own !== null ? `${task.harness} cannot run orchestrator work here.` : `${task.harness} is not an installed harness on this machine.`,
+      ...parsed.at(['tasks', index, 'harness']),
+    })
+  })
+  return issues
+}
+/** The wire code for harness problems: any non-engine issue makes it a harness problem. */
+export const harnessIssueCode = (issues: readonly FlowIssue[]): string => issues.some(i => i.path !== 'engine') ? 'HARNESS_UNAVAILABLE' : 'ENGINE_UNSUPPORTED'
 export const inputEnvName = (name: string): string => `HARNESS_INPUT_${name.toUpperCase()}`
 const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex')
 const pathText = (path: readonly PropertyKey[]): string => path.map((p, i) => typeof p === 'number' ? `[${p}]` : `${i ? '.' : ''}${String(p)}`).join('')

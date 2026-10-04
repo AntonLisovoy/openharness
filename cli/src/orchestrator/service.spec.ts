@@ -649,10 +649,27 @@ tasks:
     expect(snap().state).toBe('active')
   })
   it('validates the whole flow before creating anything', async () => {
-    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: missing/x, prompt: p }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE' })
-    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: "engine:gemini", prompt: p }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE' })
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: missing/x, prompt: p }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE', message: expect.stringMatching(/demo\.yaml:3:\d+: tasks\[0\] \(a\): missing\/x is not an installed harness/) })
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: "engine:gemini", prompt: p }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE', message: expect.stringMatching(/demo\.yaml:3:\d+: tasks\[0\] \(a\): engine:gemini cannot run/) })
     await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, run: "echo $inputs.x" }]\n')).rejects.toMatchObject({ code: 'INVALID_FLOW' })
     expect(existsSync(join(project, '.harness-projects'))).toBe(false)
+  })
+  it('creates nothing, not even the state folder, for a flow that does not compile', async () => {
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: test/none, prompt: hi }]\n')).rejects.toThrow(/demo\.yaml:3:\d+: tasks\[0\] \(a\): test\/none is not an installed harness/)
+    expect(existsSync(deps.stateDir)).toBe(false)
+    expect(existsSync(join(project, '.harness-projects'))).toBe(false)
+  })
+  it('names the position of an engine this daemon cannot run', async () => {
+    await expect(startFlow('spec: 1\nname: demo\ntasks: [{ id: a, harness: engine:grok, prompt: hi }]\n')).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE', message: expect.stringMatching(/demo\.yaml:3:\d+: tasks\[0\] \(a\): engine:grok cannot run orchestrator work here\./) })
+  })
+  it('keeps ENGINE_UNSUPPORTED for a start engine this daemon cannot run, with a position when the file declares it', async () => {
+    const start = (source: string) => service.start({ id: flowId, engine: 'cursor', prompt: 'Flow demo', cwd: project, flow: { source, path: join(project, '.harness/flows/demo.yaml') } })
+    await expect(start('spec: 1\nname: demo\nengine: cursor\ntasks: [{ id: a, run: "true" }]\n')).rejects.toMatchObject({ code: 'ENGINE_UNSUPPORTED', message: expect.stringContaining('demo.yaml:3:9: engine: cursor cannot run orchestrator work here.') })
+    await expect(start('spec: 1\nname: demo\ntasks: [{ id: a, run: "true" }]\n')).rejects.toMatchObject({ code: 'ENGINE_UNSUPPORTED', message: expect.stringMatching(/^[^:]*demo\.yaml: engine: cursor cannot run/) })
+    expect(existsSync(deps.stateDir)).toBe(false)
+  })
+  it('lets a harness problem decide the code when the engine is also unsupported', async () => {
+    await expect(service.start({ id: flowId, engine: 'cursor', prompt: 'Flow demo', flow: { source: 'spec: 1\nname: demo\ntasks: [{ id: a, harness: missing/x, prompt: p }]\n', path: join(project, 'demo.yaml') } })).rejects.toMatchObject({ code: 'HARNESS_UNAVAILABLE' })
   })
   it('keeps flow-only fields away from director plans', async () => {
     await service.start({ id, engine: 'claude', prompt: 'Make something' })

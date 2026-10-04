@@ -170,6 +170,11 @@ describe('flow run command', () => {
     expect(await flowRunCommand(argv, io(extra))).toBe(1)
     expect(err.join('')).toContain(message)
   })
+  it('points a flow-declared engine this machine cannot run at its line', async () => {
+    writeFileSync(join(dir, '.harness/flows/other.yaml'), 'spec: 1\nname: other\nengine: gemini\ntasks: [{ id: a, run: "true" }]\n')
+    expect(await flowRunCommand(['other', '--dry-run'], io())).toBe(1)
+    expect(err.join('')).toContain('other.yaml:3:9: engine: gemini cannot run orchestrator work here.')
+  })
   it('checks engine harnesses and warns when a file name and flow name differ', async () => {
     writeFileSync(join(dir, '.harness/flows/other.yaml'), 'spec: 1\nname: renamed\nengine: codex\ndescription: Two steps\ntasks: [{ id: a, harness: "engine:gemini", prompt: p }]\n')
     expect(await flowRunCommand(['other', '--dry-run'], io())).toBe(1)

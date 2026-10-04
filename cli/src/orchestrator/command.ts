@@ -6,7 +6,7 @@ import { WebSocket } from 'ws'
 import { env } from '../config/env.js'
 import { readAuthSession } from '../lib/authSession.js'
 import { installedHarnessCatalog, orchestratorEngineSupported } from './catalog.js'
-import { compileFlow, FlowError, parseFlowSource, type FlowIssue } from './flow.js'
+import { checkFlowHarnesses, compileFlow, FlowError, harnessIssueCode, parseFlowSource } from './flow.js'
 import { OrchestratorError, StartSpec } from './model.js'
 import type { HarnessChoice } from './prompts.js'
 
@@ -159,17 +159,8 @@ export async function flowRunCommand(argv: readonly string[], overrides: Partial
     const parsed = parseFlowSource(source, located.path)
     const compiled = compileFlow(parsed, args.inputs)
     const engine = args.engine ?? compiled.engine ?? 'claude'
-    const installed = new Set(io.catalog().map(h => h.id))
-    const problems: FlowIssue[] = []
-    if (!io.engineSupported(engine)) problems.push({ path: 'engine', message: `${engine} cannot run orchestrator work here.` })
-    compiled.tasks.forEach((task, index) => {
-      if (task.run !== undefined) return
-      const own = task.harness.startsWith('engine:') ? task.harness.slice('engine:'.length) : null
-      if (own !== null ? !io.engineSupported(own) : !installed.has(task.harness)) {
-        problems.push({ path: `tasks[${index}] (${task.id})`, message: own !== null ? `${task.harness} cannot run orchestrator work here.` : `${task.harness} is not an installed harness on this machine.`, ...parsed.at(['tasks', index, 'harness']) })
-      }
-    })
-    if (problems.length) throw new FlowError(located.path, problems)
+    const problems = checkFlowHarnesses(parsed, compiled, engine, io.catalog(), io.engineSupported)
+    if (problems.length) throw new FlowError(located.path, problems, harnessIssueCode(problems))
     const warnings = [...compiled.warnings]
     if (located.byName && compiled.name !== basename(located.path, extname(located.path))) warnings.push(`${basename(located.path)} declares name ${compiled.name}.`)
     for (const warning of warnings) io.err(`warning: ${warning}\n`)
