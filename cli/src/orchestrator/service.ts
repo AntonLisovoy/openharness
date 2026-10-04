@@ -47,6 +47,7 @@ const exited = (pid: number): boolean => {
 export class OrchestratorService {
   private readonly runs = new Map<string, Run>()
   private readonly dirty = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly committing = new Set<string>()
   private readonly finishing = new Map<string, Promise<void>>()
   private readonly pumping = new Set<string>()
   private readonly launching = new Set<string>()
@@ -110,14 +111,18 @@ export class OrchestratorService {
     requireThat(run, 'PROJECT_NOT_FOUND', 'This orchestrator project is unavailable on this machine.')
     return run
   }
-  private save(run: Run): void {
-    const timer = this.dirty.get(run.id)
-    if (timer) clearTimeout(timer)
-    this.dirty.delete(run.id)
+  /** Write a run's file atomically; nothing else. */
+  private write(run: Run): void {
     const path = join(this.deps.stateDir, `${run.id}.json`)
     const temporary = `${path}.${randomBytes(6).toString('hex')}.tmp`
     writeFileSync(temporary, JSON.stringify(run), { mode: 0o600, flag: 'wx' })
     renameSync(temporary, path)
+  }
+  private save(run: Run): void {
+    const timer = this.dirty.get(run.id)
+    if (timer) clearTimeout(timer)
+    this.dirty.delete(run.id)
+    this.write(run)
   }
   private changed(run: Run, durable = true): void {
     run.revision++
@@ -132,11 +137,48 @@ export class OrchestratorService {
     }
     this.deps.changed?.(run.id, run.revision)
   }
-  private message(run: Run, role: 'user' | 'assistant' | 'system', text: string, id = randomBytes(16).toString('hex')): Run['messages'][number] {
-    const message: Run['messages'][number] = { id, role, text: text.slice(0, 32_000), at: Date.now() }
+  /**
+   * A transition of several fields: built on a copy, saved, then copied into the live objects, so closures that hold
+   * `run` or `task` see it and a failed save changes nothing. `mutate` must be synchronous and free of side effects.
+   */
+  private commit(run: Run, mutate: (draft: Run) => void): void {
+    requireThat(!this.committing.has(run.id), 'COMMIT_NESTED', 'A transition is already being committed for this project.')
+    this.committing.add(run.id)
+    try {
+      const draft = structuredClone(run)
+      mutate(draft)
+      const ids = (r: Run) => JSON.stringify(r.tasks.map(t => t.id).sort())
+      requireThat(ids(draft) === ids(run), 'COMMIT_TASKS', 'A transition cannot add, remove or duplicate tasks.')
+      draft.revision = run.revision + 1
+      draft.updatedAt = Date.now()
+      this.write(draft)
+      this.publish(run, draft)
+    } finally { this.committing.delete(run.id) }
+    const timer = this.dirty.get(run.id) // the draft carried every unsaved change too
+    if (timer) { clearTimeout(timer); this.dirty.delete(run.id) }
+    this.deps.changed?.(run.id, run.revision)
+  }
+  private publish(live: Run, draft: Run): void {
+    const { tasks, ...fields } = draft
+    const previous = live.tasks
+    for (const key of Object.keys(live)) if (key !== 'tasks' && !(key in fields)) delete (live as Record<string, unknown>)[key]
+    Object.assign(live, fields)
+    // The task ids were checked before the write (planning adds tasks outside commits), so every draft task has a live twin.
+    live.tasks = tasks.map(next => {
+      const current = previous.find(t => t.id === next.id)!
+      for (const key of Object.keys(current)) if (!(key in next)) delete (current as Record<string, unknown>)[key]
+      return Object.assign(current, next)
+    })
+  }
+  /** Messages are capped at 200 in memory and in the saved file (the model rejects more). Works on a draft too. */
+  private appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string, extra: Partial<Run['messages'][number]> = {}): Run['messages'][number] {
+    const message: Run['messages'][number] = { id: randomBytes(16).toString('hex'), role, text: text.slice(0, 32_000), at: Date.now(), ...extra }
     run.messages.push(message)
     if (run.messages.length > 200) run.messages.splice(0, run.messages.length - 200)
     return message
+  }
+  private message(run: Run, role: 'user' | 'assistant' | 'system', text: string, id?: string): Run['messages'][number] {
+    return this.appendMessage(run, role, text, id ? { id } : {})
   }
   /**
    * Called once at daemon start, after agent callbacks exist: the service is otherwise created lazily, and deadlines must

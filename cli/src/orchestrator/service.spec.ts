@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import * as filesystem from 'node:fs/promises'
 import * as privateState from '../lib/secureState.js'
 import { OrchestratorService, type OrchestratorDependencies } from './service.js'
-import { OrchestratorError, type Run, type Task } from './model.js'
+import { OrchestratorError, Run, type Task } from './model.js'
 import { compileFlow, parseFlowSource, pinnedFlowName } from './flow.js'
 import type { StepSpawner } from './steps.js'
 import { orchestratorRequest } from './wire.js'
@@ -859,7 +859,97 @@ tasks:
   const internals = () => service as unknown as {
     runs: Map<string, Run>; deadlines: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> } }>
     expire(run: Run, task: Task, attempt: number): Promise<void>
+    commit(run: Run, mutate: (draft: Run) => void): void
+    appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
   }
+  const live = () => internals().runs.get(flowId)! // the service's own objects: reading them never pumps
+  const liveTask = (taskId: string) => live().tasks.find(t => t.id === taskId)!
+  const onDisk = () => JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8')) as Run
+  /** Records what disk and memory hold at each notification. */
+  const watchChanges = () => {
+    const seen: { revision: number; disk: number; live: number }[] = []
+    deps.changed = (_id, revision) => { seen.push({ revision, disk: onDisk().revision, live: live().revision }) }
+    return seen
+  }
+  const objectsOf = (value: unknown, found = new Set<object>()): Set<object> => {
+    if (value && typeof value === 'object' && !found.has(value)) { found.add(value); for (const child of Object.values(value)) objectsOf(child, found) }
+    return found
+  }
+  it('commits a transition into the same objects, or not at all', async () => {
+    await startFlow(steps({ id: 'a', run: 'sleep 30' }))
+    await vi.waitFor(() => expect(liveTask('a').pid).toEqual(expect.any(Number)))
+    const run = live(), task = liveTask('a'), revision = run.revision
+    expect(run.cwd).toBeDefined()
+    const dirty = () => (internals() as unknown as { dirty: Map<string, unknown> }).dirty
+    const changed = (internals() as unknown as { changed(r: Run, durable: boolean): void }).changed.bind(service)
+    changed(run, false) // leaves a dirty-save timer
+    const seen = watchChanges()
+    internals().commit(run, draft => { draft.tasks[0].summary = 'x'; delete draft.tasks[0].pid; delete draft.cwd; draft.error = 'note' })
+    expect(dirty().size).toBe(0) // the commit carried that change too
+    expect(seen).toEqual([{ revision: revision + 2, disk: revision + 2, live: revision + 2 }]) // once, after disk and memory agree
+    expect(liveTask('a')).toBe(task)
+    expect(task).toMatchObject({ summary: 'x' }); expect(task.pid).toBeUndefined()
+    expect(run.cwd).toBeUndefined()
+    expect(run).toMatchObject({ error: 'note', revision: revision + 2 })
+    expect(onDisk().tasks[0].summary).toBe('x')
+
+    // A failed save leaves the live run exactly as it was, nested data included, and keeps the pending dirty save.
+    run.error = 'unsaved'; changed(run, false)
+    const pending = dirty().get(flowId)
+    expect(pending).toBeDefined()
+    const before = JSON.stringify(run), tasks = [...run.tasks]
+    seen.length = 0
+    diskFull()
+    expect(() => internals().commit(run, draft => {
+      const shared = objectsOf(run)
+      expect([...objectsOf(draft)].filter(o => shared.has(o))).toEqual([]) // the draft shares nothing with the live run
+      draft.tasks[0].summary = 'lost'; draft.tasks[0].dependsOn.push('z'); draft.tasks[0].inputs.z = 1
+      draft.tasks[0].artifacts.push({ path: 'p', size: 1, sha256: 'f'.repeat(64) } as Task['artifacts'][number])
+      draft.messages.push({ id: 'm', role: 'system', text: 'lost', at: 1 }); draft.flow!.inputs.extra = 'lost'
+    })).toThrow(/ENOSPC/)
+    expect(JSON.stringify(run)).toBe(before)
+    expect(run.tasks).toEqual(tasks); run.tasks.forEach((t, i) => expect(t).toBe(tasks[i]))
+    expect(dirty().get(flowId)).toBe(pending)
+    expect(seen).toEqual([])
+    vi.mocked(fs.writeFileSync).mockReset()
+    await vi.waitFor(() => expect(onDisk()).toMatchObject({ error: 'unsaved', revision: run.revision })) // the kept timer saves it
+    expect(dirty().size).toBe(0)
+
+    expect(() => internals().commit(run, () => internals().commit(run, () => {}))).toThrow(expect.objectContaining({ code: 'COMMIT_NESTED' }))
+    expect(seen).toEqual([])
+    expect(live().tasks[0]).toBe(task) // the task array still holds the same objects
+  })
+  it('publishes tasks by id and refuses a draft that changes the task list', async () => {
+    await startFlow(steps({ id: 'a', run: 'sleep 30' }, { id: 'b', run: 'sleep 30' }))
+    await vi.waitFor(() => expect(live().tasks.map(t => t.state)).toEqual(['running', 'running']))
+    const run = live(), a = liveTask('a'), b = liveTask('b'), revision = run.revision
+    const seen = watchChanges()
+    internals().commit(run, draft => { draft.tasks.reverse(); draft.tasks[0].summary = 'first' })
+    expect(run.tasks[0]).toBe(b); expect(run.tasks[1]).toBe(a) // the draft's order, the live objects
+    expect(b.summary).toBe('first'); expect(a.summary).not.toBe('first')
+    expect(seen).toEqual([{ revision: revision + 1, disk: revision + 1, live: revision + 1 }])
+    seen.length = 0
+    const before = JSON.stringify(run)
+    const twin = (draft: Run) => ({ ...draft.tasks[0] })
+    for (const mutate of [
+      (draft: Run) => { draft.tasks.push({ ...twin(draft), id: 'c' }) },
+      (draft: Run) => { draft.tasks[1] = twin(draft) },
+      (draft: Run) => { draft.tasks.pop() },
+    ]) {
+      expect(() => internals().commit(run, mutate)).toThrow(expect.objectContaining({ code: 'COMMIT_TASKS' }))
+      expect(JSON.stringify(run)).toBe(before)
+      expect(onDisk().revision).toBe(revision + 1) // nothing was written
+    }
+    expect(run.tasks[0]).toBe(b); expect(run.tasks[1]).toBe(a)
+    expect(seen).toEqual([])
+  })
+  it('keeps at most 200 messages, also in a committed draft', async () => {
+    await startFlow(steps({ id: 'a', run: 'sleep 30' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    internals().commit(live(), draft => { for (let i = 0; i < 250; i++) internals().appendMessage(draft, 'system', `m${i}`) })
+    expect(live().messages).toHaveLength(200)
+    expect(Run.parse(JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))).messages.at(-1)!.text).toBe('m249')
+  })
   it('times out a step, kills it, and retries it a bounded number of times', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'echo "$HARNESS_ATTEMPT" >> "$HARNESS_PROJECT_DIR/attempts"; sleep 30', timeout: 1s, retry: { max_attempts: 2 } }]\n`)
     await until('slow', 'failed', 2)
