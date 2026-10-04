@@ -2575,7 +2575,7 @@ tasks:
     await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
     await step.end()
     await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true }))
-    liveTask('after').state = 'succeeded' // downstream work consumed this attempt
+    liveTask('after').state = 'running' // downstream work still uses this attempt
     step.gone()
     expect(() => service.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE' }))
     expect(internals().steps.size).toBe(1)
@@ -2618,5 +2618,154 @@ tasks:
     step.gone()
     next.retry(flowId, 's')
     expect(run().tasks[0]).toMatchObject({ attempt: 2, uncertain: false })
+  })
+
+  it('retries an upstream task by re-running everything that already used it', async () => {
+    await startFlow(steps(
+      { id: 'tests', run: 'test -f "$HARNESS_PROJECT_DIR/ok"' },
+      { id: 'report', run: 'echo report', depends_on: ['tests'], trigger_rule: 'all_done' },
+      { id: 'deploy', run: 'true', depends_on: ['tests'] },
+    ))
+    await vi.waitFor(() => expect(live().error).toMatch(/^Flow stopped/))
+    const oldReport = liveTask('report').cwd
+    writeFileSync(join(project, 'ok'), '')
+    service.retry(flowId, 'tests')
+    await vi.waitFor(() => expect(live().state).toBe('completed'))
+    expect(live().tasks.map(t => [t.id, t.attempt])).toEqual([['tests', 2], ['report', 2], ['deploy', 1]]) // deploy never started
+    expect(existsSync(join(oldReport, 'stdout.log'))).toBe(true) // old attempts stay on disk
+  })
+  it('refuses a cascade while something downstream still uses the result, or while it still stops', async () => {
+    const g = gate('b')
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: g.run, depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('running'))
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'b still uses this result; cancel b first.' }))
+    service.cancel(flowId, 'b')
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE' })) // b's process is still stopping
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    service.retry(flowId, 'a')
+    expect(liveTask('b')).toMatchObject({ state: 'queued', attempt: 2 })
+  })
+  it('refuses a cascade while the target\'s logs are still being kept', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(steps({ id: 't', run: 'sleep 30', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('t').state).toBe('running'))
+    const recover = failWrites(json => json.startsWith('{"version"') && ((JSON.parse(json) as Run).tasks.find(t => t.id === 't')?.artifacts.length ?? 0) > 0)
+    await internals().expire(live(), liveTask('t'), 1)
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    recover()
+    const realRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename
+    let release: (() => void) | undefined
+    vi.mocked(filesystem.rename).mockImplementationOnce(async (from, to) => { await new Promise<void>(r => { release = r }); return realRename(from, to) })
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(release).toBeTypeOf('function')) // reconcile is keeping t's logs, inside t's owner
+    expect(() => service.retry(flowId, 't')).toThrow(expect.objectContaining({ code: 'TASK_STOPPING' }))
+    release!(); await resumed
+    service.retry(flowId, 't')
+    expect(liveTask('t').attempt).toBe(2)
+  })
+  it('refuses a cascade over an uncertain downstream task', async () => {
+    let calls = 0
+    deps.create = async input => { launches.push(input); if (++calls === 1) throw new OrchestratorError('SPAWN_FAILED', 'pane lost'); return { agentId: 'agent-x' } }
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', harness: 'test/cad', prompt: 'p', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('b')).toMatchObject({ state: 'blocked', uncertain: true }))
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'b still uses this result; cancel b first.' }))
+  })
+  it('changes nothing when a cascade cannot be saved, and clears the retry timer it replaces', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1', retry: { max_attempts: 2, delay: '60s' } }, { id: 'b', run: 'true', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(internals().retryTimers.size).toBe(1))
+    const before = JSON.stringify(live())
+    const timers = { deadlines: internals().deadlines.size }
+    diskFull()
+    expect(() => service.retry(flowId, 'a')).toThrow(/ENOSPC/)
+    vi.mocked(fs.writeFileSync).mockReset()
+    expect(JSON.stringify(live())).toBe(before)
+    expect(internals().retryTimers.size).toBe(1)
+    expect(internals().deadlines.size).toBe(timers.deadlines)
+    service.retry(flowId, 'a')
+    expect(internals().retryTimers.size).toBe(0)
+  })
+  it('refuses a cascade while a dependent is still launching', async () => {
+    const realMkdir = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).mkdir
+    let release: (() => void) | undefined
+    vi.mocked(filesystem.mkdir).mockImplementation(async (path, options) => {
+      if (!release && String(path).endsWith(join('tasks', 'b', 'attempt-1'))) await new Promise<void>(r => { release = r })
+      return realMkdir(path, options)
+    })
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: 'true', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'b still uses this result; cancel b first.' }))
+    release!()
+  })
+  it('refuses a cascade while a finished dependent is still owned by an operation on its attempt', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: 'true', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('succeeded'))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    let release!: () => void
+    const owner = internals().exclusive(live(), liveTask('b'), 1, () => new Promise<void>(r => { release = r })) // b is terminal, its attempt still owned
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'b still uses this result; cancel b first.' }))
+    release(); await owner
+    service.retry(flowId, 'a')
+    expect(liveTask('b')).toMatchObject({ state: 'queued', attempt: 2 })
+  })
+  it('refuses a cascade while a dependent result is kept for a resume', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: 'true', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('succeeded'))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    // a kept result is only reachable while paused or reconciling; the owner rule is what this pins
+    internals().pending.set(`${flowId}/b/1`, { task: liveTask('b'), at: Date.now(), source: 'exit' } as never)
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE' }))
+    internals().pending.clear()
+  })
+  it('saves a cascade once, with the full reset table, before any launch', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: 'echo b', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(live().error).toMatch(/^Flow stopped/))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    // every field of the reset table set on the started dependent (fields one task kind cannot hold together are set directly)
+    Object.assign(liveTask('b'), {
+      state: 'failed', error: 'e', uncertain: false, agentId: 'agent-x', summary: 's', deadline: 1, pid: 999_999, engine: 'claude',
+      verdict: { ready: true, errors: 0, warnings: 0 }, decision: { outcome: 'approved', at: 1 }, loopState: { phase: 'working', completed: 1, turn: 1 },
+      retryAt: Date.now() + 60_000, scripts: [{ path: '/x', sha256: 'y' }],
+    })
+    const realWrite = (await vi.importActual<typeof import('node:fs')>('node:fs')).writeFileSync
+    const saved: Run[] = []
+    vi.mocked(fs.writeFileSync).mockImplementation(((file: string, data: string, options: unknown) => {
+      if (typeof data === 'string' && data.startsWith('{"version"')) saved.push(JSON.parse(data) as Run)
+      return realWrite(file, data, options as never)
+    }) as typeof fs.writeFileSync)
+    service.retry(flowId, 'a')
+    const resets = saved.filter(r => r.tasks.every(t => t.state === 'queued' && t.attempt === 2))
+    expect(resets).toHaveLength(1) // exactly one save resets both
+    expect(saved.indexOf(resets[0])).toBe(0) // before every launch
+    expect(saved.slice(1).every(r => r.tasks.some(t => t.state !== 'queued'))).toBe(true) // the later saves are launches
+    expect(saved.filter(r => r.tasks.find(t => t.id === 'a')!.attempt === 2 && r.tasks.find(t => t.id === 'b')!.attempt === 1)).toEqual([]) // never half a cascade
+    for (const t of saved[0].tasks) {
+      expect(t).toMatchObject({ error: null, uncertain: false, agentId: null, cwd: '', artifacts: [], inputs: {}, summary: '' })
+      for (const key of ['deadline', 'pid', 'engine', 'verdict', 'decision', 'loopState', 'retryAt', 'scripts']) expect(t).not.toHaveProperty(key)
+    }
+  })
+  it('clears every timer of the tasks a cascade resets', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: 'echo b', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(live().error).toMatch(/^Flow stopped/))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    // no reset task holds a deadline timer by now; the reset table still drops one of any attempt
+    const timer = setTimeout(() => {}, 60_000)
+    internals().deadlines.set(`${flowId}/b/1`, timer)
+    const cleared = vi.spyOn(globalThis, 'clearTimeout')
+    service.retry(flowId, 'a')
+    expect(cleared).toHaveBeenCalledWith(timer)
+    expect([...internals().deadlines.keys()].filter(key => key.startsWith(`${flowId}/b/`))).toEqual([])
+  })
+  it('refuses a cascade over a dependent whose stop could not be confirmed', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const b = lingeringStep() // every step of this flow is the fake process; a is made to fail through it too
+    await startFlow(steps({ id: 'a', run: 'x' }, { id: 'b', run: 'x', depends_on: ['a'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    b.gone(); await b.end() // a fails, its group gone
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('running'))
+    b.alive(); await b.end() // b ends, its group still answers
+    await vi.waitFor(() => expect(liveTask('b')).toMatchObject({ state: 'blocked', uncertain: true }))
+    expect(internals().steps.size).toBe(1) // b's lingering owner
+    expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'b still uses this result; cancel b first.' }))
   })
 })

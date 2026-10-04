@@ -528,7 +528,7 @@ export class OrchestratorService {
         continue
       }
       // A failed save keeps the retry pending and reaches the pump's caller (a release pauses the run).
-      this.requeue(run, task, `Task ${task.id} attempt ${task.attempt} failed; retrying (attempt ${task.attempt + 1} of ${task.retry!.maxAttempts}).`)
+      this.requeue(run, task, { note: `Task ${task.id} attempt ${task.attempt} failed; retrying (attempt ${task.attempt + 1} of ${task.retry!.maxAttempts}).` })
       this.clearRetry(run, task)
     }
   }
@@ -937,14 +937,21 @@ export class OrchestratorService {
   /**
    * A new attempt of `task` in one saved transition: the reset table, skipped dependents back in the queue (they are
    * decided again), and every block lifted that is not uncertain. Nothing changes when the save fails.
+   * A cascade resets every transitive dependent instead; one that started an attempt gets a new one.
    */
-  private requeue(run: Run, task: Task, note?: string): void {
+  private requeue(run: Run, task: Task, { note, cascade = false }: { note?: string; cascade?: boolean } = {}): void {
     this.commit(run, draft => {
       if (note) this.appendMessage(draft, 'system', note)
       resetTask(draft.tasks.find(t => t.id === task.id)!, true)
-      for (const next of downstream(draft.tasks, task.id)) if (next.state === 'skipped') resetTask(next, false)
+      // Whether a dependent started an attempt is decided before the reset clears its cwd.
+      for (const next of downstream(draft.tasks, task.id)) if (cascade || next.state === 'skipped') resetTask(next, cascade && next.cwd !== '')
       for (const next of draft.tasks) if (next.state === 'blocked' && !next.uncertain) { next.state = 'queued'; next.error = null }
     })
+  }
+  /** Every timer of a task: its deadlines (of any attempt) and its retry. */
+  private clearTimers(run: Run, task: Task): void {
+    for (const [key, timer] of this.deadlines) if (key.startsWith(`${run.id}/${task.id}/`)) { clearTimeout(timer); this.deadlines.delete(key) }
+    this.clearRetry(run, task)
   }
   retry(id: string, taskId: string): void {
     const run = this.get(id), task = this.task(run, taskId)
@@ -960,10 +967,21 @@ export class OrchestratorService {
     requireThat(released || (orphan && task.pid !== undefined && processGone(task.pid)) || (!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state)), 'RETRY_UNSAFE', orphan
       ? `This step may still be running from before the daemon restart (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`
       : 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
-    requireThat(!run.tasks.some(t => t.dependsOn.includes(task.id) && ['running', 'launching', 'succeeded'].includes(t.state)), 'RESULT_IN_USE', 'Add a new revision task instead; downstream work already consumed this attempt.')
-    this.requeue(run, task)
+    if (run.flow) {
+      // A cascade: the target and everything that used its result get a new attempt, in one save.
+      requireThat(!this.busy(run, task), 'TASK_STOPPING', 'The previous attempt is still stopping or being saved; retry when it has ended.')
+      const below = downstream(run.tasks, task.id)
+      const inUse = below.find(t => ['launching', 'running', 'waiting'].includes(t.state) || t.uncertain || this.busy(run, t))
+      requireThat(!inUse, 'RESULT_IN_USE', `${inUse?.id} still uses this result; cancel ${inUse?.id} first.`)
+      this.requeue(run, task, { cascade: true })
+      for (const t of [task, ...below]) this.clearTimers(run, t)
+    } else {
+      requireThat(!run.tasks.some(t => t.dependsOn.includes(task.id) && ['running', 'launching', 'succeeded'].includes(t.state)), 'RESULT_IN_USE', 'Add a new revision task instead; downstream work already consumed this attempt.')
+      this.requeue(run, task)
+      this.clearRetry(run, task)
+    }
     if (released) this.steps.delete(key)
-    this.clearRetry(run, task); this.pump(run); this.dispatchPending(run)
+    this.pump(run); this.dispatchPending(run)
   }
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
