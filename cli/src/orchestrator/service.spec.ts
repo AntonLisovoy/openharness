@@ -7,6 +7,7 @@ import * as filesystem from 'node:fs/promises'
 import * as privateState from '../lib/secureState.js'
 import { OrchestratorService, type OrchestratorDependencies } from './service.js'
 import { OrchestratorError, type Run, type Task } from './model.js'
+import { compileFlow, parseFlowSource, pinnedFlowName } from './flow.js'
 import type { StepSpawner } from './steps.js'
 import { orchestratorRequest } from './wire.js'
 
@@ -612,6 +613,26 @@ tasks:
     expect(done.tasks[1].summary).toContain(`${realpathSync(project)}|${join(project, '.harness/flows')}|make|1`)
     expect(done.messages.every(m => m.delivery === undefined)).toBe(true)
     expect(done.messages.at(-1)!.text).toBe('Flow demo completed: 2 tasks succeeded.')
+  })
+  it('pins a JSON flow as flow.json, records the name, and compiles again from the copy', async () => {
+    const source = '{"spec":1,"name":"demo","tasks":[{"id":"a","run":"true"}]}'
+    await service.start({ id: flowId, engine: 'claude', prompt: 'Flow demo', cwd: project, flow: { source, path: join(project, 'demo.json') } })
+    await until('a', 'succeeded')
+    expect(snap().flow!.source).toBe('flow.json')
+    expect(readFileSync(join(snap().root, 'flow.json'), 'utf8')).toBe(source)
+    expect(existsSync(join(snap().root, 'flow.yaml'))).toBe(false)
+    const pinned = join(snap().root, snap().flow!.source!)
+    expect(compileFlow(parseFlowSource(readFileSync(pinned, 'utf8'), pinned), {}).tasks).toEqual(compileFlow(parseFlowSource(source, 'demo.json'), {}).tasks)
+  })
+  it('pins any other flow as flow.yaml and records it', async () => {
+    await startFlow('spec: 1\nname: demo\ntasks: [{ id: a, run: "true" }]\n')
+    await until('a', 'succeeded')
+    expect(snap().flow!.source).toBe('flow.yaml')
+    expect(existsSync(join(snap().root, 'flow.json'))).toBe(false)
+  })
+  it('names the pinned copy by the source extension, ignoring case', () => {
+    expect([pinnedFlowName('/p/a.json'), pinnedFlowName('/p/A.JSON'), pinnedFlowName('/p/a.yaml'), pinnedFlowName('/p/a.yml'), pinnedFlowName('/p/json')])
+      .toEqual(['flow.json', 'flow.json', 'flow.yaml', 'flow.yaml', 'flow.yaml'])
   })
   it('uses the run root as the project folder when none was chosen, and says when a step printed nothing', async () => {
     await service.start({ id: flowId, engine: 'claude', prompt: 'Flow demo', flow: { source: `spec: 1\nname: demo\ntasks: [{ id: a, run: 'test -f "$HARNESS_PROJECT_DIR/flow.yaml"' }]\n`, path: '/flows/demo.yaml' } })

@@ -54,6 +54,7 @@ export const Message = z.object({
 export const FlowProvenance = z.object({
   name: z.string(), path: z.string(), sha256: z.string(),
   inputs: z.record(z.string(), z.string()), warnings: z.array(z.string()),
+  source: z.enum(['flow.yaml', 'flow.json']).optional(),
 })
 export const Run = z.object({
   version: z.literal(1), id: RunId, fingerprint: z.string(), prompt: text,

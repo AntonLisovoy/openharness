@@ -14,6 +14,11 @@ describe('model compatibility', () => {
   it('reads a run saved before flows existed and writes it back unchanged', () => {
     expect(JSON.parse(JSON.stringify(Run.parse(legacyRun)))).toEqual(legacyRun)
   })
+  it('reads a flow run saved without the pinned source name unchanged', () => {
+    const flow = { name: 'demo', path: '/p/demo.yaml', sha256: 'a'.repeat(64), inputs: {}, warnings: [] }
+    expect(JSON.parse(JSON.stringify(Run.parse({ ...legacyRun, flow })))).toEqual({ ...legacyRun, flow })
+    expect(Run.parse({ ...legacyRun, flow: { ...flow, source: 'flow.json' } }).flow!.source).toBe('flow.json')
+  })
   it('keeps the fingerprint of an old start request stable', () => {
     const raw = { id: legacyRun.id, prompt: 'Make it', engine: 'claude' }
     const fingerprint = (spec: unknown) => createHash('sha256').update(JSON.stringify(spec)).digest('hex')

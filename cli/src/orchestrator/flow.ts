@@ -5,6 +5,8 @@ import { z } from 'zod'
 import { OrchestratorError, TaskId, TaskSpec, validatePlan } from './model.js'
 import type { HarnessChoice } from './prompts.js'
 
+/** File name of the run's pinned copy; absent in runs from before it was recorded, which used flow.yaml. */
+export const pinnedFlowName = (path: string): 'flow.yaml' | 'flow.json' => /\.json$/i.test(path) ? 'flow.json' : 'flow.yaml'
 export const FLOW_SOURCE_LIMIT = 256 * 1024
 export const RUN_STEP_DEFAULT_TIMEOUT_MS = 10 * 60_000
 const DAY_MS = 24 * 60 * 60_000

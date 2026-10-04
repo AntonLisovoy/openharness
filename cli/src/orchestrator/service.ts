@@ -7,7 +7,7 @@ import type { AgentEngine } from '../engines/types.js'
 import { readPrivateStateFile, secureStateDirectory } from '../lib/secureState.js'
 import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
-import { FlowError, checkFlowHarnesses, compileFlow, harnessIssueCode, inputEnvName, parseFlowSource } from './flow.js'
+import { FlowError, checkFlowHarnesses, compileFlow, harnessIssueCode, inputEnvName, parseFlowSource, pinnedFlowName } from './flow.js'
 import { checkOutputs } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
 import { directorPrompt, durationLabel, workerPrompt, type HarnessChoice } from './prompts.js'
@@ -221,11 +221,11 @@ export class OrchestratorService {
       bypassPermission: spec.bypassPermission, parallelism: spec.parallelism, root, ...(cwd ? { cwd } : {}),
       directorId: null, directorWorking: false, state: flow ? 'active' : 'starting', error: null,
       tasks: [], messages: [], revision: 0, createdAt: now, updatedAt: now,
-      ...(flow ? { flow: { name: flow.name, path: spec.flow!.path, sha256: parsed!.sha256, inputs: { ...flow.inputs }, warnings: flow.warnings } } : {}),
+      ...(flow ? { flow: { name: flow.name, path: spec.flow!.path, sha256: parsed!.sha256, inputs: { ...flow.inputs }, warnings: flow.warnings, source: pinnedFlowName(spec.flow!.path) } } : {}),
     }
     this.message(run, 'user', run.prompt)
     if (flow) {
-      writeFileSync(join(root, 'flow.yaml'), spec.flow!.source, { mode: 0o400, flag: 'wx' })
+      writeFileSync(join(root, pinnedFlowName(spec.flow!.path)), spec.flow!.source, { mode: 0o400, flag: 'wx' })
       this.addTasks(run, flow.tasks)
     }
     this.save(run)
