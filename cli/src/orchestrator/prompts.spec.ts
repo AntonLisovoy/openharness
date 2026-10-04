@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
-import { directorPrompt, shellQuote, workerPrompt } from './prompts.js'
+import { directorPrompt, formatDuration, shellQuote, workerPrompt } from './prompts.js'
 import type { Run, Task } from './model.js'
 
 describe('self-contained orchestration briefs', () => {
@@ -34,5 +34,16 @@ describe('self-contained orchestration briefs', () => {
     expect(bare).not.toContain('stopped after')
     expect(bare).not.toContain('without activity')
     expect(workerPrompt(run, { ...task, idleTimeoutMs: 900_000 } as Task, 'harness orchestrator')).toContain('The daemon stops this attempt after 15m without activity from you.')
+  })
+  it('tells a loop worker that the check decides, and when it runs', () => {
+    const run = { id: 'a'.repeat(32), root: '/project', directorId: null, flow: { name: 'demo' }, tasks: [] } as unknown as Run
+    const task = { id: 'fix', attempt: 1, cwd: '/project/fix', prompt: 'Fix it', dependsOn: [], outputs: { files: ['a.md'] }, loop: { untilRun: 'npm run lint', maxIterations: 3 } } as unknown as Task
+    const brief = workerPrompt(run, task, 'harness orchestrator')
+    expect(brief).toContain('This task loops: when your turn ends, the daemon runs `npm run lint` in your folder (at most 3 checks).')
+    expect(brief).toContain('`finish` records your summary and files; the check runs when this turn ends, so end your turn after calling it.')
+    expect(brief).toContain('If the check fails you get its output and may try again; the files are snapshotted only after a check passes.')
+    expect(brief).not.toContain('This snapshots the exact artifact versions')
+    expect(brief).not.toContain('globs matches a file')
+    expect(formatDuration(300)).toBe('300 ms'); expect(formatDuration(120_000)).toBe('2m')
   })
 })

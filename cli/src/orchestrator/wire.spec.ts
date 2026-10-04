@@ -31,6 +31,11 @@ describe('orchestrator RPC boundary', () => {
     expect(reply).toEqual({ project: { id } })
     expect(service[method as string]).toHaveBeenCalledWith(...args as unknown[])
   })
+  it('tells a loop worker that its finish was recorded for the check', async () => {
+    const service = makeService()
+    service.finish.mockImplementation((async () => 'recorded') as never)
+    expect(await orchestratorRequest(service as unknown as OrchestratorService, { action: 'finish', id, taskId: 'task', attempt: 1, summary: 'did it' })).toEqual({ project: { id }, notice: 'Recorded. The check runs when this turn ends.' })
+  })
   it('routes approve and reject with their attempt, strictly', async () => {
     const service = makeService()
     const wire = (payload: Record<string, unknown>) => orchestratorRequest(service as unknown as OrchestratorService, payload)

@@ -610,7 +610,7 @@ const stubborn = (file: string) => `sh -c 'trap "" TERM; echo $$ > "${file}"; wh
 
 describe('flow runs', () => {
   let root: string, project: string, service: OrchestratorService, deps: OrchestratorDependencies
-  let launches: Parameters<OrchestratorDependencies['create']>[0][], agents: Set<string>, cancelled: string[]
+  let launches: Parameters<OrchestratorDependencies['create']>[0][], agents: Set<string>, cancelled: string[], sends: [string, string][]
   const flowId = 'abcdefabcdefabcdefabcdefabcdef12'
   const snap = () => service.snapshot(flowId) as unknown as Run & { tasks: Task[] }
   const state = (taskId: string) => snap().tasks.find(t => t.id === taskId)!
@@ -622,13 +622,13 @@ describe('flow runs', () => {
     service.start({ id: flowId, engine: 'claude', prompt: 'Flow demo', cwd: project, flow: { source, path: join(project, '.harness/flows/demo.yaml') }, inputs })
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'orchestrator-flow-')); project = join(root, 'project'); mkdirSync(project)
-    launches = []; agents = new Set(); cancelled = []
+    launches = []; agents = new Set(); cancelled = []; sends = []
     deps = {
       stateDir: join(root, 'state'), workspaceDir: join(root, 'projects'), command: 'harness orchestrator', spawnStep: sh,
       supportsEngine: e => e === 'claude' || e === 'codex',
       catalog: () => [{ id: 'test/cad', name: 'cad', description: 'cad', engine: 'claude', viewer: true }],
       create: async input => { launches.push(input); const agentId = `agent-${launches.length}`; agents.add(agentId); return { agentId } },
-      send: () => {}, cancel: agent => { cancelled.push(agent) },
+      send: (agent, text) => { sends.push([agent, text]) }, cancel: agent => { cancelled.push(agent) },
       agent: agent => agents.has(agent) ? {} : null,
     }
     service = new OrchestratorService(deps)
@@ -914,7 +914,7 @@ tasks:
   })
 
   const internals = () => service as unknown as {
-    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; idleTimers: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> }; uncertain?: string }>
+    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; idleTimers: Map<string, unknown>; checks: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> }; uncertain?: string }>
     expire(run: Run, task: Task, attempt: number): Promise<void>
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
@@ -3254,6 +3254,516 @@ tasks:
       service.cancel(flowId)
       ;(internals() as unknown as { pause(run: Run, error: unknown): void }).pause(live(), new Error('late'))
       expect(live().state).toBe('cancelled')
+    })
+  })
+
+  describe('loops', () => {
+    const sentTo = (agent: string) => sends.filter(([a]) => a === agent).map(([, text]) => text)
+    const turn = (type: 'turn_started' | 'turn_ended', extra: Record<string, unknown> = {}) => service.ingest({ type, agentId: 'agent-1', payload: {}, ...extra })
+    const loopFlow = (check: string, max = 3, extra: Record<string, unknown> = {}) => steps({ id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: check, max_iterations: max }, timeout: '1h', ...extra })
+    const checked = () => liveTask('fix').loopState!
+    /** Records agent creations and cancellations in the order they happen. */
+    const recordOrder = (): string[] => {
+      const order: string[] = [], create = deps.create
+      deps.create = async input => { order.push('create'); return create(input) }
+      deps.cancel = agent => { cancelled.push(agent); order.push(`cancel ${agent}`) }
+      return order
+    }
+
+    it('checks after each turn, sends the failure back, and succeeds once the check passes', async () => {
+      await startFlow(loopFlow('test -f "$HARNESS_PROJECT_DIR/fixed" || { echo still broken >&2; exit 1; }'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      expect(checked()).toEqual({ phase: 'working', completed: 0, turn: 0 })
+      turn('turn_ended', { payload: { aborted: true } })
+      expect(checked().phase).toBe('working') // an aborted end starts nothing
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1, eligibleAfter: 0 }))
+      expect(sentTo('agent-1').at(-1)).toMatch(/^\[Orchestrator update\]\nCheck failed \(exit 1\), iteration 1 of 3\./)
+      expect(sentTo('agent-1').at(-1)).toContain('still broken')
+      writeFileSync(join(project, 'fixed'), '')
+      turn('turn_started'); turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'succeeded', summary: 'Check passed: test -f "$HARNESS_PROJECT_DIR/fixed" || { echo still broken >&2; exit 1; } (iteration 2 of 3). Log: .harness/loop/2.stdout.log' }))
+      expect(checked().completed).toBe(2)
+      expect(checked().check).toBeUndefined()
+    })
+    it('starts no second check for the late end of a turn that was already checked, nor for replayed frames', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_started', { replay: true }); expect(checked().turn).toBe(0)
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked()).toMatchObject({ completed: 1, phase: 'working' }))
+      turn('turn_ended'); turn('turn_ended', { replay: true }) // the old end, again and replayed
+      expect(checked().phase).toBe('working'); expect(internals().checks.size).toBe(0)
+      turn('turn_started'); turn('turn_ended') // a turn that started after the feedback
+      expect(checked().phase).toBe('checking')
+    })
+    it.each([1, 3])('fails when check number %i (the last allowed) fails', async max => {
+      await startFlow(loopFlow('exit 1', max))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      for (let i = 1; i <= max; i++) {
+        if (i > 1) turn('turn_started')
+        turn('turn_ended')
+        if (i < max) await vi.waitFor(() => expect(checked()).toMatchObject({ completed: i, phase: 'working' }))
+      }
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: `Check still failing after ${max} iteration${max === 1 ? '' : 's'}: exit 1. Log: .harness/loop/${max}.stderr.log` }))
+      expect(checked().completed).toBe(max)
+      expect(sentTo('agent-1').filter(t => t.startsWith('[Orchestrator update]\nCheck failed'))).toHaveLength(max - 1)
+      expect(cancelled).toContain('agent-1')
+    })
+    it('records finish and runs the check only when that turn ends; a steer turn during a failing check starts nothing', async () => {
+      const g = gate('check')
+      await startFlow(loopFlow(`${g.run}; exit 1`))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'out.txt'), 'x')
+      expect(await orchestratorRequest(service, { action: 'finish', id: flowId, taskId: 'fix', attempt: 1, summary: 'did it', artifacts: ['out.txt'] })).toMatchObject({ notice: 'Recorded. The check runs when this turn ends.' })
+      expect(checked()).toMatchObject({ phase: 'working', finish: { summary: 'did it', paths: ['out.txt'] } })
+      turn('turn_ended')
+      expect(checked().phase).toBe('checking')
+      turn('turn_started'); turn('turn_ended') // a steer turn while checking
+      expect(internals().checks.size).toBe(1)
+      g.open()
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1, turn: 1, eligibleAfter: 1 }))
+      turn('turn_ended') // still the steer turn
+      expect(checked().phase).toBe('working')
+    })
+    it('keeps the recorded summary and adds the check log when the check passes', async () => {
+      await startFlow(loopFlow('true'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'out.txt'), 'x')
+      await service.finish(flowId, 'fix', 1, 'did it', ['out.txt'])
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'succeeded', summary: 'did it\nCheck passed (iteration 1 of 3). Log: .harness/loop/1.stdout.log', artifacts: [{ path: 'out.txt' }] }))
+    })
+    it.each([
+      ['an explicit fail', async () => { await service.finish(flowId, 'fix', 1, 'giving up', [], true) }, 'giving up'],
+      ['the attempt timeout', async () => { await internals().expire(live(), liveTask('fix'), 1) }, 'Timed out after 1h.'],
+      ['a task cancel', async () => { service.cancel(flowId, 'fix') }, null],
+    ])('ends the attempt and stops the check on %s', async (_name, end, error) => {
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().check?.pid).toEqual(expect.any(Number)))
+      await end()
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      expect(liveTask('fix').state).toBe(error === null ? 'cancelled' : 'failed')
+      if (error) expect(liveTask('fix').error).toBe(error)
+    })
+    it('fails the attempt when the check itself times out', async () => {
+      deps.checkTimeoutMs = 300 // read when the check starts
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The loop check timed out after 300 ms. Log: .harness/loop/1.stderr.log' }))
+    })
+    it('fails without a retry when the check cannot start', async () => {
+      await startFlow(loopFlow('true', 3, { retry: { max_attempts: 2 } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      deps.spawnStep = () => { throw Object.assign(new Error('no'), { code: 'ENOENT' }) }
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The loop check could not start: the shell could not be found (ENOENT). There is no log: the shell never started.' }))
+      expect(liveTask('fix').retryAt).toBeUndefined()
+    })
+    it('pauses the idle clock while a check runs', async () => {
+      const g = gate('check')
+      await startFlow(loopFlow(`${g.run}; exit 1`, 3, { idle_timeout: '1h' }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      expect(internals().idleTimers.size).toBe(1)
+      turn('turn_ended')
+      expect(internals().idleTimers.size).toBe(0)
+      turn('turn_started') // activity during a check does not start the clock
+      expect(internals().idleTimers.size).toBe(0)
+      g.open()
+      await vi.waitFor(() => expect(checked().completed).toBe(1))
+      expect(internals().idleTimers.size).toBe(1) // the feedback starts it again
+    })
+    it('keeps a check result that arrives while paused and applies it on resume', async () => {
+      const g = gate('check')
+      await startFlow(loopFlow(`${g.run}; exit 1`))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      live().state = 'paused'
+      g.open()
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      expect(checked().phase).toBe('checking')
+      await service.resume(flowId)
+      expect(checked()).toMatchObject({ phase: 'working', completed: 1 })
+    })
+    it('stops a check whose pid cannot be saved, and fails the attempt on resume', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks[0].loopState?.check?.pid !== undefined)
+      turn('turn_ended')
+      await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      recover(); await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: expect.stringMatching(/^The loop check failed: its process id could not be saved \(ENOSPC.*\)\. Log: \.harness\/loop\/1\.stderr\.log$/) })
+    })
+    it('blocks the task as uncertain when its check could not be confirmed stopped, and keeps owning the check', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+      await startFlow(loopFlow('x'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const check = lingeringStep() // the check is spawned through deps.spawnStep too
+      turn('turn_ended')
+      await check.end()
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'blocked', uncertain: true, error: 'A loop check may still be running (pid 999999). Make sure it stopped before retrying.' }))
+      expect(internals().checks.size).toBe(1)
+      expect(cancelled).toContain('agent-1')
+      expect(() => service.retry(flowId, 'fix')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE', message: 'This loop check may still be running (pid 999999). Stop that process, then retry.' }))
+      check.gone()
+      service.retry(flowId, 'fix')
+      expect(internals().checks.size).toBe(0)
+    })
+    it('reserves .harness/loop: outputs skip it and finish cannot name it, not even through a symlink', async () => {
+      await startFlow(loopFlow('true', 3, { outputs: { files: ['**/*.log'] } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const cwd = liveTask('fix').cwd
+      mkdirSync(join(cwd, '.harness/loop'), { recursive: true }); writeFileSync(join(cwd, '.harness/loop/1.stdout.log'), 'x')
+      symlinkSync(join(cwd, '.harness/loop'), join(cwd, 'alias'))
+      await expect(service.finish(flowId, 'fix', 1, 'x', ['.harness/loop/1.stdout.log'])).rejects.toMatchObject({ code: 'INVALID_ARTIFACT' })
+      await expect(service.finish(flowId, 'fix', 1, 'x', ['alias/1.stdout.log'])).rejects.toMatchObject({ code: 'INVALID_ARTIFACT' })
+      turn('turn_ended')
+      await vi.waitFor(() => expect(sentTo('agent-1').at(-1)).toContain('outputs missing: **/*.log'))
+    })
+    it('never finishes a loop task from its outputs alone', async () => {
+      await startFlow(loopFlow('exit 1', 3, { outputs: { files: ['out.txt'] } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'out.txt'), 'x')
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().completed).toBe(1))
+      expect(liveTask('fix').state).toBe('running')
+    })
+    it('snapshots the finish acknowledged last, also one recorded while the check ran', async () => {
+      const g = gate('check')
+      await startFlow(loopFlow(g.run))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'a.txt'), 'a'); writeFileSync(join(liveTask('fix').cwd, 'b.txt'), 'b')
+      await service.finish(flowId, 'fix', 1, 'v1', ['a.txt'])
+      turn('turn_ended')
+      expect(checked().phase).toBe('checking')
+      expect(await service.finish(flowId, 'fix', 1, 'v2', ['b.txt'])).toBe('recorded') // latest wins, any phase
+      g.open()
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'succeeded', summary: 'v2\nCheck passed (iteration 1 of 3). Log: .harness/loop/1.stdout.log', artifacts: [{ path: 'b.txt' }] }))
+    })
+    it('fails the attempt, without a pause, when a file named by finish cannot be kept after the check passed', async () => {
+      const g = gate('check')
+      await startFlow(loopFlow(g.run, 3, { retry: { max_attempts: 2, delay: '60s' } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'a.txt'), 'a')
+      await service.finish(flowId, 'fix', 1, 'v1', ['a.txt'])
+      turn('turn_ended')
+      unlinkSync(join(liveTask('fix').cwd, 'a.txt')) // deleted before the passing check ends
+      g.open()
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: expect.stringMatching(/^The check passed, but the files named by finish could not be kept: ENOENT.*a\.txt'\.$/), artifacts: [] }))
+      expect(live().state).toBe('active')
+      expect(liveTask('fix').retryAt).toEqual(expect.any(Number)) // retryable under the task's policy
+      expect(checked()).toMatchObject({ completed: 1 })
+      expect(checked().check).toBeUndefined()
+      expect(internals().pending.size).toBe(0)
+      expect(cancelled).toContain('agent-1') // the worker does not outlive its attempt
+    })
+    it('cancels the worker whose passed check could not keep its files before the retry creates another', async () => {
+      const order = recordOrder()
+      await startFlow(loopFlow('true', 3, { retry: { max_attempts: 2 } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'a.txt'), 'a')
+      await service.finish(flowId, 'fix', 1, 'v1', ['a.txt'])
+      unlinkSync(join(liveTask('fix').cwd, 'a.txt'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'running', attempt: 2 }))
+      expect(order).toEqual(['create', 'cancel agent-1', 'create'])
+      expect(live().messages.some(m => m.text.includes('The check passed, but the files named by finish could not be kept'))).toBe(true)
+    })
+    it('refuses a finish that comes after the loop task succeeded', async () => {
+      await startFlow(loopFlow('true'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('succeeded'))
+      await expect(service.finish(flowId, 'fix', 1, 'late', [])).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    })
+    it('counts a turn that starts while the run is paused, so its end after the resume runs the check', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1, eligibleAfter: 0 }))
+      live().state = 'paused'
+      turn('turn_started')
+      expect(checked().turn).toBe(1)
+      await service.resume(flowId)
+      turn('turn_ended')
+      expect(checked().phase).toBe('checking')
+    })
+    it.each([
+      ['the attempt timeout', false],
+      ['an attempt timeout that cannot be saved', true],
+      ['an explicit fail', false],
+    ] as const)('stops a check that a turn started while %s was being settled', async (name, unsaved) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const hold = holdVerdictRead() // the settlement waits here
+      if (unsaved) failWrites(json => json.includes('Timed out after 1h.'))
+      const ending = name === 'an explicit fail' ? service.finish(flowId, 'fix', 1, 'giving up', [], true) : internals().expire(live(), liveTask('fix'), 1)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      turn('turn_ended') // the attempt is still running: this starts a check
+      await vi.waitFor(() => expect(checked().check?.pid).toEqual(expect.any(Number)))
+      hold.release(); await ending
+      if (unsaved) expect(live()).toMatchObject(pausedByDisk)
+      else expect(liveTask('fix').state).toBe('failed')
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0)) // stopped, not left to run
+    })
+    it('keeps a passed check for the resume when its files cannot be stored', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('true'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'a.txt'), 'a')
+      await service.finish(flowId, 'fix', 1, 'v1', ['a.txt'])
+      vi.mocked(filesystem.copyFile).mockImplementationOnce(async (from, to) => { throw Object.assign(new Error('ENOSPC: no space left on device, copyfile'), { code: 'ENOSPC', path: String(from), dest: String(to) }) })
+      turn('turn_ended')
+      await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+      expect(liveTask('fix').state).toBe('running')
+      expect(internals().pending.size).toBe(1)
+      await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'a.txt' }] })
+    })
+    it('makes a finish that comes while the success is being saved wait, and refuses it afterwards', async () => {
+      await startFlow(loopFlow('true'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'a.txt'), 'a')
+      await service.finish(flowId, 'fix', 1, 'v1', ['a.txt'])
+      const hold = holdVerdictRead() // the success owns the attempt and waits here
+      turn('turn_ended')
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      const late = service.finish(flowId, 'fix', 1, 'v2', [])
+      hold.release()
+      await expect(late).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+      expect(liveTask('fix').summary.startsWith('v1\n')).toBe(true)
+    })
+    it('changes nothing when loop feedback cannot be saved, and sends it once on resume', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks[0].loopState?.feedbackId !== undefined)
+      turn('turn_ended')
+      await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+      expect(checked()).toMatchObject({ phase: 'checking', completed: 0 })
+      expect(sentTo('agent-1')).toHaveLength(0)
+      expect(internals().pending.size).toBe(1)
+      recover(); await service.resume(flowId)
+      expect(checked()).toMatchObject({ phase: 'working', completed: 1 })
+      expect(sentTo('agent-1').filter(t => t.startsWith('[Orchestrator update]\nCheck failed'))).toHaveLength(1)
+    })
+    it('keeps loop feedback pending when its hand-off cannot be saved, and sends it exactly once on resume', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).messages.some(m => m.delivery === 'accepted'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+      const feedback = () => live().messages.find(m => m.id === checked().feedbackId)!
+      expect(checked()).toMatchObject({ phase: 'working', completed: 1 })
+      expect(feedback().delivery).toBe('pending')
+      expect(sentTo('agent-1')).toHaveLength(0)
+      recover(); await service.resume(flowId)
+      expect(sentTo('agent-1').filter(t => t.startsWith('[Orchestrator update]\nCheck failed'))).toHaveLength(1)
+      expect(feedback().delivery).toBe('accepted')
+      expect(onDisk().messages.find(m => m.id === checked().feedbackId)!.delivery).toBe('accepted')
+    })
+    it('keeps a passed check when the run pauses while its outputs are checked', async () => {
+      await startFlow(loopFlow('true', 3, { outputs: { files: ['out.txt'] } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      writeFileSync(join(liveTask('fix').cwd, 'out.txt'), 'x')
+      const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).checkOutputs
+      let release: (() => void) | undefined
+      vi.mocked(outputsModule.checkOutputs).mockImplementationOnce(async (...args) => { await new Promise<void>(r => { release = r }); return actual(...args) })
+      turn('turn_ended')
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      live().state = 'paused'
+      release!()
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'out.txt' }] })
+    })
+    it('retries a loop task with a new agent and a fresh loop', async () => {
+      await startFlow(loopFlow('exit 1', 1))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('failed'))
+      service.retry(flowId, 'fix')
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'running', attempt: 2, agentId: 'agent-2' }))
+      expect(checked()).toEqual({ phase: 'working', completed: 0, turn: 0 })
+    })
+    it('refuses a cascade while a dependent loop check still runs', async () => {
+      await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'sleep 30', max_iterations: 2 }, timeout: '1h', depends_on: ['a'], trigger_rule: 'all_done' }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(internals().checks.size).toBe(1))
+      await service.finish(flowId, 'fix', 1, 'giving up', [], true) // fix failed; its check is still being stopped
+      expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'fix still uses this result; cancel fix first.' }))
+    })
+    it('fences a loop task that already failed when its check could not be confirmed stopped', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+      await startFlow(loopFlow('x', 3, { retry: { max_attempts: 2 } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const check = lingeringStep() // the check is spawned through deps.spawnStep too
+      turn('turn_ended')
+      await internals().expire(live(), liveTask('fix'), 1) // failed with a due retry, the check is being stopped
+      expect(liveTask('fix').retryAt).toEqual(expect.any(Number))
+      await check.end()
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'blocked', uncertain: true, attempt: 1 }))
+      expect(liveTask('fix').retryAt).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(launches).toHaveLength(1) // no new agent
+    })
+    it('cancels the old worker before the replacement when a check failure kept while paused is applied', async () => {
+      const order = recordOrder()
+      const g = gate('check')
+      await startFlow(loopFlow(`${g.run}; exit 1`, 1, { retry: { max_attempts: 2 } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      live().state = 'paused'
+      g.open()
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      await service.resume(flowId)
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'running', attempt: 2 }))
+      expect(order).toEqual(['create', 'cancel agent-1', 'create'])
+    })
+    it('cancels the old worker when a check failure seen during a reconcile is applied', async () => {
+      const order = recordOrder()
+      const g = gate('check')
+      await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: `${g.run}; exit 1`, max_iterations: 1 }, timeout: '1h', retry: { max_attempts: 2 } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      service.ingest({ type: 'turn_ended', agentId: liveTask('fix').agentId, payload: {} })
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const hold = holdVerdictRead() // x's expiry holds the reconcile
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      g.open()
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1)) // the raw result waits for the barrier
+      hold.release(); await resumed
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'running', attempt: 2 }))
+      expect(order.indexOf('cancel agent-2')).toBeGreaterThan(-1)
+      expect(order.indexOf('cancel agent-2')).toBeLessThan(order.lastIndexOf('create'))
+    })
+    it('cancels the worker when an uncertainty kept while paused is applied', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+      await startFlow(loopFlow('x'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const check = lingeringStep()
+      turn('turn_ended')
+      live().state = 'paused'
+      await check.end()
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      expect(cancelled).not.toContain('agent-1')
+      await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'blocked', uncertain: true })
+      expect(cancelled).toContain('agent-1')
+    })
+    it('still times out a loop task whose kept check result is applied after its deadline, before any feedback goes out', async () => {
+      const g = gate('check')
+      await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: `${g.run}; exit 1`, max_iterations: 3 }, timeout: '1h' }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const fixAgent = liveTask('fix').agentId!
+      service.ingest({ type: 'turn_ended', agentId: fixAgent, payload: {} })
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const hold = holdVerdictRead() // x's expiry holds step 4
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      g.open() // the check fails below the limit: a feedback result, kept because the barrier is up
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      const seen = [...internals().pending.values()][0].at
+      liveTask('fix').deadline = seen + 1 // ahead when the result was seen
+      await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(seen + 1)) // passed before step 4 reaches fix
+      hold.release(); await resumed
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+      expect(sentTo(fixAgent).some(text => text.includes('Check failed'))).toBe(false) // the feedback never went out
+      expect(live().messages.find(m => m.id === liveTask('fix').loopState!.feedbackId)).toMatchObject({ delivery: 'failed', deliveryReason: 'The attempt ended before this feedback was delivered.' })
+      expect(internals().checks.size).toBe(0) // no further check
+    })
+    it('ignores the turns of a loop task that no longer runs', async () => {
+      await startFlow(loopFlow('exit 1', 1))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('failed'))
+      const before = checked()
+      turn('turn_started'); turn('turn_ended')
+      expect(checked()).toEqual(before)
+      expect(internals().checks.size).toBe(0)
+    })
+    it('pauses the run when a turn of a loop task cannot be counted', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks[0].loopState?.turn === 1)
+      turn('turn_started')
+      expect(live()).toMatchObject(pausedByDisk)
+      expect(checked().turn).toBe(0)
+    })
+    it('names the pid of a check that may still run even when that pid was never saved', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('x'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const check = lingeringStep()
+      const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks[0].loopState?.check?.pid !== undefined)
+      turn('turn_ended')
+      expect(live()).toMatchObject(pausedByDisk)
+      await check.end()
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      recover(); await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'blocked', uncertain: true, error: 'A loop check may still be running (pid 999999). Make sure it stopped before retrying.' })
+    })
+    it('names the default time limit of a check that timed out', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+      await startFlow(loopFlow('x'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const check = lingeringStep()
+      turn('turn_ended')
+      await vi.advanceTimersByTimeAsync(120_000) // the check's own limit: it is told to stop
+      check.gone(); await check.end()
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The loop check timed out after 2m. Log: .harness/loop/1.stderr.log' }))
+    })
+    it('sends feedback when the outputs of a passed check cannot be looked at', async () => {
+      await startFlow(loopFlow('true', 3, { outputs: { files: ['out.txt'] } }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      vi.mocked(outputsModule.checkOutputs).mockRejectedValueOnce(new Error('boom'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1 }))
+      expect(sentTo('agent-1').at(-1)).toMatch(/^\[Orchestrator update\]\nCheck failed \(outputs missing\), iteration 1 of 3\.[^]*outputs missing: outputs not checked: boom$/)
+    })
+    it('keeps check feedback for the resume when the run pauses while it waits for the attempt', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      let release!: () => void
+      const held = new Promise<void>(resolve => { release = resolve })
+      const owner = internals().exclusive(live(), liveTask('fix'), 1, () => held) // something else owns the attempt
+      const applying = vi.spyOn(internals() as unknown as { finishCheck(...args: unknown[]): Promise<void> }, 'finishCheck')
+      turn('turn_ended')
+      await vi.waitFor(() => expect(applying).toHaveBeenCalled()) // the result arrived and waits for the owner
+      live().state = 'paused'
+      release(); await owner
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      expect(checked()).toMatchObject({ phase: 'checking', completed: 0 })
+      expect(sentTo('agent-1')).toHaveLength(0)
+      await service.resume(flowId)
+      expect(checked()).toMatchObject({ phase: 'working', completed: 1 })
+      expect(sentTo('agent-1')).toHaveLength(1)
+    })
+    it('stops the loop check at once when its timeout cannot be saved', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().check?.pid).toEqual(expect.any(Number)))
+      const recover = failWrites(json => json.includes('Timed out after 1h.'))
+      await internals().expire(live(), liveTask('fix'), 1)
+      expect(live()).toMatchObject(pausedByDisk)
+      expect(cancelled).toContain('agent-1')
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0)) // the check was stopped, not left to run
+      expect(liveTask('fix').state).toBe('running') // the timeout itself waits for the resume
+      recover(); await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
     })
   })
 })

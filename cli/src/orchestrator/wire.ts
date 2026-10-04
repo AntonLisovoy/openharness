@@ -19,11 +19,12 @@ export async function orchestratorRequest(service: OrchestratorService, payload:
     if (action === 'start') return { project: await service.start(payload) }
     const id = RunId.parse(payload.id)
     if (MUTATING.has(action)) await service.reconciled(id)
+    let recorded: 'recorded' | undefined
     switch (action) {
       case 'plan': service.plan(id, payload.tasks); break
       case 'finish':
       case 'fail':
-        await service.finish(id, TaskId.parse(payload.taskId), z.number().int().min(1).parse(payload.attempt),
+        recorded = await service.finish(id, TaskId.parse(payload.taskId), z.number().int().min(1).parse(payload.attempt),
           z.string().parse(payload.summary), z.array(z.string()).parse(payload.artifacts ?? []), action === 'fail')
         break
       case 'retry': service.retry(id, TaskId.parse(payload.taskId)); break
@@ -39,7 +40,8 @@ export async function orchestratorRequest(service: OrchestratorService, payload:
         break
       }
     }
-    return { project: service.snapshot(id) }
+    // A loop task's finish is only recorded: its check decides when the turn ends.
+    return { project: service.snapshot(id), ...(recorded === 'recorded' ? { notice: 'Recorded. The check runs when this turn ends.' } : {}) }
   } catch (error) {
     return {
       error: error instanceof OrchestratorError ? error.code : error instanceof z.ZodError ? 'INVALID_REQUEST' : 'ORCHESTRATOR_FAILED',
