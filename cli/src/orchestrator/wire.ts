@@ -2,6 +2,9 @@ import { z } from 'zod'
 import { OrchestratorError, RunId, TaskId } from './model.js'
 import type { OrchestratorService } from './service.js'
 
+// Actions that change a run wait for its reconcile to end; cancel fences at once and status only reads.
+const MUTATING = new Set(['plan', 'finish', 'fail', 'retry', 'steer'])
+
 export async function orchestratorRequest(service: OrchestratorService, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   try {
     const action = z.enum(['list', 'catalog', 'start', 'status', 'plan', 'finish', 'fail', 'retry', 'cancel', 'resume', 'complete', 'message', 'steer']).parse(payload.action)
@@ -9,6 +12,7 @@ export async function orchestratorRequest(service: OrchestratorService, payload:
     if (action === 'catalog') return { harnesses: service.catalog() }
     if (action === 'start') return { project: await service.start(payload) }
     const id = RunId.parse(payload.id)
+    if (MUTATING.has(action)) await service.reconciled(id)
     switch (action) {
       case 'plan': service.plan(id, payload.tasks); break
       case 'finish':

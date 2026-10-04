@@ -4,7 +4,11 @@ import { OrchestratorError } from './model.js'
 import type { OrchestratorService } from './service.js'
 
 const id = 'a'.repeat(32), messageId = 'b'.repeat(32)
-const makeService = () => Object.fromEntries(['list', 'catalog', 'start', 'snapshot', 'plan', 'finish', 'retry', 'cancel', 'resume', 'complete', 'chat', 'steer'].map(key => [key, vi.fn(() => ({ id }))]))
+const makeService = () => {
+  const service = Object.fromEntries(['list', 'catalog', 'start', 'snapshot', 'plan', 'finish', 'retry', 'cancel', 'resume', 'complete', 'chat', 'steer', 'reconciled'].map(key => [key, vi.fn(() => ({ id }))]))
+  service.reconciled.mockImplementation((() => Promise.resolve()) as never)
+  return service
+}
 describe('orchestrator RPC boundary', () => {
   it.each(['list', 'catalog', 'start'])('returns %s data under the stable wire key', async action => {
     const service = makeService()
@@ -37,6 +41,17 @@ describe('orchestrator RPC boundary', () => {
     expect(answered).toBe(false)
     release()
     expect(await reply).toEqual({ project: { id } })
+  })
+  it('waits for a reconcile to end before a mutating action, but not for cancel or status', async () => {
+    const service = makeService()
+    let release!: () => void
+    service.reconciled.mockImplementation((() => new Promise<void>(r => { release = r })) as never)
+    const retried = orchestratorRequest(service as unknown as OrchestratorService, { action: 'retry', id, taskId: 'task' })
+    const others = [orchestratorRequest(service as unknown as OrchestratorService, { action: 'cancel', id }), orchestratorRequest(service as unknown as OrchestratorService, { action: 'status', id })]
+    await vi.waitFor(() => { expect(service.cancel).toHaveBeenCalled(); expect(service.snapshot).toHaveBeenCalledTimes(2) }) // answered without waiting
+    expect(service.retry).not.toHaveBeenCalled()
+    release(); await Promise.all([retried, ...others])
+    expect(service.retry).toHaveBeenCalledWith(id, 'task')
   })
   it('supports whole-project cancellation and reports validation errors without dispatch', async () => {
     const service = makeService(), wire = (payload: Record<string, unknown>) => orchestratorRequest(service as unknown as OrchestratorService, payload)

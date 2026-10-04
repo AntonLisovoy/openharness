@@ -52,12 +52,15 @@ export class OrchestratorService {
   private readonly committing = new Set<string>()
   private readonly finishing = new Map<string, Promise<void>>()
   private readonly pumping = new Set<string>()
-  private readonly launching = new Set<string>()
+  // Launches being prepared, by run/task, each with its own token: a cleanup removes only its own launch's entry.
+  private readonly launching = new Map<string, object>()
   private readonly assistantMessages = new Map<string, string>()
   private readonly steps = new Map<string, { run: Run; task: Task; attempt: number; handle: StepHandle }>()
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>()
   // Attempts that failed and are replaced once nothing of them is still running (see releaseRetries).
   private readonly retryDue = new Set<string>()
+  // Runs being reconciled: nothing pumps, dispatches or arms a timer for them until it ends (see reconcile).
+  private readonly reconciling = new Map<string, Promise<void>>()
   private loaded = false
   // Saved deadlines are enforced only once the daemon can act on them (see recover).
   private ready = false
@@ -193,7 +196,56 @@ export class OrchestratorService {
   async recover(): Promise<void> {
     this.load()
     this.ready = true
-    for (const run of this.runs.values()) if (run.state === 'active') this.restoreDeadlines(run)
+    await Promise.allSettled([...this.runs.values()].filter(run => run.state === 'active').map(run => this.reconcile(run)))
+  }
+  /** Resolves once the run's current reconcile has ended (at once when none runs). Never rejects. */
+  reconciled(id: string): Promise<void> { return (this.reconciling.get(id) ?? Promise.resolve()).catch(() => {}) }
+  /**
+   * Repairs what a pause or a restart left behind, then lets the run move. One pass at a time per run: the barrier is up
+   * before `activate` saves or announces anything. While it is up, nothing pumps or dispatches, no deadline timer is armed
+   * and one that fires does nothing, and a launch whose preparation ends goes back to the queue without starting anything.
+   * A worker whose creation was already under way may come up meanwhile; its deadline is saved but armed only once the
+   * barrier is down. A cancel does not wait: every step checks the run again after each await and stops. A failing step
+   * pauses the run again.
+   */
+  private reconcile(run: Run, activate?: () => void): Promise<void> {
+    const running = this.reconciling.get(run.id)
+    if (running) return running
+    let finish!: () => void, fail!: (error: unknown) => void
+    const done = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject })
+    this.reconciling.set(run.id, done)
+    void (async () => {
+      try {
+        activate?.()
+        await this.reconcileSteps(run)
+        this.reconciling.delete(run.id)
+        // The barrier is down: arm what came due later, deliver what waited, and move the run once.
+        if (!this.stopped && run.state === 'active') { this.restoreDeadlines(run); this.dispatchPending(run); this.pump(run) }
+        finish()
+      } catch (error) {
+        this.reconciling.delete(run.id)
+        this.pause(run, error)
+        fail(error)
+      }
+    })()
+    return done
+  }
+  private async reconcileSteps(run: Run): Promise<void> {
+    const live = (): boolean => !this.stopped && run.state === 'active'
+    // A preparation that returned because the run was paused goes back to the queue.
+    for (const task of run.tasks) if (live() && task.state === 'launching' && !this.busy(run, task)) this.unlaunch(run, task)
+    // Every deadline that passed is enforced now, through the same path as its timer.
+    await this.expireOverdue(run)
+  }
+  /** A launch that started nothing goes back to the queue; its half-prepared folder is removed when it launches again. */
+  private unlaunch(run: Run, task: Task): void {
+    this.commit(run, draft => Object.assign(draft.tasks.find(t => t.id === task.id)!, { state: 'queued', cwd: '', inputs: {} }))
+  }
+  private async expireOverdue(run: Run): Promise<void> {
+    for (const task of run.tasks) {
+      if (this.stopped || run.state !== 'active') return
+      if (task.state === 'running' && task.deadline !== undefined && task.deadline <= Date.now()) await this.expire(run, task, task.attempt)
+    }
   }
   catalog(): HarnessChoice[] { return this.deps.catalog() }
   /**
@@ -221,7 +273,7 @@ export class OrchestratorService {
   }
   snapshot(id: string): Record<string, unknown> {
     const run = this.get(id)
-    // A recovered project continues queued work only when it is requested again.
+    // A status read also moves the run (unless it is being reconciled).
     this.pump(run)
     this.dispatchPending(run)
     const viewerHarnesses = new Set(this.catalog().filter(h => h.viewer).map(h => h.id))
@@ -348,7 +400,7 @@ export class OrchestratorService {
     }
   }
   private pump(run: Run): void {
-    if (this.stopped || run.state !== 'active' || this.pumping.has(run.id)) return
+    if (this.stopped || run.state !== 'active' || this.pumping.has(run.id) || this.reconciling.has(run.id)) return
     this.pumping.add(run.id)
     try {
       this.releaseRetries(run)
@@ -380,11 +432,15 @@ export class OrchestratorService {
     this.commit(run, draft => Object.assign(draft.tasks.find(t => t.id === task.id)!, {
       state: 'launching', cwd: join(run.root, 'tasks', task.id, `attempt-${task.attempt}`), inputs: Object.fromEntries(inputs.map(t => [t.id, t.attempt])),
     }))
-    const key = `${run.id}/${task.id}`
-    this.launching.add(key)
+    const key = `${run.id}/${task.id}`, token = {}
+    this.launching.set(key, token)
     // A launch that failed in the background pauses the run before the release pump, so that pump launches nothing.
     const launch = this.launchTask(run, task, inputs).catch(error => this.pause(run, error))
-    this.background(run, launch.finally(() => { this.launching.delete(key); this.release(run) }))
+    this.background(run, launch.finally(() => {
+      // An interrupted launch gave up its entry when it queued the task again; a replacement may hold it by now.
+      if (this.launching.get(key) === token) this.launching.delete(key)
+      this.release(run)
+    }))
   }
   /** Replace failed attempts that are due for a retry, once nothing of the old attempt is still running. */
   private releaseRetries(run: Run): void {
@@ -414,11 +470,15 @@ export class OrchestratorService {
     if (run.error !== error) this.commit(run, draft => { draft.error = error })
   }
   private async launchTask(run: Run, task: Task, inputs: Task[]): Promise<void> {
-    let creating = false
+    let creating = false, interrupted = false
     try {
+      // A preparation of this same attempt that a pause or a restart interrupted; no saved state refers to its folder.
+      await rm(this.taskDir(run, task), { recursive: true, force: true })
       await mkdir(this.taskDir(run, task), { recursive: true, mode: 0o700 })
       for (const input of inputs) await materializeInputs(this.artifactRoot(run, input), join(this.taskDir(run, task), 'inputs', input.id), input.artifacts)
       if (this.stopped || task.state !== 'launching' || run.state !== 'active') return
+      // The run is being reconciled, which already passed this task: as after a pause, nothing starts and it is queued again.
+      if (this.reconciling.has(run.id)) { interrupted = true; return }
       if (task.run !== undefined) return this.launchStep(run, task)
       const harness = this.catalog().find(h => h.id === task.harness)
       const own = this.ownEngine(task.harness)
@@ -443,6 +503,10 @@ export class OrchestratorService {
         task.error = error instanceof Error ? error.message : 'Could not start this specialist.'
         this.queueResult(run, `Task ${task.id} could not start: ${task.error}`)
       }
+    } finally {
+      // Not busy before it is queued again: a pump right after the save may start a replacement, which owns the next entry.
+      // A save that fails here pauses the run (see startTask), with the task still launching for the next reconcile.
+      if (interrupted) { this.launching.delete(`${run.id}/${task.id}`); this.unlaunch(run, task) }
     }
     this.launched(run)
   }
@@ -478,7 +542,8 @@ export class OrchestratorService {
   private armDeadline(run: Run, task: Task): void {
     if (task.timeoutMs === undefined) return
     task.deadline = Date.now() + task.timeoutMs
-    this.scheduleDeadline(run, task)
+    // A worker that came up during a reconcile keeps its deadline saved; the end of the reconcile arms it.
+    if (!this.reconciling.has(run.id)) this.scheduleDeadline(run, task)
   }
   /** Saved deadlines without a timer: after a restart, or one that came due (and was ignored) while the project was paused. */
   private restoreDeadlines(run: Run): void {
@@ -487,11 +552,15 @@ export class OrchestratorService {
   }
   private scheduleDeadline(run: Run, task: Task): void {
     const key = this.attemptKey(run, task), attempt = task.attempt
-    const timer = setTimeout(() => { this.deadlines.delete(key); void this.expire(run, task, attempt) }, Math.max(0, task.deadline! - Date.now()))
+    const timer = setTimeout(() => {
+      this.deadlines.delete(key)
+      if (this.reconciling.has(run.id)) return // the reconcile enforces it, or arms it again when it ends
+      void this.expire(run, task, attempt)
+    }, Math.max(0, task.deadline! - Date.now()))
     timer.unref()
     this.deadlines.set(key, timer)
   }
-  private async expire(run: Run, task: Task, attempt: number): Promise<void> {
+  private async expire(run: Run, task: Task, attempt: number, observedAt = Date.now()): Promise<void> {
     // Captured first: once the timeout wins, a retry may already have reset the task.
     const agentId = task.agentId, step = this.steps.get(this.attemptKey(run, task, attempt))
     if (!await this.settleAuto(run, task, attempt, { failed: `Timed out after ${durationLabel(task.timeoutMs!)}.` })) return
@@ -703,9 +772,9 @@ export class OrchestratorService {
     const run = this.get(id)
     requireThat(run.flow || (run.directorId && this.deps.agent(run.directorId)), 'DIRECTOR_UNAVAILABLE', 'Inspect or restart the original director before resuming; no duplicate will be launched.')
     requireThat(run.state !== 'starting', 'PROJECT_STARTING', 'The director is still starting.')
-    run.state = 'active'; run.error = null
-    this.restoreDeadlines(run)
-    this.changed(run); this.pump(run)
+    // A flow has nothing left to resume once it ended; Director projects keep resuming (a revision may follow).
+    requireThat(!run.flow || !['cancelled', 'completed'].includes(run.state), 'PROJECT_INACTIVE', 'This flow run has ended; start the flow again instead.')
+    await this.reconcile(run, () => { run.state = 'active'; run.error = null; this.changed(run) })
   }
   complete(id: string, summary: string): void {
     const run = this.get(id)
@@ -752,7 +821,7 @@ export class OrchestratorService {
     message.delivery = 'pending'
   }
   private dispatchPending(run: Run): void {
-    if (this.stopped || run.state !== 'active') return
+    if (this.stopped || run.state !== 'active' || this.reconciling.has(run.id)) return
     for (const message of run.messages) {
       if (message.delivery !== 'pending') continue
       const target = message.targetAgentId ?? run.directorId

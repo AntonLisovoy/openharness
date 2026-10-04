@@ -913,7 +913,8 @@ tasks:
     expire(run: Run, task: Task, attempt: number): Promise<void>
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
-    finishing: Map<string, unknown>; launching: Set<string>
+    finishing: Map<string, unknown>; launching: Map<string, unknown>; reconciling: Map<string, Promise<void>>
+    pump(run: Run): void
     exclusive<T>(r: Run, t: Task, n: number, b: () => Promise<T>): Promise<T>
   }
   const live = () => internals().runs.get(flowId)! // the service's own objects: reading them never pumps
@@ -1556,6 +1557,183 @@ tasks:
     return () => vi.mocked(fs.writeFileSync).mockImplementation(actual)
   }
   const pausedByDisk = { state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) }
+  /** Holds the second verdict read (the first runs normally) until released. */
+  const holdSecondVerdictRead = async () => {
+    const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).readVerdictSnapshot
+    let release!: () => void, reading = false
+    vi.mocked(outputsModule.readVerdictSnapshot).mockImplementationOnce(actual).mockImplementationOnce(async dir => {
+      reading = true; await new Promise<void>(r => { release = r }); return actual(dir)
+    })
+    return { release: () => release(), reading: () => reading }
+  }
+  it('reconciles once for concurrent resumes, and launches nothing before it ends', async () => {
+    await startFlow(steps(
+      { id: 'a', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+      { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+      { id: 'b', run: 'true', depends_on: ['a'], trigger_rule: 'all_done' },
+    ))
+    await vi.waitFor(() => { expect(liveTask('a').state).toBe('running'); expect(liveTask('x').state).toBe('running') })
+    live().state = 'paused' // as a background error leaves it
+    liveTask('a').deadline = Date.now() - 1; liveTask('x').deadline = Date.now() - 1 // both came due while paused
+    const hold = await holdSecondVerdictRead() // a expires normally, x's expiry holds the barrier
+    const first = service.resume(flowId), second = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    expect(liveTask('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+    service.snapshot(flowId) // a status read during reconcile does not pump
+    expect(liveTask('b').state).toBe('queued')
+    hold.release(); await Promise.all([first, second])
+    expect(live().messages.filter(m => m.text.startsWith('Task x attempt 1 failed. Timed out'))).toHaveLength(1)
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('succeeded'))
+  })
+  it('defers a deadline that comes due during reconcile until it ends', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    // s is listed first: the reconcile has already passed it when its deadline comes due during x's held expiry.
+    await startFlow(steps({ id: 's', harness: 'test/cad', prompt: 'p', timeout: '2h' }, { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }))
+    await service.recover() // the daemon is ready: deadlines are armed again at the end of a reconcile
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead()
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    await vi.advanceTimersByTimeAsync(2 * 3_600_000) // s's own timer comes due inside the barrier and does nothing
+    expect(liveTask('s').state).toBe('running')
+    hold.release(); await resumed
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'failed', error: 'Timed out after 2h.' }))
+  })
+  it('stops reconciling when the project is cancelled meanwhile', async () => {
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'b', run: 'true', depends_on: ['x'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('x').state).toBe('running'))
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead()
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    service.cancel(flowId) // does not wait for the barrier
+    hold.release(); await resumed
+    expect(live().state).toBe('cancelled')
+    expect(live().tasks.map(t => t.state)).toEqual(['cancelled', 'cancelled'])
+    expect(internals().launching.size).toBe(0)
+  })
+  it('returns a launch interrupted by a pause to the queue on resume', async () => {
+    const realMkdir = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).mkdir
+    let release: (() => void) | undefined, held = false
+    vi.mocked(filesystem.mkdir).mockImplementation(async (path, options) => {
+      // hold the first copy of u's logs into a's inputs, once
+      if (!held && String(path).includes(join('tasks', 'a', 'attempt-1', 'inputs'))) { held = true; await new Promise<void>(r => { release = r }) }
+      return realMkdir(path, options)
+    })
+    await startFlow(steps({ id: 'u', run: 'echo hello' }, { id: 'a', run: 'cat inputs/u/stdout.log', depends_on: ['u'] }))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    live().state = 'paused'; release!()
+    await vi.waitFor(() => expect(internals().launching.size).toBe(0))
+    expect(liveTask('a').state).toBe('launching')
+    await service.resume(flowId) // back to the queue, the half-prepared folder removed, launched again
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'succeeded', summary: 'hello', attempt: 1 }))
+  })
+  it('returns a launch whose preparation ends during reconcile to the queue, and launches it once the reconcile ends', async () => {
+    const realMkdir = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).mkdir
+    let prepared: (() => void) | undefined, held = false
+    vi.mocked(filesystem.mkdir).mockImplementation(async (path, options) => {
+      if (!held && String(path).endsWith(join('tasks', 'a', 'attempt-1'))) { held = true; await new Promise<void>(r => { prepared = r }) }
+      return realMkdir(path, options)
+    })
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'a', run: 'echo ok' }))
+    await vi.waitFor(() => { expect(liveTask('x').state).toBe('running'); expect(prepared).toBeTypeOf('function') })
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead()
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    prepared!() // a's preparation ends while x's expiry holds the reconcile
+    await vi.waitFor(() => expect(internals().launching.size).toBe(0))
+    expect(liveTask('a').state).toBe('queued')
+    expect(internals().steps.size).toBe(0)
+    hold.release(); await resumed
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'succeeded', summary: 'ok', attempt: 1 }))
+  })
+  it('keeps the launch marker of the live preparation when a reconcile ends as an interrupted launch is queued again', async () => {
+    const realMkdir = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).mkdir
+    const gates: (() => void)[] = []
+    let preparations = 0
+    vi.mocked(filesystem.mkdir).mockImplementation(async (path, options) => {
+      if (String(path).endsWith(join('tasks', 'a', 'attempt-1')) && ++preparations <= 2) await new Promise<void>(r => { gates.push(r) })
+      return realMkdir(path, options)
+    })
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'a', run: 'echo ok' }))
+    await vi.waitFor(() => { expect(liveTask('x').state).toBe('running'); expect(gates).toHaveLength(1) })
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead()
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    // The narrowest order: the reconcile ends (barrier down, one pump) the moment a is queued again, before the
+    // interrupted launch has cleaned up after itself. The pump starts a replacement preparation, held in its mkdir.
+    deps.changed = () => {
+      if (liveTask('a').state !== 'queued' || !internals().reconciling.has(flowId)) return
+      internals().reconciling.delete(flowId); internals().pump(live())
+    }
+    gates[0]()
+    await vi.waitFor(() => expect(gates).toHaveLength(2))
+    hold.release(); await resumed // the interrupted launch has long cleaned up
+    expect(internals().launching.has(`${flowId}/a`)).toBe(true) // the marker belongs to the live preparation
+    await service.resume(flowId) // so another reconcile leaves that preparation alone
+    gates[1]()
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'succeeded', summary: 'ok', attempt: 1 }))
+    expect(preparations).toBe(2)
+  })
+  it('arms the deadline of a worker created during reconcile only once the reconcile ends', async () => {
+    let created: (() => void) | undefined
+    const create = deps.create
+    deps.create = async input => {
+      if (input.name === 'y') await new Promise<void>(r => { created = r })
+      return create(input)
+    }
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'y', harness: 'test/cad', prompt: 'p', timeout: '1h' }))
+    await service.recover() // the daemon is ready: deadlines are armed again at the end of a reconcile
+    await vi.waitFor(() => { expect(liveTask('x').state).toBe('running'); expect(created).toBeTypeOf('function') })
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead()
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    created!() // y's agent is created while x's expiry holds the reconcile
+    await vi.waitFor(() => expect(liveTask('y').state).toBe('running'))
+    expect(liveTask('y').deadline).toBeTypeOf('number')
+    expect(internals().deadlines.has(`${flowId}/y/1`)).toBe(false)
+    hold.release(); await resumed
+    expect(internals().deadlines.has(`${flowId}/y/1`)).toBe(true)
+    await service.finish(flowId, 'y', 1, 'done', [])
+    expect(liveTask('y').state).toBe('succeeded')
+  })
+  it('refuses to resume a flow run that was cancelled or completed', async () => {
+    await startFlow(steps({ id: 'a', run: 'true' }))
+    await vi.waitFor(() => expect(live().state).toBe('completed'))
+    await expect(service.resume(flowId)).rejects.toMatchObject({ code: 'PROJECT_INACTIVE', message: 'This flow run has ended; start the flow again instead.' })
+    expect(live().state).toBe('completed')
+    live().state = 'cancelled' // the same rule for a cancelled run (a cancel step or a project cancel)
+    expect(await orchestratorRequest(service, { action: 'resume', id: flowId })).toEqual({ error: 'PROJECT_INACTIVE', detail: 'This flow run has ended; start the flow again instead.' })
+    expect(live().state).toBe('cancelled')
+  })
+  it('pauses the run again when a reconcile step fails, and then answers a request that waited for it', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('x').state).toBe('running'))
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    deps.cancel = () => { throw new Error('agent unreachable') } // stopping the timed-out worker fails after the timeout was saved
+    const resumed = service.resume(flowId)
+    const retried = orchestratorRequest(service, { action: 'retry', id: flowId, taskId: 'x' }) // waits for the reconcile
+    await expect(resumed).rejects.toThrow('agent unreachable')
+    expect(await retried).toEqual({ error: 'PROJECT_INACTIVE', detail: 'Resume the project first.' })
+    expect(live()).toMatchObject({ state: 'paused', error: expect.stringContaining('agent unreachable') })
+    expect(liveTask('x')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+    await service.reconciled(flowId) // nothing is being reconciled any more
+  })
+  it('stays paused when a resume cannot be saved', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p' }, { id: 'b', run: 'true' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    live().state = 'paused'
+    diskFull()
+    await expect(service.resume(flowId)).rejects.toThrow(/ENOSPC/)
+    vi.mocked(fs.writeFileSync).mockReset()
+    expect(live()).toMatchObject(pausedByDisk)
+  })
   it('names the logs in the result of a step that failed', async () => {
     await startFlow(steps({ id: 't', run: 'echo boom >&2; exit 1' }))
     await vi.waitFor(() => expect(liveTask('t').state).toBe('failed'))
