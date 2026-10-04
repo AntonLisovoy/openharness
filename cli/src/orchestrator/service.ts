@@ -44,9 +44,18 @@ export interface OrchestratorDependencies {
 type Outcome = { summary: string; paths: string[]; keep?: string[] } | { failed: string; retryable?: boolean; keep?: string[] }
 /** What observed an automatic result: a process exit, a timeout, declared outputs, an idle clock, a loop check, lost feedback. */
 type Source = 'exit' | 'timeout' | 'outputs' | 'idle' | 'check' | 'feedback'
+/** Something of the attempt's process group may still run (see fenceUncertain): the error to show. */
+type Uncertain = { uncertain: string }
 /** A result with no owner yet: kept in memory and applied by the next reconcile. `then` is its follow-up, run once it is saved. */
-interface Pending { run: Run; task: Task; attempt: number; outcome: Outcome; source: Source; at: number; then?: () => void }
+interface Pending { run: Run; task: Task; attempt: number; outcome: Outcome | Uncertain; source: Source; at: number; then?: () => void }
 interface AutoOptions { source: Source; at?: number; guard?: () => boolean; replay?: boolean; then?: () => void }
+
+/**
+ * A step process this daemon owns. `uncertain`: the process ended but its group could not be confirmed gone (the error to
+ * show), recorded before the attempt is fenced. `lingering`: that fence was applied or kept; cancel and stop still signal
+ * the group.
+ */
+type StepEntry = { run: Run; task: Task; attempt: number; handle: StepHandle; uncertain?: string; lingering?: true }
 
 /** A shell step's logs, in the task folder. */
 const STEP_LOGS = ['stdout.log', 'stderr.log']
@@ -78,7 +87,8 @@ export class OrchestratorService {
   // Launches being prepared, by run/task, each with its own token: a cleanup removes only its own launch's entry.
   private readonly launching = new Map<string, object>()
   private readonly assistantMessages = new Map<string, string>()
-  private readonly steps = new Map<string, { run: Run; task: Task; attempt: number; handle: StepHandle }>()
+  // Step processes by attempt (see StepEntry).
+  private readonly steps = new Map<string, StepEntry>()
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>()
   // Timers of failed tasks whose saved retry is not due yet, by run/task (see releaseRetries).
   private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -125,10 +135,12 @@ export class OrchestratorService {
           task.uncertain = true
           task.error = `The daemon restarted while this step was running (pid ${task.pid ?? 'unknown'}). Make sure it stopped before retrying.`
         }
-        // A failed step that was still stopping when the daemon died: its retry waits until its group is gone.
-        for (const task of run.tasks) if (task.retryAt !== undefined && task.pid !== undefined && !processGone(task.pid)) {
+        // A failed or cancelled step that was still stopping when the daemon died (a timeout or a cancel in its grace
+        // period): no retry, automatic or by hand, replaces it until its group is gone. A cancelled one stays cancelled.
+        for (const task of run.tasks) if (task.run !== undefined && ['failed', 'cancelled'].includes(task.state) && !task.uncertain && task.pid !== undefined && !processGone(task.pid)) {
           delete task.retryAt
-          task.state = 'blocked'; task.uncertain = true
+          if (task.state === 'failed') task.state = 'blocked'
+          task.uncertain = true
           task.error = `The daemon restarted while this step was stopping (pid ${task.pid}). Make sure it stopped before retrying.`
         }
         for (const message of run.messages) if (['accepted', 'queued'].includes(message.delivery ?? '')) {
@@ -442,7 +454,9 @@ export class OrchestratorService {
   private busy(run: Run, task: Task): boolean {
     const key = this.attemptKey(run, task)
     // keepLogs runs while the step still owns its `steps` entry or the attempt is owned, so a log snapshot is covered.
-    return this.finishing.has(key) || this.steps.has(key) || this.launching.has(`${run.id}/${task.id}`) || this.pending.has(key)
+    // A lingering step is not busy: its attempt is uncertain, which already holds back its dependents and its retry.
+    const step = this.steps.get(key)
+    return this.finishing.has(key) || (step !== undefined && !step.lingering) || this.launching.has(`${run.id}/${task.id}`) || this.pending.has(key)
   }
   private busyIn(run: Run): Busy { return id => this.busy(run, run.tasks.find(t => t.id === id)!) }
   /**
@@ -501,8 +515,9 @@ export class OrchestratorService {
   /** Replaces failed attempts whose retry is due, once nothing of them is still running or saving; arms a timer for the rest. */
   private releaseRetries(run: Run): void {
     for (const task of run.tasks) {
-      // Only a failed attempt gets a retryAt, and every transition out of failed drops it.
-      if (task.retryAt === undefined || this.busy(run, task)) continue
+      // Only a failed attempt gets a retryAt, and every transition out of failed drops it. An attempt whose group may
+      // still run (a lingering step included) is never replaced automatically.
+      if (task.retryAt === undefined || this.busy(run, task) || this.steps.has(this.attemptKey(run, task))) continue
       const key = `${run.id}/${task.id}`, wait = task.retryAt - Date.now()
       if (wait > 0) {
         // A timer that fires while the run is paused or reconciled does nothing; the pump that ends either arms it again.
@@ -590,25 +605,39 @@ export class OrchestratorService {
   private launchStep(run: Run, task: Task): void {
     const attempt = task.attempt, key = this.attemptKey(run, task)
     const handle = startStep(task.run!, { cwd: this.execDir(run, task), logs: { stdout: join(this.taskDir(run, task), STEP_LOGS[0]), stderr: join(this.taskDir(run, task), STEP_LOGS[1]) }, env: this.stepEnv(run, task), spawn: this.deps.spawnStep })
-    this.steps.set(key, { run, task, attempt, handle })
+    const owned: StepEntry = { run, task, attempt, handle }
+    this.steps.set(key, owned)
     let unsaved: string | undefined
     this.background(run, handle.done.then(async result => {
       const observedAt = Date.now()
-      // A process whose pid could not be saved was stopped by the daemon: however it exited, it did not finish its work.
-      const failure = unsaved ? `Stopped: its process id could not be saved (${unsaved}).` : result.code === 0 && !result.error ? null : stepFailure(result)
-      const outcome: Outcome = failure === null
-        ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: [], keep: STEP_LOGS }
-        : { failed: failure, retryable: result.started, ...(result.started ? { keep: STEP_LOGS } : {}) }
+      let lingering = false
       try {
-        const took = await this.settleAuto(run, task, attempt, outcome, { source: 'exit', at: observedAt })
-        // A failure that another result took first (a timeout while the process ran) keeps its logs now that it is gone.
-        if (!took && result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt, this.stillFailed(run, task, attempt))
+        if (result.started && handle.armed()) {
+          // Something of its group may still run: the attempt is fenced (or the fence kept) before the entry stops being busy.
+          // The entry records it first, so a daemon stop while the fence waits for the attempt owner still saves it.
+          const uncertain = `${stepFailure(result)}. Make sure it stopped before retrying.`
+          owned.uncertain = uncertain
+          await this.fenceUncertain(run, task, attempt, uncertain, 'exit', observedAt)
+          lingering = true
+        } else {
+          // A process whose pid could not be saved was stopped by the daemon: however it exited, it did not finish its work.
+          const failure = unsaved ? `Stopped: its process id could not be saved (${unsaved}).` : result.code === 0 && !result.error ? null : stepFailure(result)
+          const outcome: Outcome = failure === null
+            ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: [], keep: STEP_LOGS }
+            : { failed: failure, retryable: result.started, ...(result.started ? { keep: STEP_LOGS } : {}) }
+          const took = await this.settleAuto(run, task, attempt, outcome, { source: 'exit', at: observedAt })
+          // A failure that another result took first (a timeout while the process ran) keeps its logs now that it is gone.
+          if (!took && result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt, this.stillFailed(run, task, attempt))
+        }
       } catch (error) {
         // The attempt moved on, or the run paused (the reconcile keeps the logs); anything else pauses before the release
         // pump, so nothing downstream starts without the logs.
         if (!(error instanceof OrchestratorError && error.code === 'TASK_INACTIVE')) this.pause(run, error)
-      } finally { this.steps.delete(key) }
-      this.release(run) // a failed attempt's retry and its dependents wait for its process to exit
+      } finally {
+        const entry = this.steps.get(key)
+        if (lingering && entry) entry.lingering = true; else this.steps.delete(key)
+      }
+      this.release(run) // every release pumps, a lingering one included: an uncertain upstream blocks its dependents now
     }))
     try {
       this.commit(run, draft => {
@@ -711,11 +740,43 @@ export class OrchestratorService {
     then?.()
     return 'saved'
   }
-  /** One kept result, under the observation-time rule: seen at or after its task's deadline, the timeout is applied instead. */
+  /**
+   * One kept result, under the observation-time rule: seen at or after its task's deadline, the timeout is applied instead.
+   * An uncertainty is applied whenever it was seen: a process that may still run outranks a timeout.
+   */
   private async applyKept(run: Run, entry: Pending): Promise<void> {
     const { task, attempt } = entry
+    if ('uncertain' in entry.outcome) {
+      await this.fenceUncertain(run, task, attempt, entry.outcome.uncertain, entry.source as 'exit' | 'check', entry.at, { replay: true, then: entry.then })
+      return
+    }
     if (entry.source === 'timeout' || (task.deadline !== undefined && entry.at >= task.deadline)) await this.expire(run, task, attempt, entry.at, true)
     else await this.settleAuto(run, task, attempt, entry.outcome, { source: entry.source, at: entry.at, then: entry.then, replay: true })
+  }
+  /**
+   * Something of the attempt's process group may still run: nothing may replace the attempt until it is gone. Wins over
+   * any result of the same attempt (a saved failure and its due retry included); a cancelled task keeps its state but is
+   * marked uncertain too, so that a retry after a restart still waits for the group. Kept as a pending transition, with
+   * its follow-up, when it cannot be applied now. True when it was applied.
+   */
+  private async fenceUncertain(run: Run, task: Task, attempt: number, error: string, source: 'exit' | 'check', at: number, opts: { replay?: boolean; then?: () => void } = {}): Promise<boolean> {
+    const key = this.attemptKey(run, task, attempt)
+    return this.exclusive(run, task, attempt, async () => {
+      if (this.stopped || task.attempt !== attempt || task.uncertain) return false
+      const keep = (): void => { this.pending.set(key, { run, task, attempt, outcome: { uncertain: error }, source, at, then: opts.then }) }
+      if (run.state !== 'active' || (this.reconciling.has(run.id) && !opts.replay)) { keep(); return false }
+      try {
+        this.commit(run, draft => {
+          const t = draft.tasks.find(x => x.id === task.id)!
+          Object.assign(t, { state: t.state === 'cancelled' ? 'cancelled' : 'blocked', uncertain: true, error })
+          delete t.retryAt
+        })
+      } catch (failure) { keep(); this.pause(run, failure); return false }
+      this.pending.delete(key)
+      clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key); this.clearRetry(run, task)
+      opts.then?.()
+      return true
+    })
   }
   /** Applies every kept result of the run, oldest first, also those added while it runs. */
   private async drain(run: Run): Promise<void> {
@@ -890,14 +951,19 @@ export class OrchestratorService {
     requireThat(run.state === 'active', 'PROJECT_INACTIVE', 'Resume the project first.')
     requireThat(!this.launching.has(`${id}/${taskId}`), 'TASK_STARTING', 'Wait for the previous launch to settle before retrying this task.')
     const key = this.attemptKey(run, task)
-    requireThat(!this.steps.has(key), 'TASK_STOPPING', 'The previous attempt is still stopping; retry when it has ended.')
+    // A step whose group could not be confirmed stopped is released once its process is gone (and the retry is saved).
+    const step = this.steps.get(key), released = step?.lingering === true
+    if (released) requireThat(task.pid !== undefined && processGone(task.pid), 'RETRY_UNSAFE', `This step may still be running (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`)
+    else requireThat(!step, 'TASK_STOPPING', 'The previous attempt is still stopping; retry when it has ended.')
     // A step left running by a crashed daemon is safe to replace once its process is gone.
     const orphan = task.uncertain && task.run !== undefined
-    requireThat((orphan && task.pid !== undefined && processGone(task.pid)) || (!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state)), 'RETRY_UNSAFE', orphan
+    requireThat(released || (orphan && task.pid !== undefined && processGone(task.pid)) || (!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state)), 'RETRY_UNSAFE', orphan
       ? `This step may still be running from before the daemon restart (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`
       : 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
     requireThat(!run.tasks.some(t => t.dependsOn.includes(task.id) && ['running', 'launching', 'succeeded'].includes(t.state)), 'RESULT_IN_USE', 'Add a new revision task instead; downstream work already consumed this attempt.')
-    this.requeue(run, task); this.clearRetry(run, task); this.pump(run); this.dispatchPending(run)
+    this.requeue(run, task)
+    if (released) this.steps.delete(key)
+    this.clearRetry(run, task); this.pump(run); this.dispatchPending(run)
   }
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
@@ -1073,7 +1139,19 @@ export class OrchestratorService {
     for (const timer of this.retryTimers.values()) clearTimeout(timer)
     this.deadlines.clear(); this.retryTimers.clear()
     const unsaved = new Set([...this.dirty.keys()].map(id => this.runs.get(id)!))
-    // A kept result is lost with the daemon: a shell step it belonged to fails as one still running would.
+    // Evidence that a group may still run (a kept uncertainty, or a step whose group outlived it and is not fenced yet) is
+    // saved as an uncertainty: the next daemon must not replace the attempt until the group is gone. A running or failed
+    // task becomes blocked, a cancelled one stays cancelled; its pid stays.
+    const evidence = [
+      ...[...this.pending.values(), ...this.replaying].flatMap(e => 'uncertain' in e.outcome ? [{ ...e, uncertain: e.outcome.uncertain }] : []),
+      ...[...this.steps.values()].flatMap(e => e.uncertain === undefined ? [] : [{ ...e, uncertain: e.uncertain }]),
+    ]
+    for (const { run, task, attempt, uncertain } of evidence) {
+      if (task.attempt !== attempt || !['running', 'cancelled', 'failed'].includes(task.state)) continue
+      if (task.state !== 'cancelled') task.state = 'blocked'
+      task.uncertain = true; task.error = uncertain; delete task.retryAt; unsaved.add(run)
+    }
+    // Any other kept result is lost with the daemon: an ordinary running shell step fails as it always did.
     for (const { run, task, attempt } of [...this.steps.values(), ...this.pending.values(), ...this.replaying]) {
       if (task.attempt === attempt && task.state === 'running' && task.run !== undefined) { task.state = 'failed'; task.error = 'Stopped with the daemon.'; unsaved.add(run) }
     }

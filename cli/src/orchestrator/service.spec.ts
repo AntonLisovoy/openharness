@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 import * as filesystem from 'node:fs/promises'
 import * as privateState from '../lib/secureState.js'
 import { OrchestratorService, type OrchestratorDependencies } from './service.js'
@@ -912,7 +914,7 @@ tasks:
   })
 
   const internals = () => service as unknown as {
-    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> } }>
+    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> }; uncertain?: string }>
     expire(run: Run, task: Task, attempt: number): Promise<void>
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
@@ -920,6 +922,7 @@ tasks:
     pump(run: Run): void
     exclusive<T>(r: Run, t: Task, n: number, b: () => Promise<T>): Promise<T>
     pending: Map<string, { task: Task; at: number; source: string }>
+    fenceUncertain(run: Run, task: Task, attempt: number, error: string, source: 'exit' | 'check', at: number): Promise<boolean>
   }
   const live = () => internals().runs.get(flowId)! // the service's own objects: reading them never pumps
   const liveTask = (taskId: string) => live().tasks.find(t => t.id === taskId)!
@@ -1461,6 +1464,28 @@ tasks:
     const ended = await exitedPid('true', []); await ended.exited
     const gone = await restartOn(saved => { saved.tasks[0].pid = ended.pid })
     expect(gone.run().tasks[0]).toMatchObject({ state: 'failed', retryAt: expect.any(Number) })
+  })
+  it.each(['failed', 'cancelled'] as const)('refuses a manual retry of a %s step whose process group survived a crash, until it is gone', async ended => {
+    await startFlow(steps({ id: 's', run: ended === 'failed' ? 'exit 1' : 'sleep 30' }))
+    if (ended === 'cancelled') { await vi.waitFor(() => expect(liveTask('s').state).toBe('running')); service.cancel(flowId, 's') }
+    await vi.waitFor(() => expect(liveTask('s').state).toBe(ended))
+    const left = orphan()
+    const { next, run } = await restartOn(saved => { saved.tasks[0].pid = left.pid }) // the crash hit while this group still ran
+    expect(run().tasks[0]).toMatchObject({ state: ended === 'failed' ? 'blocked' : 'cancelled', uncertain: true, attempt: 1, error: `The daemon restarted while this step was stopping (pid ${left.pid}). Make sure it stopped before retrying.` })
+    expect(() => next.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE', message: `This step may still be running from before the daemon restart (pid ${left.pid}). Stop that process, then retry.` }))
+    process.kill(-left.pid, 'SIGKILL')
+    await vi.waitFor(() => expect(processGone(left.pid)).toBe(true))
+    next.retry(flowId, 's')
+    expect(run().tasks[0].attempt).toBe(2)
+  })
+  it('leaves a failed or cancelled step alone after a crash when its process is known to be gone', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'b', run: 'sleep 30' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('failed'))
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('running'))
+    service.cancel(flowId, 'b')
+    const ended = await exitedPid('true', []); await ended.exited
+    const { run } = await restartOn(saved => { for (const t of saved.tasks) t.pid = ended.pid })
+    expect(run().tasks.map(t => [t.state, t.uncertain])).toEqual([['failed', false], ['cancelled', false]])
   })
   it('refuses to retry a crashed step whose pid was never recorded', async () => {
     const { recovered, step } = await afterCrash(undefined)
@@ -2385,5 +2410,213 @@ tasks:
     await service.resume(flowId) // the copy is tried again: its source is gone now, so that log is not kept
     expect(liveTask('t')).toMatchObject({ state: 'failed', error: 'exit 1' })
     expect(liveTask('t').artifacts.map(a => a.path)).toEqual(['stderr.log'])
+  })
+  /** Fake step processes, pid 999_999, a fresh one per spawn: the leader is gone, the group answers until `gone()`. */
+  const lingeringStep = () => {
+    const make = () => Object.assign(new EventEmitter(), { pid: 999_999, stdout: new PassThrough(), stderr: new PassThrough() })
+    let fake = make()
+    const spawned = vi.fn(() => { fake = make(); return fake as unknown as ChildProcess })
+    deps.spawnStep = spawned
+    let groupAlive = true
+    const real = process.kill.bind(process)
+    vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string | number) => {
+      if (Math.abs(target) !== 999_999) return real(target, signal as never)
+      if (signal === 0 && (target > 0 || !groupAlive)) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' })
+      return true // the group still answers; signals to it are swallowed
+    }) as typeof process.kill)
+    return {
+      spawned, gone: () => { groupAlive = false }, alive: () => { groupAlive = true },
+      /** The latest process exits with code 1; the grace period and the time allowed to confirm its group pass. */
+      end: async () => { fake.emit('exit', 1, null); fake.emit('close'); await vi.advanceTimersByTimeAsync(10_000) },
+    }
+  }
+  it('blocks a step as uncertain when its leftovers could not be confirmed stopped, and keeps owning it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x', retry: { max_attempts: 3 } }, { id: 'after', run: 'true', depends_on: ['s'] }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    await step.end()
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true, error: expect.stringMatching(/could not be confirmed stopped/) }))
+    expect(liveTask('s').retryAt).toBeUndefined()
+    expect(internals().steps.size).toBe(1) // still signalled by cancel and stop
+    await vi.waitFor(() => expect(liveTask('after').state).toBe('blocked'))
+    expect(() => service.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    step.gone()
+    service.retry(flowId, 's')
+    expect(internals().steps.size).toBe(0)
+    expect(liveTask('s').attempt).toBe(2)
+  })
+  it('keeps an attempt that timed out and is due for retry from being replaced while its group may still run', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x', timeout: '1h', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    await internals().expire(live(), liveTask('s'), 1) // saved: failed, retry due
+    expect(liveTask('s')).toMatchObject({ state: 'failed', retryAt: expect.any(Number) })
+    await step.end() // the stop could not be confirmed
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true, attempt: 1 }))
+    expect(liveTask('s').retryAt).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(step.spawned).toHaveBeenCalledTimes(1) // never replaced
+  })
+  it('keeps an uncertainty that cannot be saved, and applies it on resume', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks[0].uncertain === true)
+    await step.end()
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    expect(liveTask('s').state).toBe('running')
+    expect(internals().pending.size).toBe(1)
+    recover(); await service.resume(flowId)
+    expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true, attempt: 1 })
+    expect(step.spawned).toHaveBeenCalledTimes(1)
+  })
+  it('keeps an uncertainty seen while the run pauses during the wait for the attempt owner', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    let release!: () => void
+    const owner = internals().exclusive(live(), liveTask('s'), 1, () => new Promise<void>(r => { release = r }))
+    await step.end()
+    live().state = 'paused' // while the uncertainty waits for the owner
+    release(); await owner
+    await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+    await service.resume(flowId)
+    expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true })
+  })
+  it('keeps an uncertainty seen after the deadline over the timeout, and starts nothing after it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 's', run: 'x', timeout: '1h' }, { id: 'r', run: 'true', depends_on: ['s'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => { expect(liveTask('x').state).toBe('running'); expect(liveTask('s').state).toBe('running') })
+    live().state = 'paused'
+    liveTask('x').deadline = Date.now() - 1; liveTask('s').deadline = Date.now() - 1 // both overdue; x comes first in step 4
+    const hold = holdVerdictRead() // x's expiry holds step 4 before it reaches s
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    await step.end() // s ends after its deadline, its group unconfirmed: the uncertainty is kept (the barrier is up)
+    await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+    hold.release(); await resumed
+    expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true })
+    expect(liveTask('s').retryAt).toBeUndefined()
+    expect(liveTask('r').state).toBe('queued') // all_done waits for an uncertain upstream
+    expect(step.spawned).toHaveBeenCalledTimes(1)
+  })
+  it('fences a step whose pid could not be saved and whose group could not be confirmed stopped, and refuses its retry', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const step = lingeringStep()
+    const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks[0].state === 'running')
+    await startFlow(steps({ id: 's', run: 'x', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    await step.end() // stopped by the daemon, its group unconfirmed: the uncertainty is kept (the run is paused)
+    await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+    recover(); await service.resume(flowId)
+    expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true, attempt: 1 })
+    expect(liveTask('s').pid).toBeUndefined()
+    step.gone()
+    expect(() => service.retry(flowId, 's')).toThrow('This step may still be running (pid unknown). Stop that process, then retry.')
+    expect(step.spawned).toHaveBeenCalledTimes(1)
+  })
+  it('keeps the first uncertainty of an attempt', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    await step.end()
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true }))
+    const { error, revision } = { error: liveTask('s').error, revision: live().revision }
+    expect(await internals().fenceUncertain(live(), liveTask('s'), 1, 'Another uncertainty.', 'check', Date.now())).toBe(false)
+    expect(liveTask('s').error).toBe(error)
+    expect(live().revision).toBe(revision)
+  })
+  it.each(['running', 'cancelled'] as const)('saves an uncertainty kept at a daemon stop, so the next daemon waits for the group (%s)', async kind => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    live().state = 'paused'
+    await step.end() // the uncertainty is kept (the run is paused)
+    await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+    if (kind === 'cancelled') service.cancel(flowId, 's')
+    service.stop() // a graceful stop, saved before the next daemon reads the state
+    const { next, run } = await restartOn()
+    expect(run().tasks[0]).toMatchObject({ state: kind === 'running' ? 'blocked' : 'cancelled', uncertain: true, error: expect.stringMatching(/could not be confirmed stopped/) })
+    await next.resume(flowId)
+    expect(() => next.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    step.gone()
+    next.retry(flowId, 's')
+    expect(run().tasks[0]).toMatchObject({ attempt: 2, uncertain: false })
+  })
+  it('marks a cancelled step uncertain when its stop could not be confirmed, so a retry after a restart waits for the group', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    service.cancel(flowId, 's')
+    await step.end()
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'cancelled', uncertain: true }))
+    expect(() => service.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    service.stop()
+    const { next, run } = await restartOn()
+    expect(() => next.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    step.gone()
+    next.retry(flowId, 's')
+    expect(run().tasks[0]).toMatchObject({ attempt: 2, uncertain: false })
+  })
+  it('keeps a lingering step owned when its retry is refused for another reason', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x' }, { id: 'after', run: 'true', depends_on: ['s'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    await step.end()
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'blocked', uncertain: true }))
+    liveTask('after').state = 'succeeded' // downstream work consumed this attempt
+    step.gone()
+    expect(() => service.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE' }))
+    expect(internals().steps.size).toBe(1)
+  })
+  it('saves an uncertainty kept for an attempt that already failed on its last timeout, so the next daemon waits for the group', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    await internals().expire(live(), liveTask('s'), 1) // saved: failed, no retry left
+    expect(liveTask('s')).toMatchObject({ state: 'failed', uncertain: false })
+    live().state = 'paused'
+    await step.end() // the stop could not be confirmed: the uncertainty is kept (the run is paused)
+    await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+    service.stop() // a graceful stop, saved before the next daemon reads the state
+    const { next, run } = await restartOn()
+    expect(run().tasks[0]).toMatchObject({ state: 'blocked', uncertain: true, pid: 999_999, error: expect.stringMatching(/could not be confirmed stopped/) })
+    await next.resume(flowId)
+    expect(() => next.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    step.gone()
+    next.retry(flowId, 's')
+    expect(run().tasks[0]).toMatchObject({ attempt: 2, uncertain: false })
+  })
+  it('saves an uncertainty seen while the fence waits for the attempt owner when the daemon stops', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const step = lingeringStep()
+    await startFlow(steps({ id: 's', run: 'x' }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    let release!: () => void
+    const owner = internals().exclusive(live(), liveTask('s'), 1, () => new Promise<void>(r => { release = r }))
+    await step.end()
+    await vi.waitFor(() => expect([...internals().steps.values()][0].uncertain).toMatch(/could not be confirmed stopped/))
+    expect(internals().pending.size).toBe(0) // the fence still waits for the owner
+    service.stop()
+    release(); await owner
+    const { next, run } = await restartOn()
+    expect(run().tasks[0]).toMatchObject({ state: 'blocked', uncertain: true, pid: 999_999, error: expect.stringMatching(/could not be confirmed stopped/) })
+    await next.resume(flowId)
+    expect(() => next.retry(flowId, 's')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+    step.gone()
+    next.retry(flowId, 's')
+    expect(run().tasks[0]).toMatchObject({ attempt: 2, uncertain: false })
   })
 })
