@@ -551,7 +551,7 @@ const sh: StepSpawner = (script, opts) => spawn('/bin/sh', ['-c', script], { cwd
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
 // A descendant that ignores SIGTERM, with its output redirected so the step's pipes close without it.
 const steps = (...tasks: object[]): string => JSON.stringify({ spec: 1, name: 'demo', tasks }) // JSON is YAML: no quoting puzzles
-const stubborn = (file: string) => `sh -c 'trap "" TERM; echo $$ > "${file}"; exec sleep 30' >/dev/null 2>&1 &`
+const stubborn = (file: string) => `sh -c 'trap "" TERM; echo $$ > "${file}"; while :; do sleep 1; done' >/dev/null 2>&1 &`
 
 describe('flow runs', () => {
   let root: string, project: string, service: OrchestratorService, deps: OrchestratorDependencies
@@ -588,7 +588,6 @@ describe('flow runs', () => {
   const pidIn = async (file: string): Promise<number> => {
     const pid = await vi.waitFor(() => { const text = readFileSync(file, 'utf8'); expect(text).toMatch(/^\d+\n$/); return Number(text) }, { timeout: 5000 })
     leftovers.push(pid)
-    await new Promise(r => setTimeout(r, 100)) // exec'd: the ignored-TERM disposition is inherited by sleep
     return pid
   }
 

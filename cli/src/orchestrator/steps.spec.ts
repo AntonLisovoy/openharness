@@ -9,14 +9,37 @@ import { join } from 'node:path'
 import * as shell from '../dsh/shell.js'
 import { STEP_LOG_LIMIT, startStep, stepFailure, type StepSpawner } from './steps.js'
 
+/** While `hold` is set, every log file opened from then on finishes closing only once it settles. */
+const logGate = vi.hoisted(() => ({ hold: null as Promise<void> | null }))
+vi.mock('node:fs', async importOriginal => {
+  const fs = await importOriginal<typeof import('node:fs')>()
+  const createWriteStream = ((...args: Parameters<typeof fs.createWriteStream>) => {
+    const out = fs.createWriteStream(...args)
+    const hold = logGate.hold
+    if (hold) {
+      const end = out.end.bind(out) as (...rest: unknown[]) => unknown
+      out.end = ((...rest: unknown[]) => { void hold.then(() => end(...rest)); return out }) as typeof out.end
+    }
+    return out
+  }) as typeof fs.createWriteStream
+  return { ...fs, createWriteStream }
+})
+/** Keeps the logs of the next step closing until the returned release is called. */
+const holdLogs = (): (() => void) => {
+  let release!: () => void
+  logGate.hold = new Promise(resolve => { release = resolve })
+  return () => { logGate.hold = null; release() }
+}
+
 const sh: StepSpawner = (script, opts) => spawn('/bin/sh', ['-c', script], { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+const fakeChild = ({ pid }: { pid?: number }) => Object.assign(new EventEmitter(), { pid, stdout: new PassThrough(), stderr: new PassThrough() })
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
 
 describe('shell steps', () => {
   let cwd: string
   beforeEach(() => { cwd = mkdtempSync(join(tmpdir(), 'steps-')) })
   const pids: number[] = []
-  afterEach(() => { for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
+  afterEach(() => { logGate.hold = null; for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
 
   it('runs in the task folder with env inputs that stay literal', async () => {
     const result = await startStep('pwd; printf "%s" "$HARNESS_INPUT_X"; echo warn >&2', { cwd, env: { HARNESS_INPUT_X: '$(echo pwned)"\'' }, spawn: sh }).done
@@ -32,17 +55,16 @@ describe('shell steps', () => {
     expect(stepFailure({ code: 1, signal: null, error: null, started: true, stdoutTail: '', stderrTail: 'x'.repeat(5000) })).toHaveLength(2000)
   })
   it('stops descendants that ignore SIGTERM, even after the shell is gone', async () => {
-    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' & wait`, { cwd, env: {}, spawn: sh, graceMs: 200 })
+    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; while :; do sleep 1; done' & wait`, { cwd, env: {}, spawn: sh, graceMs: 200 })
     await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+\n/))
     const child = Number(readFileSync(join(cwd, 'child.pid'), 'utf8'))
     pids.push(child)
-    await new Promise(r => setTimeout(r, 100)) // exec'd: the ignored-TERM disposition is inherited by sleep
     step.stop()
     await step.done
     await vi.waitFor(() => expect(alive(child)).toBe(false), { timeout: 3000 })
   })
   it('ends only once the leftovers of its group are gone, even with their output redirected', async () => {
-    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' >/dev/null 2>&1 & sleep 0.3; exit 1`, { cwd, env: {}, spawn: sh, graceMs: 300 })
+    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; while :; do sleep 1; done' >/dev/null 2>&1 & sleep 0.3; exit 1`, { cwd, env: {}, spawn: sh, graceMs: 300 })
     await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+\n/))
     const child = Number(readFileSync(join(cwd, 'child.pid'), 'utf8'))
     pids.push(child)
@@ -50,15 +72,117 @@ describe('shell steps', () => {
     expect(alive(child)).toBe(false)
   })
   it('kills the whole group at once when stopped now', async () => {
-    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; exec sleep 30' & wait`, { cwd, env: {}, spawn: sh, graceMs: 30_000 })
+    const step = startStep(`sh -c 'trap "" TERM; echo $$ > child.pid; while :; do sleep 1; done' & wait`, { cwd, env: {}, spawn: sh, graceMs: 30_000 })
     await vi.waitFor(() => expect(readFileSync(join(cwd, 'child.pid'), 'utf8')).toMatch(/\d+\n/))
     const child = Number(readFileSync(join(cwd, 'child.pid'), 'utf8'))
     pids.push(child)
-    await new Promise(r => setTimeout(r, 100)) // exec'd: the ignored-TERM disposition is inherited by sleep
     step.stop({ now: true })
     await vi.waitFor(() => expect(alive(child)).toBe(false), { timeout: 1000 })
     step.stop() // a graceful stop afterwards changes nothing
     expect(await step.done).toMatchObject({ signal: 'SIGKILL', error: null })
+  })
+  it('clears its SIGKILL escalation once the group is gone, and ignores stop afterwards', async () => {
+    const killed = vi.spyOn(process, 'kill')
+    const step = startStep('sleep 5', { cwd, env: {}, spawn: sh, graceMs: 60_000 }) // escalation far in the future
+    expect(step.armed()).toBe(true)
+    step.stop() // SIGTERM now; SIGKILL scheduled in 60 s
+    await step.done
+    expect(step.armed()).toBe(false)
+    const sigkills = () => killed.mock.calls.filter(([, signal]) => signal === 'SIGKILL').length
+    const before = sigkills()
+    step.stop(); step.stop({ now: true })
+    expect(sigkills()).toBe(before)
+  })
+  it('cancels the escalation timer once the group is gone', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const fake = fakeChild({ pid: 4242 })
+      const signals: Array<[number, unknown]> = []
+      vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: unknown) => {
+        if (Math.abs(target) !== 4242) return true
+        if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' }) // the group probe: gone
+        signals.push([target, signal]); return true
+      }) as typeof process.kill)
+      const step = startStep('x', { cwd, env: {}, spawn: () => fake as never, graceMs: 1000 })
+      step.stop() // SIGTERM now, SIGKILL scheduled at +1000 ms
+      fake.emit('exit', 0, null); fake.emit('close')
+      await vi.advanceTimersByTimeAsync(500) // before the escalation: the step ends and disarms
+      await step.done
+      expect(step.armed()).toBe(false)
+      const before = signals.length
+      await vi.advanceTimersByTimeAsync(5000) // well past the escalation
+      expect(signals.slice(before)).toEqual([]) // no SIGKILL fired after the group was gone
+    } finally { vi.useRealTimers() }
+  })
+  /** Fakes `process.kill` for one fake pid: the group probe answers `alive()`, every other signal is recorded. */
+  const fakeKill = (pid: number, alive: () => boolean): unknown[] => {
+    const signals: unknown[] = []
+    vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: unknown) => {
+      if (Math.abs(target) !== pid) return true
+      if (signal === 0) { if (alive()) return true; throw Object.assign(new Error('gone'), { code: 'ESRCH' }) }
+      signals.push(signal); return true
+    }) as typeof process.kill)
+    return signals
+  }
+  it('sends no SIGKILL after the group is gone even while its logs are still closing', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const release = holdLogs()
+    try {
+      const fake = fakeChild({ pid: 4243 })
+      const signals = fakeKill(4243, () => false)
+      const step = startStep('x', { cwd, env: {}, spawn: () => fake as never, graceMs: 1000 })
+      step.stop()
+      fake.emit('exit', 0, null); fake.emit('close')
+      let ended = false
+      void step.done.then(() => { ended = true })
+      await vi.advanceTimersByTimeAsync(1500) // the logs are held closing while the escalation time passes
+      expect(ended).toBe(false)
+      expect(signals).not.toContain('SIGKILL')
+      release()
+      await step.done
+      expect(step.armed()).toBe(false)
+      expect(signals).not.toContain('SIGKILL')
+    } finally { release(); vi.useRealTimers() }
+  })
+  it('sends no SIGKILL once the group is gone while a leftover still holds its pipes open', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const fake = fakeChild({ pid: 4244 })
+      const signals = fakeKill(4244, () => false) // the whole group is gone
+      const step = startStep('x', { cwd, env: {}, spawn: () => fake as never, graceMs: 1000 })
+      step.stop() // SIGTERM now, SIGKILL due at +1000 ms
+      fake.emit('exit', 0, null) // no close yet: an escaped process keeps a pipe open
+      await vi.advanceTimersByTimeAsync(1000) // the escalation comes due before the step ends
+      expect(signals).toEqual(['SIGTERM', 'SIGTERM'])
+      expect(step.armed()).toBe(false)
+      fake.emit('close')
+      await step.done
+      expect(signals).toEqual(['SIGTERM', 'SIGTERM'])
+    } finally { vi.useRealTimers() }
+  })
+  it('still sends the SIGKILL while a process of the group is alive', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const fake = fakeChild({ pid: 4245 })
+      let alive = true
+      const signals = fakeKill(4245, () => alive)
+      const step = startStep('x', { cwd, env: {}, spawn: () => fake as never, graceMs: 1000 })
+      step.stop()
+      fake.emit('exit', null, 'SIGTERM') // the leader is gone; a descendant ignoring SIGTERM is not
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(signals).toEqual(['SIGTERM', 'SIGTERM', 'SIGKILL', 'SIGKILL'])
+      expect(step.armed()).toBe(true)
+      alive = false
+      fake.emit('close')
+      await vi.advanceTimersByTimeAsync(100)
+      expect(await step.done).toMatchObject({ signal: 'SIGTERM', error: null })
+      expect(step.armed()).toBe(false)
+    } finally { vi.useRealTimers() }
+  })
+  it('is never armed when the shell could not be spawned', async () => {
+    const step = startStep('x', { cwd, env: {}, spawn: () => { throw Object.assign(new Error('no'), { code: 'ENOENT' }) } })
+    expect(step.armed()).toBe(false)
+    await step.done
   })
   it('says so when it cannot confirm its group stopped', async () => {
     const kill = process.kill.bind(process)

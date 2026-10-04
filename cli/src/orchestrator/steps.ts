@@ -4,13 +4,13 @@ import { createWriteStream } from 'node:fs'
 import { basename, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { Readable } from 'node:stream'
-import { killPidGroup, signalPidGroup, spawnDshCommand } from '../dsh/shell.js'
+import { signalPidGroup, spawnDshCommand } from '../dsh/shell.js'
 
 export type StepSpawner = (script: string, opts: { cwd: string; env: Record<string, string> }) => ChildProcess
 /** `started` is false when the shell itself could not start: a launch error, never retried automatically. */
 export interface StepResult { code: number | null; signal: NodeJS.Signals | null; error: string | null; started: boolean; stdoutTail: string; stderrTail: string }
-/** `done` resolves once the step's whole process group is gone; `stop({ now: true })` skips the grace period (daemon exit). */
-export interface StepHandle { pid: number | undefined; done: Promise<StepResult>; stop(options?: { now?: boolean }): void }
+/** `done` resolves once the step's whole process group is gone; `stop({ now: true })` skips the grace period (daemon exit). `armed()` is false once the group is confirmed gone (or the shell never started): stop is then a no-op. */
+export interface StepHandle { pid: number | undefined; done: Promise<StepResult>; stop(options?: { now?: boolean }): void; armed(): boolean }
 export const STEP_LOG_LIMIT = 8 * 1024 * 1024
 const TAIL = 2000
 // How long after the SIGKILL a group may take to disappear before the step reports it could not confirm that.
@@ -49,10 +49,10 @@ function capture(stream: Readable | null, file: string, onFail: (message: string
   }
 }
 
-/** True once no process of the group is left; false if one still is (or cannot be checked) at the deadline. */
-async function groupGone(pid: number, until: number): Promise<boolean> {
+/** True once no process of the group is left (`gone` probes it); false if one still is (or cannot be checked) at the deadline. */
+async function groupGone(gone: () => boolean, until: number): Promise<boolean> {
   for (;;) {
-    try { process.kill(-pid, 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true }
+    if (gone()) return true
     if (Date.now() >= until) return false
     await new Promise(r => setTimeout(r, 50).unref())
   }
@@ -65,14 +65,25 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
   let child: ChildProcess
   try { child = spawner(script, { cwd: opts.cwd, env: opts.env }) }
   catch (error) {
-    return { pid: undefined, stop: () => {}, done: Promise.resolve({ code: 127, signal: null, error: describe(error), started: false, stdoutTail: '', stderrTail: '' }) }
+    return { pid: undefined, stop: () => {}, armed: () => false, done: Promise.resolve({ code: 127, signal: null, error: describe(error), started: false, stdoutTail: '', stderrTail: '' }) }
   }
-  let error: string | null = null, giveUpAt: number | undefined
-  // killPidGroup's SIGKILL is not tied to the leader: descendants that ignore SIGTERM still go.
+  let error: string | null = null, giveUpAt: number | undefined, escalation: NodeJS.Timeout | undefined, gone = false
+  /** Probes the group; once it is gone the handle is disarmed for good. True when it is (or already was) gone. */
+  const confirmGone = (pid: number): boolean => {
+    try { process.kill(-pid, 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') { gone = true; clearTimeout(escalation) } }
+    return gone
+  }
+  // The SIGKILL is not tied to the leader: descendants that ignore SIGTERM still go. It is sent only while the handle
+  // is armed and the group still exists: a group that is gone (its pid possibly reused) is never signalled.
   const stop = ({ now = false } = {}): void => {
-    if (child.pid === undefined) return
+    if (child.pid === undefined || gone) return
     if (now) signalPidGroup(child.pid, 'SIGKILL')
-    else if (giveUpAt === undefined) killPidGroup(child.pid, graceMs)
+    else if (giveUpAt === undefined) {
+      const pid = child.pid
+      signalPidGroup(pid, 'SIGTERM')
+      escalation = setTimeout(() => { if (!confirmGone(pid)) signalPidGroup(pid, 'SIGKILL') }, graceMs)
+      escalation.unref()
+    }
     giveUpAt ??= Date.now() + graceMs + KILL_SETTLE_MS
   }
   const failed = (message: string): void => { error ??= message; stop() }
@@ -87,9 +98,12 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
       stop() // the step is over: whatever it left behind in its group goes too
       await Promise.race([closed, new Promise(r => setTimeout(r, graceMs).unref())])
       child.stdout?.destroy(); child.stderr?.destroy()
-      await Promise.all([stdout.close(), stderr.close()])
       // Ended only when nothing of it is left: its owner may start a retry or exit next.
-      if (child.pid !== undefined && !await groupGone(child.pid, giveUpAt!)) error ??= 'processes it started could not be confirmed stopped'
+      // Confirmed before the logs are flushed, so a slow flush cannot leave a SIGKILL pending for a gone group.
+      const pid = child.pid
+      if (pid === undefined) gone = true
+      else if (!await groupGone(() => confirmGone(pid), giveUpAt!)) error ??= 'processes it started could not be confirmed stopped'
+      await Promise.all([stdout.close(), stderr.close()])
       resolve({ code: error && code === null ? 127 : code, signal, error, started: child.pid !== undefined, stdoutTail: stdout.tail(), stderrTail: stderr.tail() })
     }
     child.on('error', e => {
@@ -98,5 +112,5 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
     })
     child.on('exit', (code, signal) => { void finish(code, signal) })
   })
-  return { pid: child.pid, done, stop }
+  return { pid: child.pid, done, stop, armed: () => !gone }
 }
