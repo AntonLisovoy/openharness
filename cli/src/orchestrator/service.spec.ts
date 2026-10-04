@@ -78,9 +78,12 @@ describe('durable orchestrator lifecycle', () => {
     expect(run.messages.find(m => m.text.startsWith('Task part attempt 1 failed. Timed out after 1m.'))!.delivery).toBe('pending')
     expect(sent).toHaveLength(sentBefore)
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] part attempt 1: ENOSPC/))
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] part attempt 1: after the result: ENOSPC/))
     expect(cancelled).toEqual([part.agentId])
-    expect(run.tasks.find(t => t.id === 'next')!.state).toBe('blocked') // the pump still ran
+    // The release pump could not save blocking `next`: the run is paused rather than left active with nothing to wake it.
+    expect(run.tasks.find(t => t.id === 'next')!.state).toBe('queued')
+    expect(run).toMatchObject({ state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) })
+    service.resume(id)
+    expect(run.tasks.find(t => t.id === 'next')!.state).toBe('blocked')
   })
   it('does not mark a task succeeded when it is cancelled while its artifacts are being saved', async () => {
     await start(); await active()
@@ -221,6 +224,38 @@ describe('durable orchestrator lifecycle', () => {
     await vi.waitFor(() => expect(tasks()[0].state).toBe('blocked'))
     expect(tasks()[0].uncertain).toBe(true)
     expect(() => service.retry(id, 'a')).toThrow(/uncertain/)
+  })
+  it('blocks the dependents of an uncertain specialist at once, so the Director is not kept busy', async () => {
+    await start(); await active()
+    deps.create = async () => { throw new OrchestratorError('SPAWN_FAILED', 'tmux pane could not be registered') }
+    service.plan(id, [task('a'), task('b', ['a'])])
+    const live = () => (service as unknown as { runs: Map<string, Run> }).runs.get(id)!.tasks // reading these never pumps
+    await vi.waitFor(() => expect(live()[0]).toMatchObject({ state: 'blocked', uncertain: true }))
+    await vi.waitFor(() => expect(live()[1]).toMatchObject({ state: 'blocked', error: 'An upstream task did not succeed.' }))
+    expect(service.roleOf('agent-1')).toEqual({ role: 'director', busy: false })
+  })
+  it('keeps a saved result taken when delivering it to the Director cannot be saved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await start(); await active()
+    service.plan(id, [task('a')]); await running('a')
+    const actual = vi.mocked(fs.writeFileSync).getMockImplementation()!
+    let writes = 0
+    vi.mocked(fs.writeFileSync).mockImplementation((file, data, options) => {
+      if (++writes > 1) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' })
+      return actual(file, data, options)
+    })
+    try { await service.finish(id, 'a', 1, 'done', []) } finally { vi.mocked(fs.writeFileSync).mockImplementation(actual) }
+    expect(warn).toHaveBeenCalledWith('[orchestrator] a attempt 1: after the result: ENOSPC: no space left on device, write')
+    expect((service as unknown as { runs: Map<string, Run> }).runs.get(id)!.tasks[0].state).toBe('succeeded')
+  })
+  it('counts a task waiting for an answer as work still out for the Director', async () => {
+    await start(); await active()
+    deps.create = async () => { throw new OrchestratorError('SPAWN_FAILED', 'tmux pane could not be registered') }
+    service.plan(id, [task('a')])
+    await vi.waitFor(() => expect(tasks()[0]).toMatchObject({ state: 'blocked', uncertain: true }))
+    const run = (service as unknown as { runs: Map<string, Run> }).runs.get(id)!
+    run.tasks[0].state = 'waiting' // no service path reaches an approval yet: the model state alone
+    expect(service.roleOf('agent-1')).toEqual({ role: 'director', busy: true })
   })
   it('persists transcript and reattaches without launching duplicate agents', async () => {
     await start(); await active(); service.plan(id, [task('a')]); await running('a')
@@ -878,6 +913,7 @@ tasks:
     expire(run: Run, task: Task, attempt: number): Promise<void>
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
+    finishing: Map<string, unknown>; launching: Set<string>
   }
   const live = () => internals().runs.get(flowId)! // the service's own objects: reading them never pumps
   const liveTask = (taskId: string) => live().tasks.find(t => t.id === taskId)!
@@ -979,8 +1015,11 @@ tasks:
     expect(liveTask('bad').verdict).toEqual({ ready: true, errors: 0, warnings: 1 })
     expect(liveTask('none').verdict).toBeUndefined()
   })
-  it('drops the verdict of an earlier attempt when its retry cannot start', async () => {
-    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: review, harness: test/cad, prompt: p, retry: { max_attempts: 2 } }\n`)
+  it('drops the verdict of an earlier attempt when its retry cannot start, so no condition reads it', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:
+  - { id: review, harness: test/cad, prompt: p, retry: { max_attempts: 2 } }
+  - { id: gate, run: 'true', depends_on: [review], trigger_rule: all_done, when: 'review.verdict.ready == true' }
+`)
     await vi.waitFor(() => expect(liveTask('review').state).toBe('running'))
     const cwd = liveTask('review').cwd
     mkdirSync(join(cwd, '.harness')); writeFileSync(join(cwd, '.harness/verdict.json'), JSON.stringify({ spec: 1, ready: true }))
@@ -988,6 +1027,8 @@ tasks:
     await service.finish(flowId, 'review', 1, 'not ready yet', [], true)
     await vi.waitFor(() => expect(liveTask('review')).toMatchObject({ state: 'failed', attempt: 2, error: 'test/cad is no longer installed.' }))
     expect(liveTask('review').verdict).toBeUndefined()
+    await vi.waitFor(() => expect(liveTask('gate').state).toBe('failed'))
+    expect(liveTask('gate').error).toBe('review wrote no verdict; the condition review.verdict.ready == true cannot be evaluated.')
   })
   it('changes nothing when a result cannot be saved, and saves it on the next try', async () => {
     await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work', timeout: '1h' }))
@@ -1085,7 +1126,10 @@ tasks:
     try { await internals().expire(live(), liveTask('a'), 1) } finally { vi.mocked(fs.writeFileSync).mockReset() }
     expect(cancelled).toEqual([agentId])
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] a attempt 1: ENOSPC/))
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] a attempt 1: after the result: ENOSPC/))
+    // The retry could not be saved: the run pauses, and resuming starts the retry.
+    expect(live()).toMatchObject({ state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) })
+    service.resume(flowId)
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'running', attempt: 2 }))
   })
   it('runs what follows a reported result once, even when a change observer fails', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -1395,5 +1439,189 @@ tasks:
     expect(internals().deadlines.size).toBe(1)
     service.stop()
     expect(internals().deadlines.size).toBe(0)
+  })
+  it('skips a branch whose condition is false and completes with skipped tasks', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:
+  - { id: check, run: 'true' }
+  - { id: fix, run: 'true', depends_on: [check], trigger_rule: all_done, when: 'check.state == failed' }
+  - { id: after, run: 'true', depends_on: [fix] }
+  - { id: ship, run: 'true', depends_on: [check], when: 'check.state == succeeded' }
+`)
+    await vi.waitFor(() => expect(live().state).toBe('completed'))
+    expect(live().tasks.map(t => [t.id, t.state])).toEqual([['check', 'succeeded'], ['fix', 'skipped'], ['after', 'skipped'], ['ship', 'succeeded']])
+    expect(liveTask('fix').summary).toBe('Skipped: check.state == failed is false.')
+    expect(live().messages.at(-1)!.text).toBe('Flow demo completed: 2 tasks succeeded, 2 skipped.')
+  })
+  it('runs an all_done report after a failure, with the failed step logs already in its inputs', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:
+  - { id: tests, run: 'echo boom >&2; exit 1' }
+  - { id: report, run: 'cat inputs/tests/stderr.log', depends_on: [tests], trigger_rule: all_done }
+`)
+    await vi.waitFor(() => expect(live()).toMatchObject({ state: 'active', error: 'Flow stopped: tests (failed). Retry a task or cancel the project.' }))
+    expect(liveTask('report')).toMatchObject({ state: 'succeeded', summary: 'boom' })
+  })
+  it('fails a task whose condition reads a verdict the dependency never wrote', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: review, run: 'true' }\n  - { id: gate, run: 'true', depends_on: [review], when: 'review.verdict.errors == 0' }\n`)
+    await vi.waitFor(() => expect(liveTask('gate').state).toBe('failed'))
+    expect(liveTask('gate')).toMatchObject({ error: 'review wrote no verdict; the condition review.verdict.errors == 0 cannot be evaluated.', cwd: '' })
+  })
+  it('propagates skips through tasks declared before their upstream, without a status read', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:
+  - { id: d, run: 'true', depends_on: [c] }
+  - { id: c, run: 'true', depends_on: [b], when: 'b.state == failed', trigger_rule: all_done }
+  - { id: b, run: 'true', depends_on: [a] }
+  - { id: a, run: 'true' }
+`)
+    await vi.waitFor(() => expect(live().state).toBe('completed'))
+    expect(live().tasks.map(t => t.state)).toEqual(['skipped', 'skipped', 'succeeded', 'succeeded'])
+  })
+  it('starts dependents when a result is released, without a status read', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: a, harness: test/cad, prompt: work }\n  - { id: b, run: 'true', depends_on: [a] }\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    await service.finish(flowId, 'a', 1, 'done', [])
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('succeeded'))
+  })
+  it('never reports completed while the last attempt is still being saved', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: work }]\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const states: string[] = []
+    deps.changed = () => { states.push(`${live().state}:${internals().finishing.size}`) }
+    await service.finish(flowId, 'a', 1, 'done', [])
+    expect(states).not.toContain('completed:1')
+    expect(live().state).toBe('completed')
+  })
+  it('publishes kept logs only to the failed attempt they belong to', async () => {
+    const realRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename
+    // Nothing public changes a failed attempt while its logs are kept (its process still holds it); the guard is defensive.
+    vi.mocked(filesystem.rename).mockImplementationOnce(async (from, to) => { liveTask('bad').state = 'cancelled'; return realRename(from, to) })
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: bad, run: 'exit 4' }]\n`)
+    await vi.waitFor(() => expect(liveTask('bad').state).toBe('cancelled'))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    expect(liveTask('bad').artifacts).toEqual([])
+  })
+  /** Fails every state write whose content matches, until the returned function is called. */
+  const failWrites = (matches: (json: string) => boolean): (() => void) => {
+    const actual = vi.mocked(fs.writeFileSync).getMockImplementation()!
+    vi.mocked(fs.writeFileSync).mockImplementation((file, data, options) => {
+      if (typeof data === 'string' && matches(data)) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' })
+      return actual(file, data, options)
+    })
+    return () => vi.mocked(fs.writeFileSync).mockImplementation(actual)
+  }
+  const pausedByDisk = { state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) }
+  it('pauses a failed launch before its release pump can start a dependent', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    deps.create = async input => {
+      launches.push(input)
+      // The task fails to start, and saving that failure fails once.
+      vi.mocked(fs.writeFileSync).mockImplementationOnce(() => { throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }) })
+      throw new OrchestratorError('HARNESS_UNAVAILABLE', 'gone')
+    }
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: a, harness: test/cad, prompt: p }\n  - { id: b, harness: test/cad, prompt: p, depends_on: [a], trigger_rule: all_done }\n`)
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    await vi.waitFor(() => expect(internals().launching.size).toBe(0)) // its release pump has run
+    expect(launches).toHaveLength(1)
+    expect(liveTask('b').state).toBe('queued')
+  })
+  it('pauses when a skip cannot be saved after a step process is gone, and skips on resume', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const recover = failWrites(json => json.includes('"state":"skipped"'))
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: check, run: 'true' }\n  - { id: fix, run: 'true', depends_on: [check], when: 'check.state == failed' }\n`)
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    expect(live().tasks.map(t => t.state)).toEqual(['succeeded', 'queued'])
+    recover(); service.resume(flowId)
+    expect(live()).toMatchObject({ state: 'completed' })
+    expect(liveTask('fix').state).toBe('skipped')
+  })
+  it('pauses when a block cannot be saved, and blocks on resume', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const recover = failWrites(json => json.includes('An upstream task did not succeed.'))
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: bad, run: 'exit 4' }\n  - { id: after, run: 'true', depends_on: [bad] }\n`)
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    expect(live().tasks.map(t => t.state)).toEqual(['failed', 'queued'])
+    recover(); service.resume(flowId)
+    expect(liveTask('after').state).toBe('blocked')
+    expect(live()).toMatchObject({ state: 'active', error: 'Flow stopped: bad (failed), after (blocked). Retry a task or cancel the project.' })
+  })
+  it('pauses when the completion cannot be saved after the last result, and completes on resume', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: work }]\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const recover = failWrites(json => json.includes('"state":"completed"'))
+    await service.finish(flowId, 'a', 1, 'done', []) // the result itself was saved: no error for its reporter
+    expect(liveTask('a').state).toBe('succeeded')
+    expect(live()).toMatchObject(pausedByDisk)
+    recover(); service.resume(flowId)
+    expect(live()).toMatchObject({ state: 'completed', error: null })
+    expect(live().messages.at(-1)!.text).toBe('Flow demo completed: 1 tasks succeeded.')
+  })
+  it('keeps a taken result when the release pump cannot save and the pause notification fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: work }]\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    failWrites(json => json.includes('"state":"completed"'))
+    deps.changed = () => { if (live().state === 'paused') throw new Error('observer down') }
+    await service.finish(flowId, 'a', 1, 'done', [])
+    expect(liveTask('a').state).toBe('succeeded')
+    expect(live()).toMatchObject(pausedByDisk)
+    expect(warn).toHaveBeenCalledWith('[orchestrator] pause notification failed: observer down')
+  })
+  it('still stops a timed-out worker when the release pump cannot save and the pause notification fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: work, timeout: 1h }]\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const agentId = liveTask('a').agentId
+    failWrites(json => json.includes('Flow stopped:'))
+    deps.changed = () => { if (live().state === 'paused') throw new Error('observer down') }
+    await internals().expire(live(), liveTask('a'), 1)
+    expect(liveTask('a')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+    expect(cancelled).toEqual([agentId])
+    expect(live()).toMatchObject(pausedByDisk)
+  })
+  it('keeps the run paused when the pause notification throws a value that is not an Error', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: work }]\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    failWrites(json => json.includes('"state":"completed"'))
+    deps.changed = () => { if (live().state === 'paused') throw undefined }
+    await service.finish(flowId, 'a', 1, 'done', [])
+    expect(liveTask('a').state).toBe('succeeded')
+    expect(live()).toMatchObject(pausedByDisk)
+    expect(warn).toHaveBeenCalledWith('[orchestrator] pause notification failed: undefined')
+  })
+  it('keeps the run paused when the pause notification throws a value that cannot be turned into text', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, harness: test/cad, prompt: work }]\n`)
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    failWrites(json => json.includes('"state":"completed"'))
+    deps.changed = () => { if (live().state === 'paused') throw Object.create(null) }
+    await expect(service.finish(flowId, 'a', 1, 'done', [])).resolves.toBeUndefined()
+    expect(liveTask('a').state).toBe('succeeded')
+    expect(live()).toMatchObject(pausedByDisk)
+    expect(warn).toHaveBeenCalledWith('[orchestrator] pause notification failed: unknown error')
+  })
+  it('pauses a failed launch without an unhandled rejection when the pause notification throws', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      deps.create = async input => {
+        launches.push(input)
+        vi.mocked(fs.writeFileSync).mockImplementationOnce(() => { throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }) })
+        throw new OrchestratorError('HARNESS_UNAVAILABLE', 'gone')
+      }
+      deps.changed = () => { if (live().state === 'paused') throw new Error('observer down') }
+      await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: a, harness: test/cad, prompt: p }\n  - { id: b, harness: test/cad, prompt: p, depends_on: [a], trigger_rule: all_done }\n`)
+      await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+      await vi.waitFor(() => expect(internals().launching.size).toBe(0)) // its release pump has run
+      expect(unhandled).not.toHaveBeenCalled()
+      expect(launches).toHaveLength(1)
+      expect(warn).toHaveBeenCalledWith('[orchestrator] pause notification failed: observer down')
+    } finally { process.off('unhandledRejection', unhandled) }
   })
 })

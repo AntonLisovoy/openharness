@@ -7,6 +7,7 @@ import type { AgentEngine } from '../engines/types.js'
 import { readPrivateStateFile, secureStateDirectory } from '../lib/secureState.js'
 import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
+import { decide, outcome, type Busy } from './graph.js'
 import { FlowError, checkFlowHarnesses, compileFlow, harnessIssueCode, inputEnvName, parseFlowSource, pinnedFlowName } from './flow.js'
 import { checkOutputs, readVerdictSnapshot } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
@@ -37,6 +38,11 @@ export interface OrchestratorDependencies {
 // A worker's fail, a step's exit and a timeout are retried; a shell that could not start is a launch error and is not.
 // A daemon stop is not a result.
 type Outcome = { summary: string; paths: string[]; base?: 'task' | 'exec' } | { failed: string; retryable?: boolean }
+
+/** A thrown value as text, without assuming it is an Error; never throws itself. */
+const reason = (error: unknown): string => {
+  try { return error instanceof Error ? error.message : String(error) } catch { return 'unknown error' }
+}
 
 /** True when no process has this pid any more (one we may not signal still exists). */
 const exited = (pid: number): boolean => {
@@ -158,7 +164,7 @@ export class OrchestratorService {
     if (timer) { clearTimeout(timer); this.dirty.delete(run.id) }
     // The transition is saved and published: an observer that fails cannot undo it, so it must not look like a failed save.
     try { this.deps.changed?.(run.id, run.revision) }
-    catch (error) { console.warn(`[orchestrator] change notification failed: ${(error as Error).message}`) }
+    catch (error) { console.warn(`[orchestrator] change notification failed: ${reason(error)}`) }
   }
   private publish(live: Run, draft: Run): void {
     const { tasks, ...fields } = draft
@@ -194,7 +200,7 @@ export class OrchestratorService {
   catalog(): HarnessChoice[] { return this.deps.catalog() }
   /**
    * What an agent is to a project: a specialist (`worker`), the Director (with whether work is still
-   * out — a task queued, launching or running on an active run), or nothing. The daemon asks this for
+   * out — a task queued, launching, running or waiting for an answer on an active run), or nothing. The daemon asks this for
    * every turn that ends: a specialist's end is never announced, and the Director's only when nothing is
    * left to run — the person asked for one notification per project, not one per sub-agent.
    */
@@ -203,7 +209,7 @@ export class OrchestratorService {
     for (const run of this.runs.values()) {
       if (run.tasks.some(t => t.agentId === agentId)) return { role: 'worker' }
       if (run.directorId === agentId) {
-        const busy = run.state === 'active' && run.tasks.some(t => t.state === 'queued' || t.state === 'launching' || t.state === 'running')
+        const busy = run.state === 'active' && run.tasks.some(t => ['queued', 'launching', 'running', 'waiting'].includes(t.state))
         return { role: 'director', busy }
       }
     }
@@ -327,32 +333,60 @@ export class OrchestratorService {
   private taskDir(_run: Run, task: Task): string { return task.cwd }
   /** Where the agent or the shell works: outputs, verdict and scripts are looked up here. Same folder until runs get a worktree. */
   private execDir(_run: Run, task: Task): string { return task.cwd }
+  /** Something of the task's current attempt is still launching, running, saving, keeping logs or due for a retry. */
+  private busy(run: Run, task: Task): boolean {
+    const key = this.attemptKey(run, task)
+    // keepLogs runs while the step still owns its `steps` entry, so a log snapshot is covered by `steps`.
+    return this.finishing.has(key) || this.steps.has(key) || this.retryDue.has(key) || this.launching.has(`${run.id}/${task.id}`)
+  }
+  private busyIn(run: Run): Busy { return id => this.busy(run, run.tasks.find(t => t.id === id)!) }
+  /**
+   * An attempt stopped being busy: pump again. A save that fails here has no caller to report to and would leave the
+   * run active with nothing left to wake it, so the run is paused instead; resuming pumps and recomputes the transition.
+   */
+  private release(run: Run): void {
+    try { this.pump(run) } catch (error) {
+      this.pause(run, error)
+    }
+  }
   private pump(run: Run): void {
     if (this.stopped || run.state !== 'active' || this.pumping.has(run.id)) return
     this.pumping.add(run.id)
     try {
       this.releaseRetries(run)
-      for (const task of run.tasks) {
-        if (task.state !== 'queued') continue
-        const inputs = task.dependsOn.map(id => run.tasks.find(t => t.id === id)!)
-        if (inputs.some(t => ['failed', 'blocked', 'cancelled'].includes(t.state))) {
-          task.state = 'blocked'; task.error = 'An upstream task did not succeed.'; this.changed(run); continue
+      const busy = this.busyIn(run)
+      // Repeat while a pass changed something: tasks are not ordered by the graph, and a later skip can free an earlier task.
+      for (let changed = true; changed && run.state === 'active';) {
+        changed = false
+        for (const task of run.tasks) {
+          if (task.state !== 'queued' || run.state !== 'active') continue
+          const next = decide(task, run.tasks, busy)
+          if (next.kind === 'wait') continue
+          if (next.kind === 'launch') {
+            if (run.tasks.filter(t => t.state === 'running' || t.state === 'launching').length >= run.parallelism) continue
+            this.startTask(run, task, task.dependsOn.map(id => run.tasks.find(t => t.id === id)!))
+          } else this.commit(run, draft => {
+            const t = draft.tasks.find(x => x.id === task.id)!
+            if (next.kind === 'block') { t.state = 'blocked'; t.error = next.reason }
+            else if (next.kind === 'skip') { t.state = 'skipped'; t.summary = next.reason }
+            else { t.state = 'failed'; t.error = next.reason; t.summary = next.reason; this.appendMessage(draft, 'system', `Task ${t.id} failed: ${next.reason}`) }
+          })
+          changed = true
         }
-        const active = run.tasks.filter(t => t.state === 'running' || t.state === 'launching').length
-        if (active >= run.parallelism || !inputs.every(t => t.state === 'succeeded')) continue
-        task.state = 'launching'
-        task.cwd = join(run.root, 'tasks', task.id, `attempt-${task.attempt}`)
-        task.inputs = Object.fromEntries(inputs.map(t => [t.id, t.attempt]))
-        this.changed(run) // Reserve before launching: no duplicate on a concurrent status read.
-        const key = `${run.id}/${task.id}`
-        this.launching.add(key)
-        this.background(run, this.launchTask(run, task, inputs).finally(() => {
-          this.launching.delete(key)
-          if (this.retryDue.has(this.attemptKey(run, task))) this.pump(run)
-        }))
       }
       this.settleFlow(run)
     } finally { this.pumping.delete(run.id) }
+  }
+  private startTask(run: Run, task: Task, inputs: Task[]): void {
+    // Reserve before launching: no duplicate on a concurrent status read. Saved before anything is created.
+    this.commit(run, draft => Object.assign(draft.tasks.find(t => t.id === task.id)!, {
+      state: 'launching', cwd: join(run.root, 'tasks', task.id, `attempt-${task.attempt}`), inputs: Object.fromEntries(inputs.map(t => [t.id, t.attempt])),
+    }))
+    const key = `${run.id}/${task.id}`
+    this.launching.add(key)
+    // A launch that failed in the background pauses the run before the release pump, so that pump launches nothing.
+    const launch = this.launchTask(run, task, inputs).catch(error => this.pause(run, error))
+    this.background(run, launch.finally(() => { this.launching.delete(key); this.release(run) }))
   }
   /** Replace failed attempts that are due for a retry, once nothing of the old attempt is still running. */
   private releaseRetries(run: Run): void {
@@ -365,15 +399,21 @@ export class OrchestratorService {
     }
   }
   private settleFlow(run: Run): void {
-    if (!run.flow) return
-    let error: string | null = null
-    if (run.tasks.every(t => t.state === 'succeeded')) {
-      run.state = 'completed'
-      this.message(run, 'system', `Flow ${run.flow.name} completed: ${run.tasks.length} tasks succeeded.`)
-    } else if (!run.tasks.some(t => ['queued', 'launching', 'running'].includes(t.state) || this.retryDue.has(this.attemptKey(run, t)))) {
-      error = `Flow stopped: ${run.tasks.filter(t => t.state !== 'succeeded').map(t => `${t.id} (${t.state})`).join(', ')}. Retry a task or cancel the project.`
+    if (!run.flow || run.state !== 'active') return // a cancelled or paused run is never re-classified
+    const flow = run.flow
+    const result = outcome(run.tasks, this.busyIn(run))
+    if (result === 'completed') {
+      const succeeded = run.tasks.filter(t => t.state === 'succeeded').length, skipped = run.tasks.length - succeeded
+      this.commit(run, draft => {
+        Object.assign(draft, { state: 'completed', error: null })
+        this.appendMessage(draft, 'system', `Flow ${flow.name} completed: ${succeeded} tasks succeeded${skipped ? `, ${skipped} skipped` : ''}.`)
+      })
+      return
     }
-    if (run.state === 'completed' || run.error !== error) { run.error = error; this.changed(run) }
+    const error = result === 'stopped'
+      ? `Flow stopped: ${run.tasks.filter(t => t.state !== 'succeeded' && t.state !== 'skipped').map(t => `${t.id} (${t.state})`).join(', ')}. Retry a task or cancel the project.`
+      : null
+    if (run.error !== error) this.commit(run, draft => { draft.error = error })
   }
   private async launchTask(run: Run, task: Task, inputs: Task[]): Promise<void> {
     let creating = false
@@ -430,7 +470,7 @@ export class OrchestratorService {
       // A failed attempt (exit, timeout) keeps its logs too, saved while the step still blocks a retry.
       if (result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt)
       this.steps.delete(key)
-      this.pump(run) // a failed attempt's retry waits for its process to exit
+      this.release(run) // a failed attempt's retry and its dependents wait for its process to exit
     }))
     this.launched(run)
   }
@@ -470,7 +510,7 @@ export class OrchestratorService {
     if (this.stopped || run.state !== 'active' || task.attempt !== attempt || !['running', 'launching'].includes(task.state)) return false
     try { return await this.settle(run, task, attempt, outcome, true) }
     catch (error) {
-      if (!(error instanceof OrchestratorError && error.code === 'TASK_INACTIVE')) console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${(error as Error).message}`)
+      if (!(error instanceof OrchestratorError && error.code === 'TASK_INACTIVE')) console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${reason(error)}`)
       return false
     }
   }
@@ -528,7 +568,7 @@ export class OrchestratorService {
         // still retries. A reported result, or an automatic success, that cannot be saved changes nothing.
         if (!automatic || !('failed' in outcome)) throw error
         apply(run)
-        console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${(error as Error).message}`)
+        console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${reason(error)}`)
         this.afterAttempt(run, key, outcome, attempt, task, false)
         return true
       }
@@ -537,12 +577,13 @@ export class OrchestratorService {
     }
     try { return await operation() } finally {
       ended(); this.finishing.delete(key)
-      if (this.retryDue.has(key)) this.followUp(task, attempt, () => this.pump(run))
+      // Every release pumps: dependents and the run outcome wait for this attempt to stop being saved. Never throws.
+      this.release(run)
     }
   }
   /**
-   * After an attempt really ended: its deadline goes, a retryable failure is marked for retry, the result is delivered
-   * (only once it is saved: an unsaved one stays pending and goes out later) and dependents may start. The attempt is
+   * After an attempt really ended: its deadline goes, a retryable failure is marked for retry and the result is delivered
+   * (only once it is saved: an unsaved one stays pending and goes out later). Dependents start from the release pump. The attempt is
    * already taken, so a failure here is logged and never reported as the result's own failure.
    */
   private afterAttempt(run: Run, key: string, outcome: Outcome, attempt: number, task: Task, saved: boolean): void {
@@ -550,11 +591,10 @@ export class OrchestratorService {
     clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
     if ('failed' in outcome && outcome.retryable !== false && attempt < (task.retry?.maxAttempts ?? 1)) this.retryDue.add(key)
     this.followUp(task, attempt, () => saved ? this.dispatchPending(run) : this.changed(run, false))
-    this.followUp(task, attempt, () => this.pump(run))
   }
   /** A step after an attempt was taken: its failure is logged, never turned into the result's own failure. */
   private followUp(task: Task, attempt: number, step: () => void): void {
-    try { step() } catch (error) { console.warn(`[orchestrator] ${task.id} attempt ${attempt}: after the result: ${(error as Error).message}`) }
+    try { step() } catch (error) { console.warn(`[orchestrator] ${task.id} attempt ${attempt}: after the result: ${reason(error)}`) }
   }
   /** The result of an attempt as a system message, on the live run or on a draft. */
   private resultMessage(run: Run, task: Task, attempt: number): void {
@@ -578,10 +618,10 @@ export class OrchestratorService {
   }
   private async keepLogs(run: Run, task: Task, attempt: number): Promise<void> {
     try {
-      task.artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'], this.taskDir(run, task))
-      this.changed(run)
+      const artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'], this.taskDir(run, task))
+      if (task.attempt === attempt && task.state === 'failed') this.commit(run, draft => { draft.tasks.find(t => t.id === task.id)!.artifacts = artifacts })
     } catch (error) {
-      console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${(error as Error).message}`)
+      console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${reason(error)}`)
     }
   }
   private requeue(run: Run, task: Task): void {
@@ -718,13 +758,15 @@ export class OrchestratorService {
     }
   }
   private background(run: Run, operation: Promise<void>): void {
-    void operation.catch(error => {
-      // Storage failures must not crash the entire daemon or allow more launches.
-      run.state = 'paused'
-      run.error = `Project paused after a background error: ${error instanceof Error ? error.message : 'unknown error'}. Inspect existing agents before resuming.`
-      console.error(`[orchestrator] ${run.error}`)
-      this.changed(run, false)
-    })
+    void operation.catch(error => this.pause(run, error))
+  }
+  /** Storage failures must not crash the entire daemon or allow more launches. */
+  private pause(run: Run, error: unknown): void {
+    run.state = 'paused'
+    run.error = `Project paused after a background error: ${error instanceof Error ? error.message : 'unknown error'}. Inspect existing agents before resuming.`
+    console.error(`[orchestrator] ${run.error}`)
+    // The run is paused before anyone is notified: an observer that fails cannot undo the pause or reach a caller.
+    try { this.changed(run, false) } catch (error) { console.warn(`[orchestrator] pause notification failed: ${reason(error)}`) }
   }
   /** A worker's ended turn is a cue to look for declared outputs; it is never itself evidence of success. */
   private workerTurnEnded(frame: { agentId?: unknown; payload?: unknown }): boolean {
@@ -780,7 +822,7 @@ export class OrchestratorService {
     }
     this.steps.clear()
     for (const run of unsaved) {
-      try { this.save(run) } catch (error) { console.warn(`[orchestrator] could not save ${run.id}: ${(error as Error).message}`) }
+      try { this.save(run) } catch (error) { console.warn(`[orchestrator] could not save ${run.id}: ${reason(error)}`) }
     }
   }
 }
