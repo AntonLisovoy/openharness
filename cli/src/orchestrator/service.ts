@@ -537,9 +537,6 @@ export class OrchestratorService {
     const key = this.attemptKey(run, task, attempt)
     const current = (): boolean => !this.stopped && run.state === 'active' && ['running', 'launching'].includes(task.state) && task.attempt === attempt
     const stillCurrent = (): void => requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
-    // Registered before the body runs: a failure's retry must see the attempt in flight until settle has ended.
-    let ended!: () => void
-    this.finishing.set(key, new Promise<void>(resolve => { ended = resolve }))
     const operation = async (): Promise<boolean> => {
       // Approval and cancel tasks never settle here, so every task that does may have left a verdict.
       const verdict = await readVerdictSnapshot(this.execDir(run, task))
@@ -570,9 +567,21 @@ export class OrchestratorService {
       this.afterAttempt(run, key, outcome, attempt, task, true)
       return true
     }
-    try { return await operation() } finally {
+    return this.exclusive(run, task, attempt, operation)
+  }
+  /**
+   * Runs `body` as the only operation on this attempt: settles, answers, check results and timeouts never overlap. It waits
+   * for the current owner, registers before `body` starts (at once when nobody owns the attempt), and every release pumps.
+   * `body` must check again that the attempt is still the one it was called for.
+   */
+  private async exclusive<T>(run: Run, task: Task, attempt: number, body: () => Promise<T>): Promise<T> {
+    const key = this.attemptKey(run, task, attempt)
+    while (this.finishing.has(key)) await this.finishing.get(key) // never rejects: it only says that the owner has ended
+    let ended!: () => void
+    this.finishing.set(key, new Promise<void>(resolve => { ended = resolve }))
+    try { return await body() } finally {
       ended(); this.finishing.delete(key)
-      // Every release pumps: dependents and the run outcome wait for this attempt to stop being saved. Never throws.
+      // Every release pumps: dependents and the run outcome wait for this attempt. Never throws.
       this.release(run)
     }
   }

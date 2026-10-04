@@ -914,6 +914,7 @@ tasks:
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
     finishing: Map<string, unknown>; launching: Set<string>
+    exclusive<T>(r: Run, t: Task, n: number, b: () => Promise<T>): Promise<T>
   }
   const live = () => internals().runs.get(flowId)! // the service's own objects: reading them never pumps
   const liveTask = (taskId: string) => live().tasks.find(t => t.id === taskId)!
@@ -928,6 +929,20 @@ tasks:
     if (value && typeof value === 'object' && !found.has(value)) { found.add(value); for (const child of Object.values(value)) objectsOf(child, found) }
     return found
   }
+
+  it('runs operations on one attempt one after another, and registers at once when nobody owns it', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const order: string[] = []
+    let release!: () => void
+    const first = internals().exclusive(live(), liveTask('a'), 1, async () => { order.push('first in'); await new Promise<void>(r => { release = r }); order.push('first out') })
+    expect(internals().finishing.size).toBe(1) // registered before the first await
+    const second = internals().exclusive(live(), liveTask('a'), 1, async () => { order.push('second') })
+    await vi.waitFor(() => expect(order).toEqual(['first in']))
+    release(); await Promise.all([first, second])
+    expect(order).toEqual(['first in', 'first out', 'second'])
+    expect(internals().finishing.size).toBe(0)
+  })
   it('commits a transition into the same objects, or not at all', async () => {
     await startFlow(steps({ id: 'a', run: 'sleep 30' }))
     await vi.waitFor(() => expect(liveTask('a').pid).toEqual(expect.any(Number)))
