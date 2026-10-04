@@ -57,8 +57,8 @@ export class OrchestratorService {
   private readonly assistantMessages = new Map<string, string>()
   private readonly steps = new Map<string, { run: Run; task: Task; attempt: number; handle: StepHandle }>()
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>()
-  // Attempts that failed and are replaced once nothing of them is still running (see releaseRetries).
-  private readonly retryDue = new Set<string>()
+  // Timers of failed tasks whose saved retry is not due yet, by run/task (see releaseRetries).
+  private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   // Runs being reconciled: nothing pumps, dispatches or arms a timer for them until it ends (see reconcile).
   private readonly reconciling = new Map<string, Promise<void>>()
   private loaded = false
@@ -95,6 +95,12 @@ export class OrchestratorService {
           task.state = 'blocked'
           task.uncertain = true
           task.error = `The daemon restarted while this step was running (pid ${task.pid ?? 'unknown'}). Make sure it stopped before retrying.`
+        }
+        // A failed step that was still stopping when the daemon died: its retry waits until its group is gone.
+        for (const task of run.tasks) if (task.retryAt !== undefined && task.pid !== undefined && !processGone(task.pid)) {
+          delete task.retryAt
+          task.state = 'blocked'; task.uncertain = true
+          task.error = `The daemon restarted while this step was stopping (pid ${task.pid}). Make sure it stopped before retrying.`
         }
         for (const message of run.messages) if (['accepted', 'queued'].includes(message.delivery ?? '')) {
           message.delivery = 'unknown'
@@ -383,11 +389,11 @@ export class OrchestratorService {
   private taskDir(_run: Run, task: Task): string { return task.cwd }
   /** Where the agent or the shell works: outputs, verdict and scripts are looked up here. Same folder until runs get a worktree. */
   private execDir(_run: Run, task: Task): string { return task.cwd }
-  /** Something of the task's current attempt is still launching, running, saving, keeping logs or due for a retry. */
+  /** Something of the task's current attempt is still launching, running, saving or keeping logs. */
   private busy(run: Run, task: Task): boolean {
     const key = this.attemptKey(run, task)
     // keepLogs runs while the step still owns its `steps` entry, so a log snapshot is covered by `steps`.
-    return this.finishing.has(key) || this.steps.has(key) || this.retryDue.has(key) || this.launching.has(`${run.id}/${task.id}`)
+    return this.finishing.has(key) || this.steps.has(key) || this.launching.has(`${run.id}/${task.id}`)
   }
   private busyIn(run: Run): Busy { return id => this.busy(run, run.tasks.find(t => t.id === id)!) }
   /**
@@ -442,15 +448,29 @@ export class OrchestratorService {
       this.release(run)
     }))
   }
-  /** Replace failed attempts that are due for a retry, once nothing of the old attempt is still running. */
+  private retryDelay(task: Task, failedAttempt: number): number { return (task.retry?.delayMs ?? 0) * 2 ** (failedAttempt - 1) }
+  /** Replaces failed attempts whose retry is due, once nothing of them is still running or saving; arms a timer for the rest. */
   private releaseRetries(run: Run): void {
     for (const task of run.tasks) {
-      const key = this.attemptKey(run, task)
-      if (!this.retryDue.has(key) || this.steps.has(key) || this.finishing.has(key) || this.launching.has(`${run.id}/${task.id}`)) continue
-      // A failed save keeps the retry due; the pump's caller pauses the run.
+      // Only a failed attempt gets a retryAt, and every transition out of failed drops it.
+      if (task.retryAt === undefined || this.busy(run, task)) continue
+      const key = `${run.id}/${task.id}`, wait = task.retryAt - Date.now()
+      if (wait > 0) {
+        // A timer that fires while the run is paused or reconciled does nothing; the pump that ends either arms it again.
+        if (!this.retryTimers.has(key)) {
+          const timer = setTimeout(() => { this.retryTimers.delete(key); this.release(run) }, wait)
+          timer.unref(); this.retryTimers.set(key, timer)
+        }
+        continue
+      }
+      // A failed save keeps the retry pending; the pump's caller pauses the run.
       this.requeue(run, task, `Task ${task.id} attempt ${task.attempt} failed; retrying (attempt ${task.attempt + 1} of ${task.retry!.maxAttempts}).`)
-      this.retryDue.delete(key)
+      this.clearRetry(run, task)
     }
+  }
+  private clearRetry(run: Run, task: Task): void {
+    const key = `${run.id}/${task.id}`
+    clearTimeout(this.retryTimers.get(key)); this.retryTimers.delete(key)
   }
   private settleFlow(run: Run): void {
     if (!run.flow || run.state !== 'active') return // a cancelled or paused run is never re-classified
@@ -626,6 +646,7 @@ export class OrchestratorService {
       const apply = (target: Run): void => {
         const t = target.tasks.find(x => x.id === task.id)!
         Object.assign(t, { state, summary, artifacts, error: 'failed' in outcome ? outcome.failed : t.error })
+        if ('failed' in outcome && outcome.retryable !== false && attempt < (task.retry?.maxAttempts ?? 1)) t.retryAt = Date.now() + this.retryDelay(task, attempt)
         if (verdict) t.verdict = verdict; else delete t.verdict
         this.resultMessage(target, t, attempt)
       }
@@ -637,10 +658,10 @@ export class OrchestratorService {
         if (!automatic || !('failed' in outcome)) throw error
         apply(run)
         console.warn(`[orchestrator] ${task.id} attempt ${attempt}: ${reason(error)}`)
-        this.afterAttempt(run, key, outcome, attempt, task, false)
+        this.afterAttempt(run, key, attempt, task, false)
         return true
       }
-      this.afterAttempt(run, key, outcome, attempt, task, true)
+      this.afterAttempt(run, key, attempt, task, true)
       return true
     }
     return this.exclusive(run, task, attempt, operation)
@@ -662,14 +683,13 @@ export class OrchestratorService {
     }
   }
   /**
-   * After an attempt really ended: its deadline goes, a retryable failure is marked for retry and the result is delivered
+   * After an attempt really ended: its deadline goes and the result is delivered
    * (only once it is saved: an unsaved one stays pending and goes out later). Dependents start from the release pump. The attempt is
    * already taken, so a failure here is logged and never reported as the result's own failure.
    */
-  private afterAttempt(run: Run, key: string, outcome: Outcome, attempt: number, task: Task, saved: boolean): void {
+  private afterAttempt(run: Run, key: string, attempt: number, task: Task, saved: boolean): void {
     // Only an attempt that really ended loses its deadline: a result that could not be saved leaves it to time out.
     clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
-    if ('failed' in outcome && outcome.retryable !== false && attempt < (task.retry?.maxAttempts ?? 1)) this.retryDue.add(key)
     this.followUp(task, attempt, () => saved ? this.dispatchPending(run) : this.changed(run, false))
   }
   /** A step after an attempt was taken: its failure is logged, never turned into the result's own failure. */
@@ -737,7 +757,7 @@ export class OrchestratorService {
       ? `This step may still be running from before the daemon restart (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`
       : 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
     requireThat(!run.tasks.some(t => t.dependsOn.includes(task.id) && ['running', 'launching', 'succeeded'].includes(t.state)), 'RESULT_IN_USE', 'Add a new revision task instead; downstream work already consumed this attempt.')
-    this.requeue(run, task); this.retryDue.delete(key); this.pump(run); this.dispatchPending(run)
+    this.requeue(run, task); this.clearRetry(run, task); this.pump(run); this.dispatchPending(run)
   }
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
@@ -746,9 +766,10 @@ export class OrchestratorService {
     if (!taskId) { run.state = 'cancelled'; run.directorWorking = false; if (run.flow) run.error = null }
     const agents: string[] = []
     for (const task of tasks) {
-      // Also for a failed task: its due retry is dropped.
+      // Also for a failed task: its pending retry is dropped.
       const key = this.attemptKey(run, task)
-      clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key); this.retryDue.delete(key)
+      clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
+      delete task.retryAt; this.clearRetry(run, task)
     }
     for (const task of tasks) if (['queued', 'running', 'launching', 'blocked'].includes(task.state)) {
       task.state = 'cancelled'
@@ -908,7 +929,8 @@ export class OrchestratorService {
     // Kill everything before saving anything: the daemon exits right after, and a failed save must not keep a step alive.
     for (const { handle } of this.steps.values()) handle.stop({ now: true })
     for (const timer of this.deadlines.values()) clearTimeout(timer)
-    this.deadlines.clear(); this.retryDue.clear()
+    for (const timer of this.retryTimers.values()) clearTimeout(timer)
+    this.deadlines.clear(); this.retryTimers.clear()
     const unsaved = new Set([...this.dirty.keys()].map(id => this.runs.get(id)!))
     for (const { run, task, attempt } of this.steps.values()) if (task.attempt === attempt && task.state === 'running') {
       task.state = 'failed'; task.error = 'Stopped with the daemon.'

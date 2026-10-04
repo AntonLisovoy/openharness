@@ -909,7 +909,7 @@ tasks:
   })
 
   const internals = () => service as unknown as {
-    runs: Map<string, Run>; deadlines: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> } }>
+    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> } }>
     expire(run: Run, task: Task, attempt: number): Promise<void>
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
@@ -1371,6 +1371,16 @@ tasks:
     await recovered.recover()
     return { recovered, step: () => (recovered as unknown as { runs: Map<string, Run> }).runs.get(flowId)!.tasks[0] }
   }
+  /** A second daemon on a copy of this run's saved state, started after the first one stopped (as after a crash). */
+  const restartOn = async (mutate: (saved: Run) => void = () => {}): Promise<{ next: OrchestratorService; run: () => Run }> => {
+    const saved = onDisk(); mutate(saved)
+    service.stop()
+    const dir = join(root, `state-${others.length}`)
+    mkdirSync(dir, { mode: 0o700 }); writeFileSync(join(dir, `${flowId}.json`), JSON.stringify(saved), { mode: 0o600 })
+    const next = new OrchestratorService({ ...deps, stateDir: dir }); others.push(next)
+    await next.recover()
+    return { next, run: () => (next as unknown as { runs: Map<string, Run> }).runs.get(flowId)! }
+  }
   const exitedPid = async (command: string, args: string[]): Promise<{ pid: number; exited: Promise<unknown> }> => {
     const child = spawn(command, args, { stdio: 'ignore' })
     leftovers.push(child.pid!)
@@ -1387,7 +1397,7 @@ tasks:
     await gone.exited
     const { recovered, step } = await afterCrash(gone.pid)
     expect(step()).toMatchObject({ state: 'failed', uncertain: false, error: `Interrupted by a daemon restart (pid ${gone.pid} had already exited). Retry to run it again.` })
-    expect((recovered as unknown as { retryDue: Set<string> }).retryDue.size).toBe(0) // never retried automatically
+    expect(step().retryAt).toBeUndefined() // never retried automatically
     expect(step()).toMatchObject({ state: 'failed', attempt: 1 })
     recovered.retry(flowId, 's')
     await vi.waitFor(() => expect(step()).toMatchObject({ state: 'running', attempt: 2 }))
@@ -1412,6 +1422,50 @@ tasks:
     await vi.waitFor(() => expect(processGone(left.pid)).toBe(true))
     recovered.retry(flowId, 's')
     await vi.waitFor(() => expect(step()).toMatchObject({ state: 'running', attempt: 2 }))
+  })
+  it('waits the doubled delay before each automatic retry, across a daemon restart', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    await startFlow(steps({ id: 'w', harness: 'test/cad', prompt: 'work', retry: { max_attempts: 3, delay: '2s' } }))
+    await vi.waitFor(() => expect(liveTask('w').state).toBe('running'))
+    const failedAt = Date.now()
+    await service.finish(flowId, 'w', 1, 'nope', [], true)
+    expect(liveTask('w')).toMatchObject({ state: 'failed', retryAt: failedAt + 2000 })
+    expect(onDisk().tasks[0].retryAt).toBe(failedAt + 2000)
+    await vi.advanceTimersByTimeAsync(1999); expect(liveTask('w').attempt).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.waitFor(() => expect(liveTask('w')).toMatchObject({ attempt: 2, state: 'running' }))
+    await service.finish(flowId, 'w', 2, 'nope', [], true)
+    expect(liveTask('w').retryAt).toBe(Date.now() + 4000)
+    const { run } = await restartOn()
+    await vi.advanceTimersByTimeAsync(3999); expect(run().tasks[0].attempt).toBe(2)
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.waitFor(() => expect(run().tasks[0]).toMatchObject({ attempt: 3, state: 'running' }))
+  })
+  it('arms one retry timer per task, however often the run moves meanwhile', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    await startFlow(steps({ id: 'w', harness: 'test/cad', prompt: 'work', retry: { max_attempts: 2, delay: '1s' } }, { id: 'o', harness: 'test/cad', prompt: 'other' }))
+    await vi.waitFor(() => { for (const id of ['w', 'o']) expect(liveTask(id).state).toBe('running') })
+    await service.finish(flowId, 'w', 1, 'nope', [], true)
+    const timer = internals().retryTimers.get(`${flowId}/w`)
+    expect(timer).toBeDefined()
+    await service.finish(flowId, 'o', 1, 'done', []) // its release pumps the run again
+    expect(internals().retryTimers.get(`${flowId}/w`)).toBe(timer)
+    await vi.advanceTimersByTimeAsync(1000)
+    await vi.waitFor(() => expect(liveTask('w')).toMatchObject({ attempt: 2, state: 'running' }))
+    expect(launches).toHaveLength(3)
+    expect(internals().retryTimers.size).toBe(0)
+  })
+  it('does not retry beside a process group that survived a crash, and keeps the retry when it is gone', async () => {
+    await startFlow(steps({ id: 's', run: 'exit 1', retry: { max_attempts: 2, delay: '60s' } }))
+    await vi.waitFor(() => expect(liveTask('s').retryAt).toBeDefined())
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    const left = orphan()
+    const alive = await restartOn(saved => { saved.tasks[0].pid = left.pid }) // the crash hit while this group still ran
+    expect(alive.run().tasks[0]).toMatchObject({ state: 'blocked', uncertain: true, attempt: 1, error: `The daemon restarted while this step was stopping (pid ${left.pid}). Make sure it stopped before retrying.` })
+    expect(alive.run().tasks[0].retryAt).toBeUndefined()
+    const ended = await exitedPid('true', []); await ended.exited
+    const gone = await restartOn(saved => { saved.tasks[0].pid = ended.pid })
+    expect(gone.run().tasks[0]).toMatchObject({ state: 'failed', retryAt: expect.any(Number) })
   })
   it('refuses to retry a crashed step whose pid was never recorded', async () => {
     const { recovered, step } = await afterCrash(undefined)
