@@ -1391,6 +1391,13 @@ tasks:
     leftovers.push(-child.pid!) // afterEach kills the whole group
     return { pid: child.pid!, exited: new Promise(resolve => child.once('exit', resolve)) }
   }
+  it('fails a task of a corrupt saved run instead of breaking every status read', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p' }, { id: 'b', run: 'true', depends_on: ['a'] }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const { next, run } = await restartOn(saved => { saved.tasks[1].dependsOn = ['ghost'] })
+    expect(run().tasks[1]).toMatchObject({ state: 'failed', error: 'Dependency ghost is missing from this run.' })
+    expect(() => next.snapshot(flowId)).not.toThrow()
+  })
   it('fails a crashed step whose process already exited, and lets it be retried by hand', async () => {
     const gone = await exitedPid('true', [])
     await gone.exited

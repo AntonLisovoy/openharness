@@ -1,5 +1,5 @@
 // cli/src/orchestrator/graph.ts
-import { evaluateCondition, parseCondition, type Condition } from './conditions.js'
+import { evaluateCondition, parseCondition } from './conditions.js'
 import type { Task } from './model.js'
 
 export type Readiness =
@@ -21,7 +21,11 @@ export function settled(task: Task, busy: Busy): boolean {
 
 /** What a queued task should do now: the trigger rule first, then its condition. */
 export function decide(task: Task, tasks: readonly Task[], busy: Busy): Readiness {
-  const deps = task.dependsOn.map(id => tasks.find(t => t.id === id)!)
+  const found = task.dependsOn.map(id => tasks.find(t => t.id === id))
+  // Saved runs are parsed without graph validation, so a hand-edited state file can name a task that is not there.
+  const missing = task.dependsOn.find((_id, i) => !found[i])
+  if (missing !== undefined) return { kind: 'fail', reason: `Dependency ${missing} is missing from this run.` }
+  const deps = found as Task[]
   const done = deps.map(dep => settled(dep, busy))
   const rule = task.triggerRule ?? 'all_success'
   if (rule !== 'all_done' && deps.some(dep => bad(dep, busy))) return BLOCK
@@ -32,8 +36,11 @@ export function decide(task: Task, tasks: readonly Task[], busy: Busy): Readines
   }
   if (rule === 'none_failed_min_one_success' && !deps.some(dep => dep.state === 'succeeded')) return { kind: 'skip', reason: 'Skipped: no upstream task succeeded.' }
   if (task.when === undefined) return { kind: 'launch' }
-  const condition = parseCondition(task.when) as Condition // checked when the flow was compiled
-  const dep = deps.find(d => d.id === condition.task)!
+  const condition = parseCondition(task.when)
+  // A saved condition was checked when its flow was compiled; a hand-edited state file fails the task instead of the pump.
+  if ('error' in condition) return { kind: 'fail', reason: `The condition ${task.when} cannot be evaluated: ${condition.error}` }
+  const dep = deps.find(d => d.id === condition.task)
+  if (!dep) return { kind: 'fail', reason: `The condition ${task.when} cannot be evaluated: ${condition.task} is not a dependency.` }
   // A decision counts only once its approval finished with it: one recorded on an approval cancelled before that is a record.
   const result = evaluateCondition(condition, { state: dep.state, verdict: dep.verdict, decision: dep.state === 'succeeded' ? dep.decision?.decision : undefined })
   if (!result.ok) return { kind: 'fail', reason: result.reason }

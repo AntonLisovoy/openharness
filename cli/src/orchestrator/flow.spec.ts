@@ -218,6 +218,71 @@ describe('flow task kinds, conditions and trigger rules', () => {
       'Task b: when reads the verdict of a, which does not declare outputs.verdict: ready.',
     ])
   })
+  it('rejects inputs/<x> of a task that is not a direct dependency, at the field that names it', () => {
+    const text = errors(`  - { id: plan, harness: test/cad, prompt: p, outputs: { files: [plan.md] } }\n  - { id: tests, run: "true" }\n  - { id: review, harness: test/cad, prompt: "Review against inputs/plan/plan.md", depends_on: [tests] }\n`)
+    expect(text).toMatch(/:\d+:\d+: tasks\[2\] \(review\): inputs\/plan\/ is only filled for direct dependencies; add plan to depends_on\./)
+    expect(errors(`  - { id: a, run: "true" }\n  - { id: b, harness: test/cad, prompt: p, loop: { until_run: "test -f inputs/a/x", max_iterations: 2 }, timeout: 1h }\n`)).toContain('inputs/a/ is only filled for direct dependencies; add a to depends_on.')
+  })
+  it('warns once about a file the dependency does not declare', () => {
+    const flow = compileTasks(`  - { id: plan, harness: test/cad, prompt: p, outputs: { files: [plan.md] } }
+  - { id: tests, run: "cat inputs/plan/notes.md inputs/plan/notes.md inputs/plan/plan.md", depends_on: [plan] }
+  - { id: log, run: "cat inputs/tests/stdout.log inputs/tests/x.txt", depends_on: [tests] }
+  - { id: free, harness: test/cad, prompt: p, timeout: 1h }
+  - { id: any, run: "cat inputs/free/whatever.md", depends_on: [free] }
+  - { id: ok, approval: "Read inputs/log/approval.json", depends_on: [log] }
+  - { id: gone, cancel: "see inputs/ok/x", depends_on: [ok] }
+  - { id: bare, run: "ls inputs/ok", depends_on: [ok] }
+  - { id: after, run: "cat inputs/gone/x", depends_on: [gone] }
+`)
+    expect(flow.warnings).toEqual([
+      'Task tests reads inputs/plan/notes.md, which plan does not declare in outputs.',
+      'Task log reads inputs/tests/x.txt, which tests does not declare in outputs.',
+      'Task ok reads inputs/log/approval.json, which log does not declare in outputs.',
+      'Task after reads inputs/gone/x, which gone does not declare in outputs.',
+    ])
+  })
+  it('reads references by whole words, and puts the error at the exact field', () => {
+    const base = `  - { id: plan, harness: test/cad, prompt: p, outputs: { files: [plan.md, "docs/**"] } }\n`
+    for (const text of ['inputs/plan_backup/file', 'inputs/plan.json', '/tmp/inputs/plan/file', 'inputs/plan'])
+      expect(compileTasks(`${base}  - { id: b, run: "cat ${text}" }\n`).warnings).toEqual([])
+    expect(compileTasks(`${base}  - { id: b, run: "cat x=inputs/plan/plan.md (inputs/plan/plan.md)", depends_on: [plan] }\n`).warnings).toEqual([])
+    expect(errors(`${base}  - { id: b, run: "cat x=inputs/plan/f", depends_on: [] }\n`)).toContain('add plan to depends_on')
+    // two references to the same task in one field: one error
+    expect(errors(`${base}  - { id: b, run: "cat inputs/plan/a inputs/plan/b" }\n`).match(/is only filled/g)).toHaveLength(1)
+    const at = (tasks: string): string => errors(`${base}${tasks}`)
+    expect(at(`  - { id: b, approval: { decisions: [{ id: ok }], message: "see inputs/plan/x" } }\n`)).toMatch(/f\.yaml:5:\d+: tasks\[1\] \(b\)/)
+    expect(at(`  - { id: b, approval: { decisions: [{ id: ok }], message: "see inputs/plan/x" } }\n`)).toContain(':5:60:')
+    expect(at(`  - { id: c, harness: test/cad, prompt: p, loop: { max_iterations: 2, until_run: "test -f inputs/plan/x" }, timeout: 1h }\n`)).toContain(':5:82:')
+  })
+  it('ignores punctuation, separators and globs after a file name, and treats a folder of a declared glob as declared', () => {
+    const flow = compileTasks(`  - { id: plan, harness: test/cad, prompt: p, outputs: { files: [plan.md, "docs/**"] } }
+  - { id: a, run: "true" }
+  - { id: b, prompt: "x", harness: test/cad, timeout: 1h, depends_on: [plan, a] , run: null }
+`.replace(', run: null', '') + `  - { id: c, run: "cat inputs/a/stdout.log; cat inputs/plan/*.md inputs/plan/$F inputs/plan/part? inputs/plan/docs inputs/plan/docs/ inputs/plan/docs/x.md|cat", depends_on: [plan, a] }
+  - { id: d, harness: test/cad, prompt: "Review inputs/plan/plan.md. Then inputs/plan/nope.txt, please", timeout: 1h, depends_on: [plan] }
+`)
+    expect(flow.warnings).toEqual(['Task d reads inputs/plan/nope.txt, which plan does not declare in outputs.'])
+  })
+  it('lists warnings in task order and reports only the cycle of a cyclic flow', () => {
+    expect(compileTasks(`  - { id: a, run: "cat inputs/b/x", depends_on: [b] }\n  - { id: b, run: "true", trigger_rule: none_failed_min_one_success }\n`).warnings).toEqual([
+      'Task a reads inputs/b/x, which b does not declare in outputs.',
+      'Task b uses trigger_rule none_failed_min_one_success without depends_on; it is always skipped.',
+    ])
+    expect(errors(`  - { id: a, run: "cat inputs/c/x", depends_on: [b] }\n  - { id: b, run: "true", depends_on: [a] }\n  - { id: c, run: "true" }\n`)).not.toContain('only filled')
+  })
+  it('warns about configurations that can never run', () => {
+    expect(compileTasks(`  - { id: a, run: "true", trigger_rule: none_failed_min_one_success }\n`).warnings).toEqual(['Task a uses trigger_rule none_failed_min_one_success without depends_on; it is always skipped.'])
+    expect(compileTasks(`  - { id: a, run: "true" }\n  - { id: b, run: "true", depends_on: [a], when: "a.state == failed" }\n`).warnings)
+      .toEqual(['Task b: when a.state == failed can never be true under trigger_rule all_success, which blocks or skips b first; use trigger_rule: all_done.'])
+    expect(compileTasks(`  - { id: a, run: "true" }\n  - { id: b, run: "true", depends_on: [a], trigger_rule: none_failed_min_one_success, when: "a.state == cancelled" }\n`).warnings)
+      .toEqual(['Task b: when a.state == cancelled can never be true under trigger_rule none_failed_min_one_success, which blocks b first; use trigger_rule: all_done.'])
+    for (const ok of ['when: "a.state != failed"', 'trigger_rule: all_done, when: "a.state == failed"', 'trigger_rule: none_failed_min_one_success, when: "a.state == skipped"'])
+      expect(compileTasks(`  - { id: a, run: "true" }\n  - { id: b, run: "true", depends_on: [a], ${ok} }\n`).warnings).toEqual([])
+  })
+  it('warns differently about the verdict of a shell step', () => {
+    expect(compileTasks(`  - { id: a, run: "true" }\n  - { id: b, run: "true", depends_on: [a], when: "a.verdict.ready == true" }\n`).warnings)
+      .toEqual(['Task b: when reads the verdict of a, a shell step; it must write .harness/verdict.json itself.'])
+  })
   it('accepts state conditions on any kind and decisions declared by an approval', () => {
     const flow = compileTasks(`  - { id: c, approval: { message: m, decisions: [{ id: ship }] } }\n  - { id: d, run: "true", depends_on: [c], when: "c.decision == ship" }\n  - { id: e, cancel: x, depends_on: [c, d], when: "c.state != succeeded" }\n`)
     expect(flow.tasks.map(t => t.when)).toEqual([undefined, 'c.decision == ship', 'c.state != succeeded'])

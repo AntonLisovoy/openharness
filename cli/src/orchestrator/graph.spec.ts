@@ -50,6 +50,16 @@ describe('graph', () => {
     // a skipped dependency under all_success skips before the condition is looked at
     expect(decide(t('w', 'queued', { dependsOn: ['a'], when: 'a.state == succeeded' }), [t('a', 'skipped')], idle)).toMatchObject({ kind: 'skip', reason: 'Skipped: upstream a was skipped.' })
   })
+  it('fails a task whose saved condition cannot be read, instead of throwing', () => {
+    const w = t('w', 'queued', { dependsOn: ['a'], when: 'nonsense', triggerRule: 'all_done' })
+    expect(decide(w, [t('a', 'succeeded'), w], idle)).toEqual({ kind: 'fail', reason: 'The condition nonsense cannot be evaluated: Write one comparison, like "review.verdict.errors == 0".' })
+    const x = t('x', 'queued', { dependsOn: ['a'], when: 'b.state == failed', triggerRule: 'all_done' })
+    expect(decide(x, [t('a', 'succeeded'), x], idle)).toEqual({ kind: 'fail', reason: 'The condition b.state == failed cannot be evaluated: b is not a dependency.' })
+  })
+  it('fails a task whose saved dependency is missing, instead of throwing', () => {
+    const w = t('w', 'queued', { dependsOn: ['ghost'] })
+    expect(decide(w, [w], idle)).toEqual({ kind: 'fail', reason: 'Dependency ghost is missing from this run.' })
+  })
   it('lists transitive dependents in file order', () => {
     const tasks = [t('c', 'queued', { dependsOn: ['b'] }), t('a', 'queued'), t('b', 'queued', { dependsOn: ['a'] }), t('x', 'queued')]
     expect(downstream(tasks, 'a').map(x => x.id)).toEqual(['c', 'b'])

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { LineCounter, isAlias, isCollection, isPair, isScalar, parseDocument, visit, type Document, type Scalar, type YAMLMap } from 'yaml'
 import { z } from 'zod'
 import { parseCondition } from './conditions.js'
+import { globToRegExp } from './outputs.js'
 import { OrchestratorError, TRIGGER_RULES, TaskId, TaskSpec, validatePlan } from './model.js'
 import type { HarnessChoice } from './prompts.js'
 
@@ -157,7 +158,10 @@ type Kind = 'run' | 'agent' | 'approval' | 'cancel'
 /** Compile a parsed flow into the orchestrator's task specs. Every problem is reported at once. */
 export function compileFlow(parsed: ParsedFlow, given: Record<string, string>): CompiledFlow {
   const { flow, file } = parsed
-  const issues: FlowIssue[] = [], warnings: string[] = []
+  const issues: FlowIssue[] = []
+  // Kept with their task's position so the list reads in task order whichever pass found them.
+  const found: { index: number; text: string }[] = []
+  const warn = (index: number, text: string): void => { found.push({ index, text }) }
   const declared = flow.inputs ?? {}
   // Name only: a value is often a secret.
   for (const name of Object.keys(given)) if (!Object.hasOwn(declared, name)) issues.push({ path: 'inputs', message: `Unknown input: ${name}`, ...parsed.at(['inputs']) })
@@ -218,6 +222,7 @@ export function compileFlow(parsed: ParsedFlow, given: Record<string, string>): 
     // The loop check logs are never outputs of the task.
     if (t.outputs?.files.some(glob => /^(?:\.\/)*\.harness\/loop(?:\/|$)/.test(glob))) fail('outputs cannot name .harness/loop/, the loop check logs.', 'outputs')
     if (!kind) return
+    if (t.trigger_rule === 'none_failed_min_one_success' && !(t.depends_on ?? []).length) warn(index, `Task ${t.id} uses trigger_rule none_failed_min_one_success without depends_on; it is always skipped.`)
     const common = {
       id: t.id, title: t.title ?? t.id, dependsOn: t.depends_on ?? [],
       ...(t.when ? { when: t.when.trim() } : {}),
@@ -230,9 +235,9 @@ export function compileFlow(parsed: ParsedFlow, given: Record<string, string>): 
     else if (kind === 'approval') spec = { ...common, harness: 'approval', prompt: substitute(message!), approval: { message: substitute(message!), ...(decisions ? { decisions } : {}) }, ...timeout }
     else if (kind === 'cancel') spec = { ...common, harness: 'cancel', prompt: substitute(t.cancel!), cancel: substitute(t.cancel!) }
     else {
-      if (t.loop && timeoutMs === undefined && idleTimeoutMs === undefined) warnings.push(`Task ${t.id} loops without timeout or idle_timeout; it may run until someone stops it.`)
+      if (t.loop && timeoutMs === undefined && idleTimeoutMs === undefined) warn(index, `Task ${t.id} loops without timeout or idle_timeout; it may run until someone stops it.`)
       // A loop's check decides when it finishes, so only a plain agent task needs this warning.
-      if (!t.outputs && timeoutMs === undefined && !t.loop) warnings.push(`Task ${t.id} has neither outputs nor timeout; it finishes only when its worker calls finish or fail.`)
+      if (!t.outputs && timeoutMs === undefined && !t.loop) warn(index, `Task ${t.id} has neither outputs nor timeout; it finishes only when its worker calls finish or fail.`)
       spec = {
         ...common, harness: t.harness!, prompt: substitute(t.prompt!), ...(t.outputs ? { outputs: t.outputs } : {}), ...timeout,
         ...(t.loop ? { loop: { untilRun: t.loop.until_run, maxIterations: t.loop.max_iterations } } : {}),
@@ -255,7 +260,13 @@ export function compileFlow(parsed: ParsedFlow, given: Record<string, string>): 
       else if (!declaredDecisions.some(d => d.id === condition.value)) fail(`${dep.id} has no decision ${condition.value}.`)
     } else if (condition.field.startsWith('verdict.')) {
       if (dep.approval !== undefined || dep.cancel !== undefined) fail(`${dep.id} writes no verdict.`)
-      else if (dep.outputs?.verdict !== 'ready') warnings.push(`Task ${t.id}: when reads the verdict of ${dep.id}, which does not declare outputs.verdict: ready.`)
+      else if (dep.run !== undefined) warn(index, `Task ${t.id}: when reads the verdict of ${dep.id}, a shell step; it must write .harness/verdict.json itself.`)
+      else if (dep.outputs?.verdict !== 'ready') warn(index, `Task ${t.id}: when reads the verdict of ${dep.id}, which does not declare outputs.verdict: ready.`)
+    }
+    const rule = t.trigger_rule ?? 'all_success'
+    if (condition.field === 'state' && condition.op === '==') {
+      const never = rule === 'all_success' ? ['failed', 'blocked', 'cancelled', 'skipped'] : rule === 'none_failed_min_one_success' ? ['failed', 'blocked', 'cancelled'] : []
+      if (never.includes(condition.value)) warn(index, `Task ${t.id}: when ${condition.text} can never be true under trigger_rule ${rule}, which ${rule === 'all_success' ? 'blocks or skips' : 'blocks'} ${t.id} first; use trigger_rule: all_done.`)
     }
   })
   const specs: TaskSpec[] = []
@@ -268,11 +279,45 @@ export function compileFlow(parsed: ParsedFlow, given: Record<string, string>): 
   const unknown = flow.tasks.flatMap((t, index) => (t.depends_on ?? []).filter(dep => !ids.has(dep)).map(dep => ({ path: `tasks[${index}] (${t.id}).depends_on`, message: `Unknown dependency: ${dep}`, ...parsed.at(['tasks', index, 'depends_on']) })))
   issues.push(...unknown)
   if (!unknown.length && specs.length === flow.tasks.length) {
+    let valid = true
     try { validatePlan([], specs) } catch (error) {
       // validatePlan only throws OrchestratorError (cycle / unknown dependency).
+      valid = false
       issues.push({ path: 'tasks', message: (error as OrchestratorError).message, ...parsed.at(['tasks']) })
     }
+    // Literal references only: inputs/<x>/<file> is filled for direct dependencies; shell code and prose are not analyzed.
+    const promised = (dep: FlowFile['tasks'][number]): ((file: string) => boolean) | null => {
+      const globs = dep.outputs?.files ?? []
+      const patterns = dep.run !== undefined ? [/^stdout\.log$/, /^stderr\.log$/] : dep.approval !== undefined ? [/^approval\.json$/] : dep.cancel !== undefined ? [] : globs.map(globToRegExp)
+      if (dep.run === undefined && dep.approval === undefined && dep.cancel === undefined && !dep.outputs) return null
+      // A folder that a declared glob reaches into counts as declared.
+      return file => patterns.some(p => p.test(file)) || globs.some(glob => glob.startsWith(`${file.replace(/\/+$/, '')}/`))
+    }
+    const seen = new Set<string>()
+    if (valid) flow.tasks.forEach((t, index) => {
+      const field = (key: string): string[] => key === 'approval' && typeof t.approval === 'object' ? ['approval', 'message'] : key === 'loop' ? ['loop', 'until_run'] : [key]
+      const message = typeof t.approval === 'string' ? t.approval : t.approval?.message
+      for (const [key, text] of [['prompt', t.prompt], ['run', t.run], ['approval', message], ['loop', t.loop?.until_run]] as const) {
+        if (!text) continue
+        // `inputs/` starts a path word; the id is a whole id followed by a slash.
+        for (const [, id, rest] of text.matchAll(/(?<![^\s'"`=(])inputs\/([a-z][a-z0-9-]{0,63})\/([^\s'"`]*)/g)) {
+          if (!(t.depends_on ?? []).includes(id)) {
+            const error = `tasks[${index}] ${key} inputs/${id}/`
+            if (!seen.has(error)) {
+              seen.add(error)
+              issues.push({ path: `tasks[${index}] (${t.id})`, message: `inputs/${id}/ is only filled for direct dependencies; add ${id} to depends_on.`, ...parsed.at(['tasks', index, ...field(key)]) })
+            }
+            continue
+          }
+          const word = rest.split(/[;|&<>)]/)[0]
+          const name = /[*?$]/.test(word) ? '' : word.replace(/[.,:!?]+$/, '') // a glob or variable is not a literal file name
+          const isPromised = promised(flow.tasks.find(other => other.id === id)!)
+          const warning = `Task ${t.id} reads inputs/${id}/${name}, which ${id} does not declare in outputs.`
+          if (name && isPromised && !isPromised(name) && !seen.has(warning)) { seen.add(warning); warn(index, warning) }
+        }
+      }
+    })
   }
   if (issues.length) throw new FlowError(file, issues)
-  return { name: flow.name, description: flow.description, engine: flow.engine, inputs, tasks: specs, warnings }
+  return { name: flow.name, description: flow.description, engine: flow.engine, inputs, tasks: specs, warnings: found.sort((x, y) => x.index - y.index).map(w => w.text) }
 }
