@@ -37,7 +37,8 @@ export interface OrchestratorDependencies {
 
 // A worker's fail, a step's exit and a timeout are retried; a shell that could not start is a launch error and is not.
 // A daemon stop is not a result.
-type Outcome = { summary: string; paths: string[]; base?: 'task' | 'exec' } | { failed: string; retryable?: boolean }
+/** `keep`: task-folder files saved as the failed attempt's artifacts in the same transition (a shell step's logs, once its process is gone). */
+type Outcome = { summary: string; paths: string[]; base?: 'task' | 'exec' } | { failed: string; retryable?: boolean; keep?: string[] }
 
 /** A thrown value as text, without assuming it is an Error; never throws itself. */
 const reason = (error: unknown): string => {
@@ -461,12 +462,15 @@ export class OrchestratorService {
     task.state = 'running'
     this.armDeadline(run, task)
     this.background(run, handle.done.then(async result => {
-      await this.settleAuto(run, task, attempt, result.code === 0 && !result.error
+      const outcome: Outcome = result.code === 0 && !result.error
         ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: ['stdout.log', 'stderr.log'], base: 'task' }
-        : { failed: stepFailure(result), retryable: result.started })
-      // A failed attempt (exit, timeout) keeps its logs too, saved while the step still blocks a retry.
-      if (result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt)
-      this.steps.delete(key)
+        : { failed: stepFailure(result), retryable: result.started, ...(result.started ? { keep: ['stdout.log', 'stderr.log'] } : {}) }
+      try {
+        const took = await this.settleAuto(run, task, attempt, outcome)
+        // A failure that another result took first (a timeout while the process ran) keeps its logs now that it is gone.
+        if (!took && result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt)
+      } catch (error) { this.pause(run, error) } // before the release: nothing downstream starts without the logs
+      finally { this.steps.delete(key) }
       this.release(run) // a failed attempt's retry and its dependents wait for its process to exit
     }))
     this.launched(run)
@@ -544,7 +548,8 @@ export class OrchestratorService {
       const verdict = await readVerdictSnapshot(this.execDir(run, task))
       // saveAttempt checks before each of its writes (none happen before its first check), and its staging cleanup waits
       // after its last check: the check below covers both the verdict read and that cleanup. The commit is synchronous.
-      const artifacts = 'failed' in outcome ? task.artifacts
+      const artifacts = 'failed' in outcome
+        ? (outcome.keep ? await this.keptFiles(run, task, attempt, outcome.keep, stillCurrent) : task.artifacts)
         : await this.saveAttempt(run, task, attempt, outcome.paths, outcome.base === 'task' ? this.taskDir(run, task) : this.execDir(run, task), stillCurrent)
       stillCurrent()
       const state = 'failed' in outcome ? 'failed' : 'succeeded'
@@ -622,13 +627,22 @@ export class OrchestratorService {
       return artifacts
     } finally { await rm(staging, { recursive: true, force: true }).catch(() => {}) }
   }
-  private async keepLogs(run: Run, task: Task, attempt: number): Promise<void> {
-    try {
-      const artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'], this.taskDir(run, task))
-      if (task.attempt === attempt && task.state === 'failed') this.commit(run, draft => { draft.tasks.find(t => t.id === task.id)!.artifacts = artifacts })
-    } catch (error) {
+  /** Files a failed attempt leaves behind (its logs). A snapshot that cannot be made is logged; the failure stands. */
+  private async keptFiles(run: Run, task: Task, attempt: number, paths: string[], check: () => void): Promise<Artifact[]> {
+    try { return await this.saveAttempt(run, task, attempt, paths, this.taskDir(run, task), check) }
+    catch (error) {
+      if (error instanceof OrchestratorError && error.code === 'TASK_INACTIVE') throw error
       console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${reason(error)}`)
+      return []
     }
+  }
+  /** Logs of a failed attempt that another result took while its process ran. A snapshot that cannot be made is logged. */
+  private async keepLogs(run: Run, task: Task, attempt: number): Promise<void> {
+    let artifacts: Artifact[]
+    try { artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'], this.taskDir(run, task)) }
+    catch (error) { console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${reason(error)}`); return }
+    // A save that fails reaches the step's callback, which pauses the run before anything downstream can start.
+    if (task.attempt === attempt && task.state === 'failed') this.commit(run, draft => { draft.tasks.find(t => t.id === task.id)!.artifacts = artifacts })
   }
   /**
    * A new attempt of `task` in one saved transition: the reset table, skipped dependents back in the queue (they are

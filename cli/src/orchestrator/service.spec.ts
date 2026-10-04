@@ -1535,6 +1535,17 @@ tasks:
     await vi.waitFor(() => expect(internals().steps.size).toBe(0))
     expect(liveTask('bad').artifacts).toEqual([])
   })
+  it('publishes the logs of a timed-out step only to the failed attempt they belong to', async () => {
+    const realRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename
+    await startFlow(steps({ id: 't', run: 'sleep 30', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('t').state).toBe('running'))
+    // The timeout takes the attempt; its logs are saved once the process is gone, and the task changes meanwhile (defensive).
+    vi.mocked(filesystem.rename).mockImplementationOnce(async (from, to) => { liveTask('t').state = 'cancelled'; return realRename(from, to) })
+    await internals().expire(live(), liveTask('t'), 1)
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    expect(liveTask('t')).toMatchObject({ state: 'cancelled', artifacts: [] })
+    expect(onDisk().tasks[0].artifacts).toEqual([])
+  })
   /** Fails every state write whose content matches, until the returned function is called. */
   const failWrites = (matches: (json: string) => boolean): (() => void) => {
     const actual = vi.mocked(fs.writeFileSync).getMockImplementation()!
@@ -1545,6 +1556,24 @@ tasks:
     return () => vi.mocked(fs.writeFileSync).mockImplementation(actual)
   }
   const pausedByDisk = { state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) }
+  it('names the logs in the result of a step that failed', async () => {
+    await startFlow(steps({ id: 't', run: 'echo boom >&2; exit 1' }))
+    await vi.waitFor(() => expect(liveTask('t').state).toBe('failed'))
+    const result = live().messages.find(m => m.text.startsWith('Task t attempt 1 failed.'))!
+    expect(result.text).toContain('"path":"stdout.log"')
+    expect(result.text).toContain('"path":"stderr.log"')
+  })
+  it('pauses before anything downstream starts when the logs of a timed-out step cannot be saved', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(steps({ id: 't', run: 'sleep 30', timeout: '1h' }, { id: 'r', run: 'true', depends_on: ['t'], trigger_rule: 'all_done' }))
+    await vi.waitFor(() => expect(liveTask('t').state).toBe('running'))
+    failWrites(json => json.startsWith('{"version"') && ((JSON.parse(json) as Run).tasks.find(t => t.id === 't')?.artifacts.length ?? 0) > 0)
+    await internals().expire(live(), liveTask('t'), 1) // takes the attempt, then stops the step; its logs are kept once it is gone
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    expect(live()).toMatchObject(pausedByDisk)
+    expect(liveTask('r').state).toBe('queued')
+    expect(liveTask('t')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.', artifacts: [] })
+  })
   it('pauses a failed launch before its release pump can start a dependent', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     deps.create = async input => {
