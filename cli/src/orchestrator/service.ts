@@ -36,7 +36,7 @@ export interface OrchestratorDependencies {
 
 // A worker's fail, a step's exit and a timeout are retried; a shell that could not start is a launch error and is not.
 // A daemon stop is not a result.
-type Outcome = { summary: string; paths: string[] } | { failed: string; retryable?: boolean }
+type Outcome = { summary: string; paths: string[]; base?: 'task' | 'exec' } | { failed: string; retryable?: boolean }
 
 /** True when no process has this pid any more (one we may not signal still exists). */
 const exited = (pid: number): boolean => {
@@ -278,6 +278,10 @@ export class OrchestratorService {
     requireThat(ok, 'HARNESS_UNAVAILABLE', `${task.harness} is not an installed, supported harness.`)
   }
   private artifactRoot(run: Run, task: Task, attempt = task.attempt): string { return join(run.root, 'artifacts', task.id, `attempt-${attempt}`) }
+  /** The attempt's own folder: brief, inputs/, logs, approval.json, check logs. */
+  private taskDir(_run: Run, task: Task): string { return task.cwd }
+  /** Where the agent or the shell works: outputs, verdict and scripts are looked up here. Same folder until runs get a worktree. */
+  private execDir(_run: Run, task: Task): string { return task.cwd }
   private pump(run: Run): void {
     if (this.stopped || run.state !== 'active' || this.pumping.has(run.id)) return
     this.pumping.add(run.id)
@@ -329,18 +333,18 @@ export class OrchestratorService {
   private async launchTask(run: Run, task: Task, inputs: Task[]): Promise<void> {
     let creating = false
     try {
-      await mkdir(task.cwd, { recursive: true, mode: 0o700 })
-      for (const input of inputs) await materializeInputs(this.artifactRoot(run, input), join(task.cwd, 'inputs', input.id), input.artifacts)
+      await mkdir(this.taskDir(run, task), { recursive: true, mode: 0o700 })
+      for (const input of inputs) await materializeInputs(this.artifactRoot(run, input), join(this.taskDir(run, task), 'inputs', input.id), input.artifacts)
       if (this.stopped || task.state !== 'launching' || run.state !== 'active') return
       if (task.run !== undefined) return this.launchStep(run, task)
       const harness = this.catalog().find(h => h.id === task.harness)
       const own = this.ownEngine(task.harness)
       requireThat(harness || (own !== null && (own === run.engine || (!!run.flow && this.deps.supportsEngine(own)))), 'HARNESS_UNAVAILABLE', `${task.harness} is no longer installed.`)
       const engine = (harness?.engine ?? own!) as AgentEngine
-      writeFileSync(join(task.cwd, 'ORCHESTRATOR_TASK.md'), workerPrompt(run, task, this.deps.command), { mode: 0o600, flag: 'wx' })
+      writeFileSync(join(this.taskDir(run, task), 'ORCHESTRATOR_TASK.md'), workerPrompt(run, task, this.deps.command), { mode: 0o600, flag: 'wx' })
       creating = true
       const result = await this.deps.create({
-        engine, cwd: task.cwd,
+        engine, cwd: this.execDir(run, task),
         dsh: harness?.id ?? null, bypassPermission: run.bypassPermission,
         prompt: 'Read ORCHESTRATOR_TASK.md in this folder and complete the specialist assignment using your harness. Verify the result, update the viewer/verdict, then report through the exact finish or fail command in that file.', name: task.title,
       })
@@ -369,14 +373,14 @@ export class OrchestratorService {
   }
   private launchStep(run: Run, task: Task): void {
     const attempt = task.attempt, key = this.attemptKey(run, task)
-    const handle = startStep(task.run!, { cwd: task.cwd, env: this.stepEnv(run, task), spawn: this.deps.spawnStep })
+    const handle = startStep(task.run!, { cwd: this.execDir(run, task), logs: { stdout: join(this.taskDir(run, task), 'stdout.log'), stderr: join(this.taskDir(run, task), 'stderr.log') }, env: this.stepEnv(run, task), spawn: this.deps.spawnStep })
     this.steps.set(key, { run, task, attempt, handle })
     if (handle.pid !== undefined) task.pid = handle.pid
     task.state = 'running'
     this.armDeadline(run, task)
     this.background(run, handle.done.then(async result => {
       await this.settleAuto(run, task, attempt, result.code === 0 && !result.error
-        ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: ['stdout.log', 'stderr.log'] }
+        ? { summary: result.stdoutTail.trim().slice(-2000) || 'Exited 0.', paths: ['stdout.log', 'stderr.log'], base: 'task' }
         : { failed: stepFailure(result), retryable: result.started })
       // A failed attempt (exit, timeout) keeps its logs too, saved while the step still blocks a retry.
       if (result.started && !this.stopped && task.attempt === attempt && task.state === 'failed') await this.keepLogs(run, task, attempt)
@@ -450,7 +454,7 @@ export class OrchestratorService {
     const operation = async (): Promise<void> => {
       if ('failed' in outcome) { task.state = 'failed'; task.error = outcome.failed; task.summary = outcome.failed }
       else {
-        task.artifacts = await this.saveAttempt(run, task, attempt, outcome.paths, () => requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.'))
+        task.artifacts = await this.saveAttempt(run, task, attempt, outcome.paths, outcome.base === 'task' ? this.taskDir(run, task) : this.execDir(run, task), () => requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.'))
         task.state = 'succeeded'
         task.summary = outcome.summary
       }
@@ -468,10 +472,10 @@ export class OrchestratorService {
     }
   }
   /** Snapshot paths of the task folder into the attempt's artifact folder; `check` runs after each slow step. */
-  private async saveAttempt(run: Run, task: Task, attempt: number, paths: string[], check: () => void = () => {}): Promise<Artifact[]> {
+  private async saveAttempt(run: Run, task: Task, attempt: number, paths: string[], base: string, check: () => void = () => {}): Promise<Artifact[]> {
     const staging = join(run.root, 'artifacts', `${task.id}-${randomBytes(8).toString('hex')}.staging`)
     try {
-      const artifacts = await snapshotArtifacts(task.cwd, staging, paths)
+      const artifacts = await snapshotArtifacts(base, staging, paths)
       check()
       await mkdir(join(run.root, 'artifacts', task.id), { recursive: true, mode: 0o700 })
       await rename(staging, this.artifactRoot(run, task, attempt))
@@ -481,7 +485,7 @@ export class OrchestratorService {
   }
   private async keepLogs(run: Run, task: Task, attempt: number): Promise<void> {
     try {
-      task.artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'])
+      task.artifacts = await this.saveAttempt(run, task, attempt, ['stdout.log', 'stderr.log'], this.taskDir(run, task))
       this.changed(run)
     } catch (error) {
       console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${(error as Error).message}`)
@@ -642,7 +646,7 @@ export class OrchestratorService {
   }
   private async autoFinish(run: Run, task: Task, attempt: number): Promise<void> {
     try {
-      const check = await checkOutputs(task.cwd, task.outputs!)
+      const check = await checkOutputs(this.execDir(run, task), task.outputs!)
       if (!check.ok) {
         this.message(run, 'system', `Task ${task.id} attempt ${attempt}: turn ended. Outputs missing: ${check.missing.join(', ')}`)
         this.changed(run, false)

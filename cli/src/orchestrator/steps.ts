@@ -59,7 +59,7 @@ async function groupGone(gone: () => boolean, until: number): Promise<boolean> {
 }
 
 /** Run a flow's shell step in its task folder and its own process group, output streamed to files. */
-export function startStep(script: string, opts: { cwd: string; env: Record<string, string>; spawn?: StepSpawner; graceMs?: number }): StepHandle {
+export function startStep(script: string, opts: { cwd: string; env: Record<string, string>; spawn?: StepSpawner; graceMs?: number; logs?: { stdout: string; stderr: string } }): StepHandle {
   const spawner = opts.spawn ?? ((s, o) => spawnDshCommand(s, o))
   const graceMs = opts.graceMs ?? 3000
   let child: ChildProcess
@@ -87,8 +87,8 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
     giveUpAt ??= Date.now() + graceMs + KILL_SETTLE_MS
   }
   const failed = (message: string): void => { error ??= message; stop() }
-  const stdout = capture(child.stdout, join(opts.cwd, 'stdout.log'), failed)
-  const stderr = capture(child.stderr, join(opts.cwd, 'stderr.log'), failed)
+  const stdout = capture(child.stdout, opts.logs?.stdout ?? join(opts.cwd, 'stdout.log'), failed)
+  const stderr = capture(child.stderr, opts.logs?.stderr ?? join(opts.cwd, 'stderr.log'), failed)
   const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
   const done = new Promise<StepResult>(resolve => {
     let settled = false

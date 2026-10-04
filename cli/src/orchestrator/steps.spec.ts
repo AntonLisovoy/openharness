@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as shell from '../dsh/shell.js'
@@ -41,6 +41,13 @@ describe('shell steps', () => {
   const pids: number[] = []
   afterEach(() => { logGate.hold = null; for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
 
+  it('writes its logs where it is told to', async () => {
+    const logs = join(cwd, 'logs'); mkdirSync(logs)
+    await startStep('echo out; echo err >&2', { cwd, env: {}, spawn: sh, logs: { stdout: join(logs, 'o.log'), stderr: join(logs, 'e.log') } }).done
+    expect(readFileSync(join(logs, 'o.log'), 'utf8')).toBe('out\n')
+    expect(readFileSync(join(logs, 'e.log'), 'utf8')).toBe('err\n')
+    expect(existsSync(join(cwd, 'stdout.log'))).toBe(false)
+  })
   it('runs in the task folder with env inputs that stay literal', async () => {
     const result = await startStep('pwd; printf "%s" "$HARNESS_INPUT_X"; echo warn >&2', { cwd, env: { HARNESS_INPUT_X: '$(echo pwned)"\'' }, spawn: sh }).done
     expect(result).toMatchObject({ code: 0, signal: null, error: null, started: true })
