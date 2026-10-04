@@ -12,7 +12,7 @@ vi.mock('node:fs/promises', async () => {
   }
 })
 
-import { checkOutputs, globToRegExp } from './outputs.js'
+import { checkOutputs, globToRegExp, readVerdictSnapshot } from './outputs.js'
 import * as fsp from 'node:fs/promises'
 
 describe('output globs', () => {
@@ -92,6 +92,14 @@ describe('checkOutputs', () => {
     symlinkSync(join(outside, 'b.step'), join(cwd, 'b.step')); symlinkSync(outside, join(cwd, 'linked'))
     expect(await checkOutputs(cwd, { files: ['**/*.step'] })).toEqual({ ok: true, files: ['real/a.step'] })
     rmSync(outside, { recursive: true, force: true })
+  })
+  it('snapshots a verdict as ready and counts, or nothing', async () => {
+    mkdirSync(join(cwd, '.harness'))
+    writeFileSync(join(cwd, '.harness/verdict.json'), JSON.stringify({ spec: 1, ready: false, findings: [{ severity: 'error' }, { severity: 'warning' }, { severity: 'warning' }] }))
+    expect(await readVerdictSnapshot(cwd)).toEqual({ ready: false, errors: 1, warnings: 2 })
+    writeFileSync(join(cwd, '.harness/verdict.json'), '{nope')
+    expect(await readVerdictSnapshot(cwd)).toBeUndefined()
+    expect(await readVerdictSnapshot(join(cwd, 'missing'))).toBeUndefined()
   })
   it('bounds the walk and the number of matches', async () => {
     for (let i = 0; i < 65; i++) write(`many/${i}.png`)

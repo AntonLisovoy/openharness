@@ -25,7 +25,7 @@ const diskFull = () => vi.mocked(fs.writeFileSync).mockImplementation(() => { th
 
 vi.mock('./outputs.js', async importOriginal => {
   const actual = await importOriginal<typeof import('./outputs.js')>()
-  return { ...actual, checkOutputs: vi.fn(actual.checkOutputs) }
+  return { ...actual, checkOutputs: vi.fn(actual.checkOutputs), readVerdictSnapshot: vi.fn(actual.readVerdictSnapshot) }
 })
 import * as outputsModule from './outputs.js'
 
@@ -64,6 +64,23 @@ describe('durable orchestrator lifecycle', () => {
     expect(launches[0].prompt.length).toBeLessThan(2000)
     expect(readFileSync(join(launches[0].cwd, 'ORCHESTRATOR.md'), 'utf8')).toContain('test/blender')
     await expect(service.start({ id, engine: 'claude', prompt: 'Different' })).rejects.toMatchObject({ code: 'PROJECT_CONFLICT' })
+  })
+  it('keeps an unsaved timeout result pending for the director, and still stops the worker and starts what follows', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await start(); await active()
+    service.plan(id, [task('part'), task('next', ['part'])])
+    const part = await running('part'), sentBefore = sent.length
+    const internal = service as unknown as { runs: Map<string, Run>; expire(run: Run, task: Task, attempt: number): Promise<void> }
+    const run = internal.runs.get(id)!
+    run.tasks.find(t => t.id === 'part')!.timeoutMs = 60_000 // planned tasks cannot set one: defensive, an automatic failure on a director run
+    diskFull()
+    try { await internal.expire(run, run.tasks.find(t => t.id === 'part')!, 1) } finally { vi.mocked(fs.writeFileSync).mockReset() }
+    expect(run.messages.find(m => m.text.startsWith('Task part attempt 1 failed. Timed out after 1m.'))!.delivery).toBe('pending')
+    expect(sent).toHaveLength(sentBefore)
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] part attempt 1: ENOSPC/))
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] part attempt 1: after the result: ENOSPC/))
+    expect(cancelled).toEqual([part.agentId])
+    expect(run.tasks.find(t => t.id === 'next')!.state).toBe('blocked') // the pump still ran
   })
   it('does not mark a task succeeded when it is cancelled while its artifacts are being saved', async () => {
     await start(); await active()
@@ -949,6 +966,148 @@ tasks:
     internals().commit(live(), draft => { for (let i = 0; i < 250; i++) internals().appendMessage(draft, 'system', `m${i}`) })
     expect(live().messages).toHaveLength(200)
     expect(Run.parse(JSON.parse(readFileSync(join(deps.stateDir, `${flowId}.json`), 'utf8'))).messages.at(-1)!.text).toBe('m249')
+  })
+  it('keeps the verdict of a finished attempt, failed ones included', async () => {
+    writeFileSync(join(project, 'verdict.sh'), `mkdir -p .harness && printf '%s' '{"spec":1,"ready":true,"findings":[{"severity":"warning"}]}' > .harness/verdict.json\n`)
+    await startFlow(steps(
+      { id: 'ok', run: 'sh "$HARNESS_PROJECT_DIR/verdict.sh"' },
+      { id: 'bad', run: 'sh "$HARNESS_PROJECT_DIR/verdict.sh"; exit 3' },
+      { id: 'none', run: 'true' },
+    ))
+    await vi.waitFor(() => { expect(liveTask('ok').state).toBe('succeeded'); expect(liveTask('none').state).toBe('succeeded'); expect(liveTask('bad').state).toBe('failed') })
+    expect(liveTask('ok').verdict).toEqual({ ready: true, errors: 0, warnings: 1 })
+    expect(liveTask('bad').verdict).toEqual({ ready: true, errors: 0, warnings: 1 })
+    expect(liveTask('none').verdict).toBeUndefined()
+  })
+  it('drops the verdict of an earlier attempt when its retry cannot start', async () => {
+    await startFlow(`spec: 1\nname: demo\ntasks:\n  - { id: review, harness: test/cad, prompt: p, retry: { max_attempts: 2 } }\n`)
+    await vi.waitFor(() => expect(liveTask('review').state).toBe('running'))
+    const cwd = liveTask('review').cwd
+    mkdirSync(join(cwd, '.harness')); writeFileSync(join(cwd, '.harness/verdict.json'), JSON.stringify({ spec: 1, ready: true }))
+    deps.create = async () => { throw new OrchestratorError('HARNESS_UNAVAILABLE', 'test/cad is no longer installed.') }
+    await service.finish(flowId, 'review', 1, 'not ready yet', [], true)
+    await vi.waitFor(() => expect(liveTask('review')).toMatchObject({ state: 'failed', attempt: 2, error: 'test/cad is no longer installed.' }))
+    expect(liveTask('review').verdict).toBeUndefined()
+  })
+  it('changes nothing when a result cannot be saved, and saves it on the next try', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    writeFileSync(join(liveTask('a').cwd, 'out.txt'), 'x')
+    diskFull()
+    await expect(service.finish(flowId, 'a', 1, 'done', ['out.txt'])).rejects.toThrow(/ENOSPC/)
+    vi.mocked(fs.writeFileSync).mockReset()
+    expect(liveTask('a')).toMatchObject({ state: 'running', artifacts: [], summary: '' })
+    expect(internals().deadlines.size).toBe(1)
+    expect(live().messages.some(m => m.text.startsWith('Task a attempt 1 succeeded'))).toBe(false)
+    await service.finish(flowId, 'a', 1, 'done', ['out.txt']) // the folder renamed by the failed try is replaced
+    expect(liveTask('a')).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'out.txt' }] })
+  })
+  it('changes nothing when a reported failure cannot be saved, and saves it on the next try', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work', timeout: '1h', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const revision = live().revision
+    diskFull()
+    await expect(service.finish(flowId, 'a', 1, 'broken', [], true)).rejects.toThrow(/ENOSPC/)
+    vi.mocked(fs.writeFileSync).mockReset()
+    expect(liveTask('a')).toMatchObject({ state: 'running', attempt: 1, error: null, summary: '' })
+    expect(live().revision).toBe(revision)
+    expect(internals().deadlines.size).toBe(1)
+    expect(live().messages.some(m => m.text.startsWith('Task a attempt 1 failed'))).toBe(false)
+    expect(launches).toHaveLength(1) // no retry was started for a failure that was never taken
+    await service.finish(flowId, 'a', 1, 'broken', [], true)
+    expect(onDisk().messages.some(m => m.text.startsWith('Task a attempt 1 failed. broken'))).toBe(true)
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'running', attempt: 2 }))
+  })
+  it('still retries a failed step whose failure cannot be saved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(steps({ id: 's', run: '[ "$HARNESS_ATTEMPT" = 1 ] && { sleep 0.3; exit 1; }; sleep 30', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    vi.mocked(fs.writeFileSync).mockImplementationOnce(() => { throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }) })
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'running', attempt: 2 }), { timeout: 5000 })
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] s attempt 1: ENOSPC/))
+    expect(live().messages.some(m => m.text.startsWith('Task s attempt 1 failed. exit 1'))).toBe(true)
+  })
+  /** Holds the next verdict read until released. */
+  const holdVerdictRead = () => {
+    let release!: () => void, reading = false
+    const gate = new Promise<void>(resolve => { release = resolve })
+    vi.mocked(outputsModule.readVerdictSnapshot).mockImplementationOnce(async () => { reading = true; await gate; return undefined })
+    return { release, reading: () => reading }
+  }
+  it.each(['cancel', 'stop'] as const)('does not stop or cancel anything for a timeout that a %s beat', async winner => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const hold = holdVerdictRead()
+    const expiring = internals().expire(live(), liveTask('a'), 1)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    if (winner === 'cancel') service.cancel(flowId, 'a'); else service.stop()
+    const before = [...cancelled]
+    hold.release(); await expiring
+    expect(cancelled).toEqual(before) // the agent that survives a daemon stop is not cancelled by the timeout
+    if (winner === 'cancel') expect(liveTask('a').state).toBe('cancelled')
+    expect(liveTask('a').error).not.toBe('Timed out after 1h.')
+    expect(warn).not.toHaveBeenCalled()
+  })
+  it('writes nothing more for a result once its task is stopped during a wait', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    writeFileSync(join(liveTask('a').cwd, 'out.txt'), 'x')
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+    vi.mocked(filesystem.stat).mockImplementationOnce(async path => { service.cancel(flowId, 'a'); return actual.stat(path) })
+    vi.mocked(filesystem.copyFile).mockClear()
+    await expect(service.finish(flowId, 'a', 1, 'done', ['out.txt'])).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    expect(filesystem.copyFile).not.toHaveBeenCalled()
+    expect(existsSync(join(live().root, 'artifacts'))).toBe(false)
+  })
+  it('does not save a result over a cancel that came during the staging cleanup', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work', timeout: '1h' }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    writeFileSync(join(liveTask('a').cwd, 'out.txt'), 'x')
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+    let raced = false
+    vi.mocked(filesystem.rm).mockImplementation(async (path, options) => {
+      if (!raced && String(path).endsWith('.staging')) { raced = true; service.cancel(flowId, 'a') }
+      return actual.rm(path, options)
+    })
+    await expect(service.finish(flowId, 'a', 1, 'done', ['out.txt'])).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    expect(raced).toBe(true)
+    expect(liveTask('a').state).toBe('cancelled')
+    expect(onDisk().tasks[0].state).toBe('cancelled')
+    expect(live().messages.some(m => m.text.startsWith('Task a attempt 1 succeeded'))).toBe(false)
+  })
+  it('still stops a timed-out worker when the retry it releases cannot be saved', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p', timeout: '1h', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    const agentId = liveTask('a').agentId
+    diskFull()
+    try { await internals().expire(live(), liveTask('a'), 1) } finally { vi.mocked(fs.writeFileSync).mockReset() }
+    expect(cancelled).toEqual([agentId])
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] a attempt 1: ENOSPC/))
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^\[orchestrator\] a attempt 1: after the result: ENOSPC/))
+  })
+  it('runs what follows a reported result once, even when a change observer fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p', timeout: '1h', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    let failOnce = true
+    deps.changed = () => { if (failOnce) { failOnce = false; throw new Error('observer down') } }
+    await service.finish(flowId, 'a', 1, 'broken', [], true)
+    expect(warn).toHaveBeenCalledWith('[orchestrator] change notification failed: observer down')
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'running', attempt: 2 }))
+    expect(live().messages.filter(m => m.text.startsWith('Task a attempt 1 failed. '))).toHaveLength(1)
+    expect(internals().deadlines.size).toBe(1) // only the new attempt's
+  })
+  it('takes an automatic failure once, even when a change observer fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await startFlow(steps({ id: 's', run: '[ "$HARNESS_ATTEMPT" = 1 ] && { sleep 0.3; exit 1; }; sleep 30', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('s').state).toBe('running'))
+    let failOnce = true
+    deps.changed = () => { if (failOnce) { failOnce = false; throw new Error('observer down') } }
+    await vi.waitFor(() => expect(liveTask('s')).toMatchObject({ state: 'running', attempt: 2 }), { timeout: 5000 })
+    expect(warn).toHaveBeenCalledWith('[orchestrator] change notification failed: observer down')
+    expect(live().messages.filter(m => m.text.startsWith('Task s attempt 1 failed. '))).toHaveLength(1)
   })
   it('times out a step, kills it, and retries it a bounded number of times', async () => {
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: slow, run: 'echo "$HARNESS_ATTEMPT" >> "$HARNESS_PROJECT_DIR/attempts"; sleep 30', timeout: 1s, retry: { max_attempts: 2 } }]\n`)

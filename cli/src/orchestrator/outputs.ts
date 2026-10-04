@@ -1,7 +1,7 @@
 import { lstat, opendir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parseVerdict } from '../dsh/verdict.js'
-import { OrchestratorError, type Outputs } from './model.js'
+import { OrchestratorError, type Outputs, type Verdict } from './model.js'
 
 export type OutputsCheck = { ok: true; files: string[] } | { ok: false; missing: string[] }
 const MAX_DEPTH = 16, MAX_ENTRIES = 10_000, MAX_MATCHES = 64, MAX_VERDICT_BYTES = 1024 * 1024
@@ -36,28 +36,21 @@ async function listFiles(root: string): Promise<string[]> {
   await walk(root, '', 0)
   return files
 }
-async function verdictReady(cwd: string): Promise<boolean> {
-  const harnessDir = join(cwd, '.harness')
-  const verdictFile = join(harnessDir, 'verdict.json')
-
-  // Check .harness is a real directory (not symlink)
-  let harnessInfo
-  try { harnessInfo = await lstat(harnessDir) } catch { return false }
-  if (!harnessInfo.isDirectory()) return false
-
-  // Check verdict.json is a regular file (not symlink) and within size bound
-  let fileInfo
-  try { fileInfo = await lstat(verdictFile) } catch { return false }
-  if (!fileInfo.isFile() || fileInfo.size > MAX_VERDICT_BYTES) return false
-
+/** The verdict an attempt left behind, reduced to what conditions compare. Read once, when the attempt ends. */
+export async function readVerdictSnapshot(dir: string): Promise<Verdict | undefined> {
   try {
-    const buffer = await readFile(verdictFile)
-    if (buffer.length > MAX_VERDICT_BYTES) return false
-    return parseVerdict(buffer.toString('utf8'))?.ready === true
-  } catch {
-    return false
-  }
+    const harnessDir = join(dir, '.harness'), file = join(harnessDir, 'verdict.json')
+    // Only a real `.harness` directory and a regular, bounded `verdict.json` count: links are not followed.
+    if (!(await lstat(harnessDir)).isDirectory()) return undefined
+    const info = await lstat(file)
+    if (!info.isFile() || info.size > MAX_VERDICT_BYTES) return undefined
+    const buffer = await readFile(file)
+    if (buffer.length > MAX_VERDICT_BYTES) return undefined
+    const parsed = parseVerdict(buffer.toString('utf8'))
+    return parsed ? { ready: parsed.ready, errors: parsed.errors, warnings: parsed.warnings } : undefined
+  } catch { return undefined }
 }
+async function verdictReady(dir: string): Promise<boolean> { return (await readVerdictSnapshot(dir))?.ready === true }
 
 export async function checkOutputs(cwd: string, outputs: Outputs): Promise<OutputsCheck> {
   const files = await listFiles(cwd)

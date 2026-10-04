@@ -14,8 +14,13 @@ export async function hashFile(path: string): Promise<string> {
   return hash.digest('hex')
 }
 
-/** Snapshot only named regular files contained in the worker's own workspace. */
-export async function snapshotArtifacts(cwd: string, destination: string, paths: string[]): Promise<Artifact[]> {
+/**
+ * Snapshot only named regular files contained in the worker's own workspace. `check` runs before creating the
+ * destination and before each file's folder and copy, so a caller that lost the right to save (the task was stopped
+ * meanwhile) creates and copies nothing more. The read-only `chmod` of a file just copied into the destination is not
+ * re-checked: it only touches that private staging copy.
+ */
+export async function snapshotArtifacts(cwd: string, destination: string, paths: string[], check: () => void): Promise<Artifact[]> {
   requireThat(paths.length <= 64, 'ARTIFACT_LIMIT', 'At most 64 artifacts per task.')
   const root = await realpath(cwd)
   const prepared: Array<{ source: string; path: string; size: number }> = []
@@ -31,11 +36,14 @@ export async function snapshotArtifacts(cwd: string, destination: string, paths:
     prepared.push({ source, path, size: info.size })
   }
   // Destination is a new attempt-owned directory, never a caller-supplied path.
+  check()
   await mkdir(destination, { recursive: true, mode: 0o700 })
   const result: Artifact[] = []
   for (const file of prepared) {
     const target = join(destination, file.path)
+    check()
     await mkdir(dirname(target), { recursive: true, mode: 0o700 })
+    check()
     await copyFile(file.source, target)
     const info = await stat(target)
     const sha256 = await hashFile(target)
