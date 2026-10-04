@@ -1660,4 +1660,48 @@ tasks:
       expect(warn).toHaveBeenCalledWith('[orchestrator] pause notification failed: observer down')
     } finally { process.off('unhandledRejection', unhandled) }
   })
+  it('re-evaluates skipped downstream tasks when an upstream task is retried', async () => {
+    await startFlow(steps({ id: 'a', run: 'test -f "$HARNESS_PROJECT_DIR/ok"' }, { id: 'b', run: 'true', depends_on: ['a'], trigger_rule: 'all_done', when: 'a.state == succeeded' }))
+    await vi.waitFor(() => expect(liveTask('b').state).toBe('skipped'))
+    await vi.waitFor(() => expect(internals().steps.size).toBe(0))
+    writeFileSync(join(project, 'ok'), '')
+    service.retry(flowId, 'a')
+    expect(onDisk().tasks.find(t => t.id === 'b')).toMatchObject({ state: 'queued', attempt: 1, summary: '' }) // in the same save as a's new attempt
+    await vi.waitFor(() => expect(live().state).toBe('completed'))
+    expect(liveTask('b')).toMatchObject({ state: 'succeeded', attempt: 1 })
+  })
+  it('starts every new attempt from the reset table, also an automatic retry', async () => {
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'p', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(liveTask('a').state).toBe('running'))
+    mkdirSync(join(liveTask('a').cwd, '.harness'))
+    writeFileSync(join(liveTask('a').cwd, '.harness/verdict.json'), JSON.stringify({ spec: 1, ready: false, findings: [{ severity: 'error' }] }))
+    const verdicts: unknown[] = []
+    deps.changed = () => { verdicts.push(structuredClone(liveTask('a').verdict)) } // the failed attempt's verdict is saved first
+    await service.finish(flowId, 'a', 1, 'broken', [], true)
+    await vi.waitFor(() => expect(liveTask('a')).toMatchObject({ state: 'running', attempt: 2 }))
+    expect(verdicts).toContainEqual({ ready: false, errors: 1, warnings: 0 })
+    expect(liveTask('a')).toMatchObject({ summary: '', error: null, artifacts: [] })
+    expect(liveTask('a').verdict).toBeUndefined()
+    expect(live().messages.filter(m => m.text === 'Task a attempt 1 failed; retrying (attempt 2 of 2).')).toHaveLength(1)
+  })
+  it('changes nothing when a manual retry cannot be saved', async () => {
+    await startFlow(steps({ id: 'a', run: 'exit 1' }))
+    await vi.waitFor(() => expect(live().error).toMatch(/^Flow stopped/))
+    const before = JSON.stringify(live())
+    diskFull()
+    expect(() => service.retry(flowId, 'a')).toThrow(/ENOSPC/)
+    vi.mocked(fs.writeFileSync).mockReset()
+    expect(JSON.stringify(live())).toBe(before)
+  })
+  it('pauses and keeps the retry due when an automatic retry cannot be saved', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const recover = failWrites(json => json.includes('retrying (attempt 2 of 2)'))
+    await startFlow(steps({ id: 'a', run: '[ "$HARNESS_ATTEMPT" = 1 ] && exit 1; true', retry: { max_attempts: 2 } }))
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    expect(liveTask('a')).toMatchObject({ state: 'failed', attempt: 1 })
+    recover(); await service.resume(flowId)
+    await vi.waitFor(() => expect(live().state).toBe('completed'))
+    expect(liveTask('a').attempt).toBe(2)
+    expect(live().messages.filter(m => m.text.startsWith('Task a attempt 1 failed; retrying'))).toHaveLength(1)
+  })
 })

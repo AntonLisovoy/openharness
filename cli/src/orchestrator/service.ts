@@ -7,7 +7,7 @@ import type { AgentEngine } from '../engines/types.js'
 import { readPrivateStateFile, secureStateDirectory } from '../lib/secureState.js'
 import type { SessionInputDelivery } from '../lib/sessionInput.js'
 import { materializeInputs, snapshotArtifacts } from './artifacts.js'
-import { decide, outcome, type Busy } from './graph.js'
+import { decide, downstream, outcome, resetTask, type Busy } from './graph.js'
 import { FlowError, checkFlowHarnesses, compileFlow, harnessIssueCode, inputEnvName, parseFlowSource, pinnedFlowName } from './flow.js'
 import { checkOutputs, readVerdictSnapshot } from './outputs.js'
 import { OrchestratorError, Run, RunId, StartSpec, TaskSpec, requireThat, validatePlan, type Artifact, type Task } from './model.js'
@@ -141,6 +141,8 @@ export class OrchestratorService {
   /**
    * A transition of several fields: built on a copy, saved, then copied into the live objects, so closures that hold
    * `run` or `task` see it and a failed save changes nothing. `mutate` must be synchronous and free of side effects.
+   * Publication copies plain fields into the live objects and replaces nested values (`run.messages`, a task's arrays and
+   * objects): never keep one of them across a commit.
    */
   private commit(run: Run, mutate: (draft: Run) => void): void {
     requireThat(!this.committing.has(run.id), 'COMMIT_NESTED', 'A transition is already being committed for this project.')
@@ -388,9 +390,9 @@ export class OrchestratorService {
     for (const task of run.tasks) {
       const key = this.attemptKey(run, task)
       if (!this.retryDue.has(key) || this.steps.has(key) || this.finishing.has(key) || this.launching.has(`${run.id}/${task.id}`)) continue
+      // A failed save keeps the retry due; the pump's caller pauses the run.
+      this.requeue(run, task, `Task ${task.id} attempt ${task.attempt} failed; retrying (attempt ${task.attempt + 1} of ${task.retry!.maxAttempts}).`)
       this.retryDue.delete(key)
-      this.message(run, 'system', `Task ${task.id} attempt ${task.attempt} failed; retrying (attempt ${task.attempt + 1} of ${task.retry!.maxAttempts}).`)
-      this.requeue(run, task)
     }
   }
   private settleFlow(run: Run): void {
@@ -628,11 +630,17 @@ export class OrchestratorService {
       console.warn(`[orchestrator] ${task.id} attempt ${attempt}: logs not kept: ${reason(error)}`)
     }
   }
-  private requeue(run: Run, task: Task): void {
-    task.attempt++; task.state = 'queued'; task.error = null; task.uncertain = false; task.agentId = null; task.cwd = ''; task.artifacts = []; task.inputs = {}
-    delete task.deadline; delete task.pid; delete task.engine; delete task.verdict // a new attempt starts without the old one's verdict
-    for (const next of run.tasks) if (next.state === 'blocked' && !next.uncertain) { next.state = 'queued'; next.error = null }
-    this.changed(run)
+  /**
+   * A new attempt of `task` in one saved transition: the reset table, skipped dependents back in the queue (they are
+   * decided again), and every block lifted that is not uncertain. Nothing changes when the save fails.
+   */
+  private requeue(run: Run, task: Task, note?: string): void {
+    this.commit(run, draft => {
+      if (note) this.appendMessage(draft, 'system', note)
+      resetTask(draft.tasks.find(t => t.id === task.id)!, true)
+      for (const next of downstream(draft.tasks, task.id)) if (next.state === 'skipped') resetTask(next, false)
+      for (const next of draft.tasks) if (next.state === 'blocked' && !next.uncertain) { next.state = 'queued'; next.error = null }
+    })
   }
   retry(id: string, taskId: string): void {
     const run = this.get(id), task = this.task(run, taskId)
@@ -646,8 +654,7 @@ export class OrchestratorService {
       ? `This step may still be running from before the daemon restart (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`
       : 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
     requireThat(!run.tasks.some(t => t.dependsOn.includes(task.id) && ['running', 'launching', 'succeeded'].includes(t.state)), 'RESULT_IN_USE', 'Add a new revision task instead; downstream work already consumed this attempt.')
-    this.retryDue.delete(key)
-    this.requeue(run, task); this.pump(run); this.dispatchPending(run)
+    this.requeue(run, task); this.retryDue.delete(key); this.pump(run); this.dispatchPending(run)
   }
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
