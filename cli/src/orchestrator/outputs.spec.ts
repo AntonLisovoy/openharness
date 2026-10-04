@@ -108,6 +108,19 @@ describe('checkOutputs', () => {
     write(`${deep}/x.bin`)
     expect(await checkOutputs(cwd, { files: ['**/x.bin'] })).toMatchObject({ ok: false })
   })
+  it('skips the loop check logs when it looks for outputs', async () => {
+    mkdirSync(join(cwd, '.harness/loop'), { recursive: true }); writeFileSync(join(cwd, '.harness/loop/1.stdout.log'), 'x')
+    mkdirSync(join(cwd, 'logs')); writeFileSync(join(cwd, 'logs/run.log'), 'y')
+    expect(await checkOutputs(cwd, { files: ['**/*.log'] })).toEqual({ ok: true, files: ['logs/run.log'] })
+  })
+  it.each([
+    ['.harness/loop is a link', 'logs', '.harness/loop', 'logs/1.stdout.log'],
+    ['.harness is a link', 'sub', '.harness', 'sub/loop/1.stdout.log'],
+  ])('skips the loop check logs where they really are when %s', async (_name, target, link, real) => {
+    write(real); write('other/run.log', 'y')
+    mkdirSync(join(cwd, link, '..'), { recursive: true }); symlinkSync(join(cwd, target), join(cwd, link))
+    expect(await checkOutputs(cwd, { files: ['**/*.log'] })).toEqual({ ok: true, files: ['other/run.log'] })
+  })
   it('refuses folders too large to walk', async () => {
     for (let i = 0; i < 10_001; i++) writeFileSync(join(cwd, `f${i}`), '')
     await expect(checkOutputs(cwd, { files: ['f1'] })).rejects.toMatchObject({ code: 'OUTPUTS_TOO_LARGE' })

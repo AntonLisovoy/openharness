@@ -1,6 +1,7 @@
-import { lstat, opendir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { lstat, opendir, readFile, realpath } from 'node:fs/promises'
+import { join, relative, sep } from 'node:path'
 import { parseVerdict } from '../dsh/verdict.js'
+import { loopFolders } from './artifacts.js'
 import { OrchestratorError, type Outputs, type Verdict } from './model.js'
 
 export type OutputsCheck = { ok: true; files: string[] } | { ok: false; missing: string[] }
@@ -24,13 +25,16 @@ export function globToRegExp(pattern: string): RegExp {
 async function listFiles(root: string): Promise<string[]> {
   const files: string[] = []
   let seen = 0
+  // The loop check logs are never outputs, wherever a linked `.harness` or `.harness/loop` really puts them.
+  const real = await realpath(root)
+  const reserved = new Set((await loopFolders(real)).map(folder => relative(real, folder).split(sep).join('/')))
   const walk = async (dir: string, prefix: string, depth: number): Promise<void> => {
     const dirHandle = await opendir(dir)
     for await (const entry of dirHandle) {
       if (++seen > MAX_ENTRIES) throw new OrchestratorError('OUTPUTS_TOO_LARGE', `The task folder has more than ${MAX_ENTRIES} entries to search.`)
       const path = prefix ? `${prefix}/${entry.name}` : entry.name
       if (entry.isFile()) files.push(path)
-      else if (entry.isDirectory() && depth < MAX_DEPTH && !(depth === 0 && entry.name === 'inputs')) await walk(join(dir, entry.name), path, depth + 1)
+      else if (entry.isDirectory() && depth < MAX_DEPTH && !(depth === 0 && entry.name === 'inputs') && !reserved.has(path)) await walk(join(dir, entry.name), path, depth + 1)
     }
   }
   await walk(root, '', 0)

@@ -12,7 +12,8 @@ export interface StepResult { code: number | null; signal: NodeJS.Signals | null
 /** `done` resolves once the step's whole process group is gone; `stop({ now: true })` skips the grace period (daemon exit). `armed()` is false once the group is confirmed gone (or the shell never started): stop is then a no-op. */
 export interface StepHandle { pid: number | undefined; done: Promise<StepResult>; stop(options?: { now?: boolean }): void; armed(): boolean }
 export const STEP_LOG_LIMIT = 8 * 1024 * 1024
-const TAIL = 2000
+const TAIL = 4000
+const FAILURE = 2000
 // How long after the SIGKILL a group may take to disappear before the step reports it could not confirm that.
 const KILL_SETTLE_MS = 2000
 
@@ -26,7 +27,7 @@ function describe(error: unknown): string {
 export function stepFailure(result: StepResult): string {
   const how = result.error ?? (result.signal ? `stopped by ${result.signal}` : `exit ${result.code}`)
   const detail = (result.stderrTail.trim() || result.stdoutTail.trim())
-  return (detail ? `${how}: ${detail.slice(-(TAIL - how.length - 2))}` : how).slice(0, TAIL)
+  return (detail ? `${how}: ${detail.slice(-(FAILURE - how.length - 2))}` : how).slice(0, FAILURE)
 }
 
 function capture(stream: Readable | null, file: string, onFail: (message: string) => void): { tail(): string; close(): Promise<void> } {

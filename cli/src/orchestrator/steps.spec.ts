@@ -47,6 +47,12 @@ describe('shell steps', () => {
   const pids: number[] = []
   afterEach(() => { logGate.hold = null; for (const child of leaders) { if (child.pid && child.exitCode === null && child.signalCode === null) for (const target of [-child.pid, child.pid]) { try { process.kill(target, 'SIGKILL') } catch { /* gone */ } } } for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; leaders.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
 
+  it('keeps a 4000-character tail but a failure text of at most 2000', async () => {
+    const step = startStep(`printf '%5000s' x | tr ' ' a; exit 1`, { cwd, env: {}, spawn: sh })
+    const result = await step.done
+    expect(result.stdoutTail).toHaveLength(4000)
+    expect(stepFailure(result).length).toBeLessThanOrEqual(2000)
+  })
   it('writes its logs where it is told to', async () => {
     const logs = join(cwd, 'logs'); mkdirSync(logs)
     await startStep('echo out; echo err >&2', { cwd, env: {}, spawn: sh, logs: { stdout: join(logs, 'o.log'), stderr: join(logs, 'e.log') } }).done

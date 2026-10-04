@@ -240,6 +240,12 @@ describe('flow task kinds, conditions and trigger rules', () => {
     ['a malformed decision id', `  - { id: c, approval: { message: m, decisions: [{ id: Ship }] } }\n`, 'a decision id looks like ship or needs-work'],
     ['an unknown trigger rule', `  - { id: a, run: "true", trigger_rule: any }\n`, 'trigger_rule'],
   ])('rejects %s', (_name, tasks, expected) => { expect(errors(tasks)).toContain(expected) })
+  it.each(['./.harness/loop/1.log', '.harness/loop', '.harness/loop/**', './././.harness/loop/x'])('refuses an outputs glob into the loop logs: %s', glob => {
+    expect(errors(`  - { id: a, harness: test/cad, prompt: p, outputs: { files: ["${glob}"] } }\n`)).toContain('outputs cannot name .harness/loop/, the loop check logs.')
+  })
+  it('accepts a folder whose name only starts like the loop logs', () => {
+    expect(compileTasks(`  - { id: a, harness: test/cad, prompt: p, outputs: { files: [".harness/loopy/x"] }, timeout: 1h }\n`).tasks).toHaveLength(1)
+  })
   it('warns about agent tasks without outputs or timeout, but not about loops', () => {
     expect(compileTasks(`  - { id: a, harness: test/cad, prompt: p }\n`).warnings).toEqual(['Task a has neither outputs nor timeout; it finishes only when its worker calls finish or fail.'])
     expect(compileTasks(`  - { id: a, harness: test/cad, prompt: p, loop: { until_run: "true", max_iterations: 2 }, timeout: 1h }\n`).warnings).toEqual([])

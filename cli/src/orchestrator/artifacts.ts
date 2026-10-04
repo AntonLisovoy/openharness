@@ -15,6 +15,26 @@ export async function hashFile(path: string): Promise<string> {
 }
 
 /**
+ * The places `.harness/loop/` names in the workspace `root` (already canonical): the folder as written and where it
+ * really is, so a linked `.harness` or `.harness/loop` still counts as the loop logs.
+ */
+export async function loopFolders(root: string): Promise<string[]> {
+  const direct = join(root, '.harness', 'loop')
+  return [direct, await realpath(direct).catch(() => direct)]
+}
+/** `path` (named by the worker) resolves to `source`; neither may be the loop logs or lie inside them. */
+function refuseLoopLog(reserved: string[], root: string, path: string, source: string): void {
+  const hit = reserved.some(folder => [join(root, path), source].some(file => file === folder || inside(folder, file)))
+  requireThat(!hit, 'INVALID_ARTIFACT', `${path} is a loop check log, not an artifact.`)
+}
+
+/** `.harness/loop/` holds loop check logs; they are never artifacts. Checked on canonical paths, so aliases count. */
+export async function assertNotLoopLog(root: string, paths: string[]): Promise<void> {
+  const real = await realpath(root), reserved = await loopFolders(real)
+  for (const path of paths) refuseLoopLog(reserved, real, path, await realpath(join(real, path)).catch(() => join(real, path)))
+}
+
+/**
  * Snapshot only named regular files contained in the worker's own workspace. `check` runs before creating the
  * destination and before each file's folder and copy, so a caller that lost the right to save (the task was stopped
  * meanwhile) creates and copies nothing more. The read-only `chmod` of a file just copied into the destination is not
@@ -22,12 +42,14 @@ export async function hashFile(path: string): Promise<string> {
  */
 export async function snapshotArtifacts(cwd: string, destination: string, paths: string[], check: () => void): Promise<Artifact[]> {
   requireThat(paths.length <= 64, 'ARTIFACT_LIMIT', 'At most 64 artifacts per task.')
-  const root = await realpath(cwd)
+  const root = await realpath(cwd), reserved = await loopFolders(root)
   const prepared: Array<{ source: string; path: string; size: number }> = []
   let bytes = 0
   for (const path of new Set(paths)) {
     requireThat(path.length > 0 && path.length <= 4096 && !isAbsolute(path) && !path.split(/[\\/]/).includes('..'), 'INVALID_ARTIFACT', 'Artifact paths must stay inside the task workspace.')
+    // Resolved once: the path that passes these checks is the one copied.
     const source = await realpath(join(root, path))
+    refuseLoopLog(reserved, root, path, source)
     requireThat(inside(root, source), 'INVALID_ARTIFACT', `Artifact ${path} escapes the task workspace.`)
     const info = await stat(source)
     requireThat(info.isFile() && info.size <= 256 * 1024 * 1024, 'INVALID_ARTIFACT', `${path} must be a regular file of at most 256 MiB.`)
