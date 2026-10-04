@@ -49,6 +49,8 @@ type Uncertain = { uncertain: string }
 /** A result with no owner yet: kept in memory and applied by the next reconcile. `then` is its follow-up, run once it is saved. */
 interface Pending { run: Run; task: Task; attempt: number; outcome: Outcome | Uncertain; source: Source; at: number; then?: () => void }
 interface AutoOptions { source: Source; at?: number; guard?: () => boolean; replay?: boolean; then?: () => void }
+/** Frames an engine normalizer emits for real agent work. The daemon's own frames (heartbeats, recaps, errors) are not activity. */
+export const WORKER_ACTIVITY: ReadonlySet<string> = new Set(['turn_started', 'turn_ended', 'text_delta', 'thinking_delta', 'tool_start', 'tool_end', 'user_message', 'context_compact', 'subagent_finished'])
 
 /**
  * A step process this daemon owns. `uncertain`: the process ended but its group could not be confirmed gone (the error to
@@ -92,6 +94,8 @@ export class OrchestratorService {
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>()
   // Timers of failed tasks whose saved retry is not due yet, by run/task (see releaseRetries).
   private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // Idle clocks of running agent tasks, by attempt; in memory only, started again after a restart or a resume.
+  private readonly idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
   // Runs being reconciled: nothing pumps, dispatches or arms a timer for them until it ends (see reconcile).
   private readonly reconciling = new Map<string, Promise<void>>()
   // Automatic results that arrived while their run was paused or reconciled, or whose save failed, by attempt.
@@ -275,7 +279,11 @@ export class OrchestratorService {
         this.reconciling.delete(run.id)
         // The barrier is down: a ready cancel step goes first; otherwise arm what came due later, deliver what waited,
         // and move the run once.
-        if (!this.stopped && run.state === 'active' && !this.cancelReady(run)) { this.restoreDeadlines(run); this.dispatchPending(run); this.pump(run) }
+        if (!this.stopped && run.state === 'active' && !this.cancelReady(run)) {
+          this.restoreDeadlines(run)
+          for (const task of run.tasks) this.armIdle(run, task) // from now: idle time before a pause or a restart does not count
+          this.dispatchPending(run); this.pump(run)
+        }
         finish()
       } catch (error) {
         this.reconciling.delete(run.id)
@@ -637,7 +645,7 @@ export class OrchestratorService {
       task.engine = engine
       if ((task as Task).state === 'cancelled' || (run as Run).state === 'cancelled') this.deps.cancel(result.agentId)
       // After a stop the agent stays recorded as launching: the next daemon shows it as uncertain, and arms nothing now.
-      else if (task.state === 'launching' && !this.stopped) { task.state = 'running'; this.armDeadline(run, task) }
+      else if (task.state === 'launching' && !this.stopped) { task.state = 'running'; this.armDeadline(run, task); this.armIdle(run, task) }
     } catch (error) {
       if (task.state !== 'cancelled') {
         task.uncertain = creating && (!(error instanceof OrchestratorError) || ['SPAWN_FAILED', 'REGISTRATION_FAILED'].includes(error.code))
@@ -734,6 +742,33 @@ export class OrchestratorService {
     }, Math.max(0, task.deadline! - Date.now()))
     timer.unref()
     this.deadlines.set(key, timer)
+  }
+  /** (Re)starts the idle clock of a running agent task; never inside a reconcile, which arms it again when it ends. */
+  private armIdle(run: Run, task: Task): void {
+    if (task.idleTimeoutMs === undefined || task.state !== 'running' || run.state !== 'active' || this.reconciling.has(run.id)) return
+    const key = this.attemptKey(run, task), attempt = task.attempt
+    clearTimeout(this.idleTimers.get(key))
+    // The entry stays until the expiry is settled: it is how the expiry knows that no newer clock replaced it.
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => { void this.idle(run, task, attempt, timer) }, task.idleTimeoutMs)
+    timer.unref(); this.idleTimers.set(key, timer)
+  }
+  /** Idle clocks under a key prefix: one task (`run/task/`) or a whole run (`run/`). */
+  private clearIdle(prefix: string): void {
+    for (const [key, timer] of this.idleTimers) if (key.startsWith(prefix)) { clearTimeout(timer); this.idleTimers.delete(key) }
+  }
+  /**
+   * The idle clock ran out: an automatic failure, retryable. The agent is cancelled only once the failure is saved (now or
+   * when a kept failure is applied on resume); unlike a timeout, a failed save stops nothing.
+   */
+  private async idle(run: Run, task: Task, attempt: number, timer: ReturnType<typeof setTimeout>): Promise<void> {
+    const observedAt = Date.now(), agentId = task.agentId!, key = this.attemptKey(run, task, attempt) // only a running agent has an idle clock
+    // Still this clock: no activity, pause, reconcile or end of the attempt cleared or replaced it, also while the expiry
+    // waited for the attempt's owner. A stale expiry is dropped; the newer clock decides.
+    const armed = (): boolean => this.idleTimers.get(key) === timer
+    try {
+      if (this.reconciling.has(run.id)) return // armed again when the reconcile ends
+      await this.settleAuto(run, task, attempt, { failed: `No activity for ${durationLabel(task.idleTimeoutMs!)}.` }, { source: 'idle', at: observedAt, guard: armed, then: () => this.deps.cancel(agentId) })
+    } finally { if (armed()) this.idleTimers.delete(key) }
   }
   private async expire(run: Run, task: Task, attempt: number, observedAt = Date.now(), replay = false): Promise<void> {
     // Captured first: once the timeout wins, a retry may already have reset the task.
@@ -928,7 +963,7 @@ export class OrchestratorService {
    * pump. The attempt is already taken, so a failure here is logged and never reported as the result's own failure.
    */
   private afterAttempt(run: Run, key: string, attempt: number, task: Task): void {
-    clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
+    clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key); this.clearIdle(`${run.id}/${task.id}/`)
     this.followUp(task, attempt, () => this.dispatchPending(run))
   }
   /** A step after an attempt was taken: its failure is logged, never turned into the result's own failure. */
@@ -1009,9 +1044,10 @@ export class OrchestratorService {
       for (const next of draft.tasks) if (next.state === 'blocked' && !next.uncertain) { next.state = 'queued'; next.error = null }
     })
   }
-  /** Every timer of a task: its deadlines (of any attempt) and its retry. */
+  /** Every timer of a task: its deadlines and idle clocks (of any attempt) and its retry. */
   private clearTimers(run: Run, task: Task): void {
     for (const [key, timer] of this.deadlines) if (key.startsWith(`${run.id}/${task.id}/`)) { clearTimeout(timer); this.deadlines.delete(key) }
+    this.clearIdle(`${run.id}/${task.id}/`)
     this.clearRetry(run, task)
   }
   retry(id: string, taskId: string): void {
@@ -1254,18 +1290,24 @@ export class OrchestratorService {
     // Late callbacks never move a run that ended: the error is only reported.
     if (run.state === 'cancelled' || run.state === 'completed') { console.error(`[orchestrator] ${run.id}: ${reason(error)}`); return }
     run.state = 'paused'
+    this.clearIdle(`${run.id}/`) // a paused run has no idle clock; the resume starts it again from then
     run.error = `Project paused after a background error: ${error instanceof Error ? error.message : 'unknown error'}. Inspect existing agents before resuming.`
     console.error(`[orchestrator] ${run.error}`)
     // The run is paused before anyone is notified: an observer that fails cannot undo the pause or reach a caller.
     try { this.changed(run, false) } catch (error) { console.warn(`[orchestrator] pause notification failed: ${reason(error)}`) }
   }
-  /** A worker's ended turn is a cue to look for declared outputs; it is never itself evidence of success. */
-  private workerTurnEnded(frame: { agentId?: unknown; payload?: unknown }): boolean {
+  /**
+   * Frames of a worker's agent: real work restarts its idle clock, and an ended turn is a cue to look for declared
+   * outputs (never itself evidence of success). Replayed frames are neither.
+   */
+  private workerFrame(frame: { type?: unknown; agentId?: unknown; payload?: unknown; replay?: unknown }): boolean {
     for (const run of this.runs.values()) {
       const task = run.tasks.find(t => t.agentId === frame.agentId)
       if (!task) continue
+      if (frame.replay === true) return true
+      if (WORKER_ACTIVITY.has(String(frame.type))) this.armIdle(run, task)
       const aborted = (frame.payload as { aborted?: unknown } | undefined)?.aborted === true
-      if (run.flow && task.outputs && !aborted && task.state === 'running' && run.state === 'active') void this.autoFinish(run, task, task.attempt)
+      if (frame.type === 'turn_ended' && run.flow && task.outputs && !aborted && task.state === 'running' && run.state === 'active') void this.autoFinish(run, task, task.attempt)
       return true
     }
     return false
@@ -1287,7 +1329,7 @@ export class OrchestratorService {
   ingest(frame: { type?: unknown; agentId?: unknown; payload?: unknown; replay?: unknown }): void {
     if (this.stopped) return
     this.load()
-    if (frame.type === 'turn_ended' && frame.replay !== true && this.workerTurnEnded(frame)) return
+    if (this.workerFrame(frame)) return
     const run = [...this.runs.values()].find(r => r.directorId === frame.agentId)
     if (!run || frame.replay === true) return
     const payload = (frame.payload ?? {}) as Record<string, unknown>
@@ -1306,8 +1348,8 @@ export class OrchestratorService {
     // Kill everything before saving anything: the daemon exits right after, and a failed save must not keep a step alive.
     for (const { handle } of this.steps.values()) handle.stop({ now: true })
     for (const timer of this.deadlines.values()) clearTimeout(timer)
-    for (const timer of this.retryTimers.values()) clearTimeout(timer)
-    this.deadlines.clear(); this.retryTimers.clear()
+    for (const timer of [...this.retryTimers.values(), ...this.idleTimers.values()]) clearTimeout(timer)
+    this.deadlines.clear(); this.retryTimers.clear(); this.idleTimers.clear()
     const unsaved = new Set([...this.dirty.keys()].map(id => this.runs.get(id)!))
     // Evidence that a group may still run (a kept uncertainty, or a step whose group outlived it and is not fenced yet) is
     // saved as an uncertainty: the next daemon must not replace the attempt until the group is gone. A running or failed

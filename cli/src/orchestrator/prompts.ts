@@ -38,6 +38,7 @@ function flowTerms(task: Task): string {
       + 'Calling finish yourself also works.'
     : ''
   return outputs + (task.timeoutMs === undefined ? '' : `\nThis attempt is stopped after ${durationLabel(task.timeoutMs)}.`)
+    + (task.idleTimeoutMs === undefined ? '' : `\nThe daemon stops this attempt after ${durationLabel(task.idleTimeoutMs)} without activity from you.`)
 }
 export function workerPrompt(run: Run, task: Task, command: string): string {
   const upstream = task.dependsOn.map(id => {

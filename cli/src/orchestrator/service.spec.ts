@@ -914,12 +914,12 @@ tasks:
   })
 
   const internals = () => service as unknown as {
-    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> }; uncertain?: string }>
+    runs: Map<string, Run>; deadlines: Map<string, unknown>; retryTimers: Map<string, unknown>; idleTimers: Map<string, unknown>; steps: Map<string, { handle: { done: Promise<unknown> }; uncertain?: string }>
     expire(run: Run, task: Task, attempt: number): Promise<void>
     commit(run: Run, mutate: (draft: Run) => void): void
     appendMessage(run: Run, role: 'user' | 'assistant' | 'system', text: string): Run['messages'][number]
     finishing: Map<string, unknown>; launching: Map<string, unknown>; reconciling: Map<string, Promise<void>>
-    pump(run: Run): void
+    pump(run: Run): void; pause(run: Run, error: unknown): void
     exclusive<T>(r: Run, t: Task, n: number, b: () => Promise<T>): Promise<T>
     pending: Map<string, { task: Task; at: number; source: string }>
     fenceUncertain(run: Run, task: Task, attempt: number, error: string, source: 'exit' | 'check', at: number): Promise<boolean>
@@ -1636,6 +1636,100 @@ tasks:
     return () => vi.mocked(fs.writeFileSync).mockImplementation(actual)
   }
   const pausedByDisk = { state: 'paused', error: expect.stringMatching(/^Project paused after a background error: ENOSPC/) }
+  it('fails an agent task that shows no real activity, heartbeats and recaps notwithstanding', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+    await startFlow(steps({ id: 'w', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }))
+    await vi.waitFor(() => expect(liveTask('w').state).toBe('running'))
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(3000)
+      for (const type of ['agent_activity', 'turn_heartbeat', 'turn_summary', 'error']) service.ingest({ type, agentId: 'agent-1', payload: {} })
+      service.ingest({ type: 'text_delta', agentId: 'agent-1', payload: {}, replay: true })
+    }
+    await vi.waitFor(() => expect(liveTask('w')).toMatchObject({ state: 'failed', error: 'No activity for 10s.' }))
+    expect(cancelled).toContain('agent-1')
+  })
+  it('counts real worker events as activity', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    await startFlow(steps({ id: 'w', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }))
+    await vi.waitFor(() => expect(liveTask('w').state).toBe('running'))
+    for (const type of ['turn_started', 'text_delta', 'thinking_delta', 'tool_start', 'tool_end', 'user_message', 'context_compact', 'subagent_finished', 'turn_ended']) {
+      await vi.advanceTimersByTimeAsync(9000); service.ingest({ type, agentId: 'agent-1', payload: {} })
+    }
+    expect(liveTask('w').state).toBe('running')
+  })
+  it('does not run the idle clock inside a reconcile, and starts it again afterwards', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'w', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }))
+    await vi.waitFor(() => expect(liveTask('w').state).toBe('running'))
+    live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+    const hold = holdVerdictRead() // x's expiry holds the barrier
+    const resumed = service.resume(flowId)
+    await vi.waitFor(() => expect(hold.reading()).toBe(true))
+    await vi.advanceTimersByTimeAsync(11_000) // the old timer fires inside the barrier and does nothing
+    expect(liveTask('w').state).toBe('running')
+    hold.release(); await resumed
+    await vi.advanceTimersByTimeAsync(9_999); expect(liveTask('w').state).toBe('running')
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.waitFor(() => expect(liveTask('w')).toMatchObject({ state: 'failed', error: 'No activity for 10s.' }))
+  })
+  it('stops the idle clock of a finished task and keeps the others running', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }, { id: 'b', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }))
+    await vi.waitFor(() => expect([liveTask('a').state, liveTask('b').state]).toEqual(['running', 'running']))
+    await vi.advanceTimersByTimeAsync(5000)
+    await service.finish(flowId, 'a', 1, 'done', [])
+    expect(internals().idleTimers.size).toBe(1)
+    await vi.advanceTimersByTimeAsync(5000)
+    await vi.waitFor(() => expect(liveTask('b')).toMatchObject({ state: 'failed', error: 'No activity for 10s.' }))
+    expect(liveTask('a').state).toBe('succeeded')
+    expect(cancelled).toEqual([liveTask('b').agentId])
+  })
+  // An expiry waits for the attempt's owner; a newer clock armed meanwhile (activity, or a resume after a pause) decides.
+  it.each([
+    ['a pause before it fired', 6000, 'pause'], // paused at 6s, the old clock fires at 10s, resumed at 11s
+    ['a pause while it waited', 11_000, 'pause'], // the old clock fired at 10s; paused and resumed at 11s
+    ['activity while it waited', 11_000, 'activity'],
+  ] as const)('drops a stale idle expiry after %s, and fails the task when the newer clock runs out', async (_, at, what) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(steps({ id: 'w', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }))
+    await vi.waitFor(() => expect(liveTask('w').state).toBe('running'))
+    const expiries = vi.spyOn(service as unknown as { idle: () => Promise<void> }, 'idle')
+    let release!: () => void
+    const owner = internals().exclusive(live(), liveTask('w'), 1, () => new Promise<void>(resolve => { release = resolve }))
+    await vi.advanceTimersByTimeAsync(at)
+    if (what === 'pause') {
+      internals().pause(live(), new Error('test pause'))
+      await vi.advanceTimersByTimeAsync(11_000 - at)
+      await service.resume(flowId) // the newer clock: 11s + 10s
+    } else service.ingest({ type: 'tool_start', agentId: 'agent-1', payload: {} })
+    await vi.advanceTimersByTimeAsync(1000)
+    release(); await owner
+    // The old clock's expiry ran (a paused run has none) and has settled: it changed nothing.
+    expect(expiries).toHaveBeenCalledTimes(what === 'pause' && at < 10_000 ? 0 : 1)
+    await Promise.all(expiries.mock.results.map(r => r.value))
+    expect(liveTask('w').state).toBe('running')
+    expect(cancelled).toEqual([])
+    await vi.advanceTimersByTimeAsync(8_999)
+    expect(liveTask('w').state).toBe('running')
+    await vi.advanceTimersByTimeAsync(1)
+    await vi.waitFor(() => expect(liveTask('w')).toMatchObject({ state: 'failed', error: 'No activity for 10s.' }))
+    expect(cancelled).toEqual(['agent-1'])
+  })
+  // The timeout exception does not cover idle_timeout: an idle worker is cancelled only once its failure is saved.
+  it('does not cancel an idle worker whose failure cannot be saved, and cancels it on resume', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    await startFlow(steps({ id: 'w', harness: 'test/cad', prompt: 'work', idle_timeout: '10s' }))
+    await vi.waitFor(() => expect(liveTask('w').state).toBe('running'))
+    const recover = failWrites(json => json.includes('No activity for 10s.'))
+    await vi.advanceTimersByTimeAsync(10_000)
+    await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+    expect(cancelled).toEqual([]) // kept, not saved: nothing is touched
+    recover(); await service.resume(flowId)
+    expect(liveTask('w')).toMatchObject({ state: 'failed', error: 'No activity for 10s.' })
+    expect(cancelled).toEqual(['agent-1'])
+  })
   /** Holds the second verdict read (the first runs normally) until released. */
   const holdSecondVerdictRead = async () => {
     const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).readVerdictSnapshot

@@ -32,5 +32,7 @@ describe('self-contained orchestration briefs', () => {
     const bare = workerPrompt(run, { ...task, outputs: undefined, timeoutMs: undefined } as unknown as Task, 'harness orchestrator')
     expect(bare).not.toContain('globs')
     expect(bare).not.toContain('stopped after')
+    expect(bare).not.toContain('without activity')
+    expect(workerPrompt(run, { ...task, idleTimeoutMs: 900_000 } as Task, 'harness orchestrator')).toContain('The daemon stops this attempt after 15m without activity from you.')
   })
 })
