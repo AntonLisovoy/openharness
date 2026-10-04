@@ -237,3 +237,10 @@ Initial contract. Lifted from the `.board.json` (Circuit) and `.episode.json` (T
 - **Why:** a graph that worked once can be run again with different inputs, reviewed as a file, and checked by plain commands instead of prose acceptance criteria.
 - **Backward compatible:** yes. New file, new optional fields on the orchestrator's own state; harness manifests, viewers and verdicts are unchanged. `verdict.ready` is read only when a flow opts in with `outputs.verdict: ready`.
 - **Mechanism:** YAML 1.2 (JSON is valid) parsed as plain data (no anchors, aliases or tags), then the same strict validation as the schema.
+
+## 2026-10-04 - orchestrator flows: conditions, approvals and loops
+- **Change:** flow tasks gain the optional keys `when`, `trigger_rule`, `approval`, `cancel`, `loop`, `idle_timeout` and `retry.delay`. A task is now an agent task, a shell step, an approval or a cancel step (four `oneOf` kinds in `schema/flow.schema.json`). Task state gains `skipped` and `waiting`; a `Task` gains the optional fields `verdict`, `decision`, `loopState`, `retryAt` and `scripts`, and `FlowProvenance` gains `source`. The wire gains the actions `approve` and `reject`, and the CLI `harness orchestrator approve|reject`. See "Orchestrator flows" in `README.md`.
+- **Why:** a recipe often branches, waits for a person, stops on a known condition, or lets an agent fix its work until a check passes.
+- **Backward compatible:** yes for files and saved state. Every new key and field is optional; a flow without them compiles to the same graph as before, and old runs load. One behavior change: resuming a flow run that was cancelled or completed is now refused with `PROJECT_INACTIVE` ("This flow run has ended; start the flow again instead."); it was allowed before. Director projects can still be resumed.
+- **Migration:** none for files and state. To repeat a flow run that ended, start the flow again (`harness orchestrator run <flow>`).
+- **Mechanism:** `cli/src/orchestrator/` (`conditions.ts`, `graph.ts`, `loop.ts`, `scripts.ts`, `flow.ts`, `service.ts`, `wire.ts`, `command.ts`).
