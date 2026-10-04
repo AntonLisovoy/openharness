@@ -34,3 +34,41 @@ describe('model compatibility', () => {
     expect(() => TaskSpec.parse({ id: 'x', title: 'x', harness: 'run', prompt: 'p', retry: { maxAttempts: 7 } })).toThrow()
   })
 })
+
+const filledTask = {
+  id: 'review', title: 'review', harness: 'test/cad', prompt: 'Review', dependsOn: ['plan'],
+  outputs: { files: ['review.md'], verdict: 'ready' }, timeoutMs: 60_000, retry: { maxAttempts: 3, delayMs: 30_000 },
+  when: 'plan.verdict.errors == 0', triggerRule: 'none_failed_min_one_success', idleTimeoutMs: 900_000,
+  loop: { untilRun: 'npm run lint', maxIterations: 3 },
+  state: 'running', attempt: 2, agentId: 'agent-3', cwd: '/r/tasks/review/attempt-2', summary: 's', error: null, uncertain: false,
+  artifacts: [{ path: 'review.md', size: 3, sha256: 'a'.repeat(64) }], inputs: { plan: 1 }, engine: 'claude', promptSha256: 'b'.repeat(64),
+  deadline: 5, pid: 7, verdict: { ready: true, errors: 0, warnings: 2 },
+  loopState: { phase: 'checking', completed: 1, turn: 2, eligibleAfter: 1, check: { pid: 9, startedAt: 4 }, finish: { summary: 'done', paths: ['review.md'] }, feedbackId: 'c'.repeat(32) },
+  retryAt: 6, scripts: [{ path: '/p/check.sh', sha256: 'd'.repeat(64) }],
+}
+const approvalTask = {
+  id: 'ok', title: 'ok', harness: 'approval', prompt: 'Ship?', dependsOn: [], approval: { message: 'Ship?', decisions: [{ id: 'ship', label: 'Ship it' }] },
+  state: 'waiting', attempt: 1, agentId: null, cwd: '/r/tasks/ok/attempt-1', summary: '', error: null, uncertain: false, artifacts: [], inputs: {},
+  decision: { outcome: 'approved', decision: 'ship', comment: 'go', at: 8 },
+}
+const cancelTask = { id: 'stop', title: 'stop', harness: 'cancel', prompt: 'Rework', dependsOn: ['ok'], cancel: 'Rework', when: 'ok.decision == ship',
+  state: 'skipped', attempt: 1, agentId: null, cwd: '', summary: 'Skipped: ok.decision == ship is false', error: null, uncertain: false, artifacts: [], inputs: {} }
+
+describe('phase-2 model fields', () => {
+  it('round-trips every phase-2 field before and after execution', () => {
+    const run = { ...legacyRun, directorId: null, flow: { name: 'x', path: '/p/x.yaml', sha256: 'e'.repeat(64), inputs: {}, warnings: [], source: 'flow.yaml' }, tasks: [filledTask, approvalTask, cancelTask] }
+    expect(JSON.parse(JSON.stringify(Run.parse(run)))).toEqual(run)
+    const queued = { ...filledTask, state: 'queued', attempt: 3, agentId: null, cwd: '', artifacts: [], inputs: {} }
+    for (const key of ['verdict', 'loopState', 'retryAt', 'scripts', 'deadline', 'pid', 'engine'] as const) delete (queued as Record<string, unknown>)[key]
+    expect(JSON.parse(JSON.stringify(Run.parse({ ...run, tasks: [queued] })))).toEqual({ ...run, tasks: [queued] })
+  })
+  it('bounds the new fields', () => {
+    const base = { id: 'a', title: 'a', harness: 'approval', prompt: 'p' }
+    expect(() => TaskSpec.parse({ ...base, approval: { message: 'p', decisions: [] } })).toThrow()
+    expect(() => TaskSpec.parse({ ...base, approval: { message: 'p', decisions: Array.from({ length: 9 }, (_, i) => ({ id: `d${i}`, label: 'x' })) } })).toThrow()
+    expect(() => TaskSpec.parse({ ...base, approval: { message: 'p', decisions: [{ id: 'Bad', label: 'x' }] } })).toThrow()
+    expect(() => TaskSpec.parse({ ...base, retry: { maxAttempts: 2, delayMs: 61_000 } })).toThrow()
+    expect(() => TaskSpec.parse({ ...base, loop: { untilRun: 'x', maxIterations: 21 } })).toThrow()
+    expect(() => TaskSpec.parse({ ...base, idleTimeoutMs: 86_400_001 })).toThrow()
+  })
+})

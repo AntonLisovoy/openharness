@@ -694,7 +694,9 @@ tasks:
   it('keeps flow-only fields away from director plans', async () => {
     await service.start({ id, engine: 'claude', prompt: 'Make something' })
     await vi.waitFor(() => expect(service.snapshot(id).state).toBe('active'))
-    for (const extra of [{ run: 'rm -rf ~' }, { outputs: { files: ['x'] } }, { timeoutMs: 1000 }, { retry: { maxAttempts: 1 } }]) {
+    for (const extra of [{ run: 'rm -rf ~' }, { outputs: { files: ['x'] } }, { timeoutMs: 1000 }, { retry: { maxAttempts: 1 } },
+      { when: 'x == 1' }, { triggerRule: 'all_done' }, { approval: { message: 'ok' } }, { cancel: 'stop' },
+      { loop: { untilRun: 'true', maxIterations: 2 } }, { idleTimeoutMs: 5000 }, { retry: { maxAttempts: 2, delayMs: 2000 } }]) {
       expect(() => service.plan(id, [{ ...task('a', [], 'test/cad'), ...extra }])).toThrow(expect.objectContaining({ code: 'FLOW_ONLY' }))
     }
     expect(() => service.plan(id, [task('a', [], 'engine:codex')])).toThrow(expect.objectContaining({ code: 'HARNESS_UNAVAILABLE' }))

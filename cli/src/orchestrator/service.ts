@@ -259,7 +259,8 @@ export class OrchestratorService {
     requireThat(run.state === 'active' || run.state === 'starting', 'PROJECT_INACTIVE', 'Resume this project before adding work.')
     const tasks = z.array(TaskSpec).min(1).max(32).parse(raw)
     // A scope rule, not a sandbox: shell steps and automatic completion come from a file the user runs.
-    requireThat(tasks.every(t => t.run === undefined && t.outputs === undefined && t.timeoutMs === undefined && t.retry === undefined), 'FLOW_ONLY', 'run, outputs, timeoutMs and retry are only available in flow files.')
+    const FLOW_FIELDS = ['run', 'outputs', 'timeoutMs', 'retry', 'when', 'triggerRule', 'approval', 'cancel', 'loop', 'idleTimeoutMs'] as const
+    requireThat(tasks.every(t => FLOW_FIELDS.every(field => t[field] === undefined)), 'FLOW_ONLY', `${FLOW_FIELDS.join(', ')} are only available in flow files.`)
     validatePlan(run.tasks, tasks)
     for (const task of tasks) this.checkHarness(run.engine, task)
     this.addTasks(run, tasks)
