@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { constants, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
-import { access, mkdir, realpath, rename, rm, stat } from 'node:fs/promises'
+import { access, mkdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import { z } from 'zod'
 import type { AgentEngine } from '../engines/types.js'
@@ -117,6 +117,10 @@ export class OrchestratorService {
         if (run.state === 'starting') {
           run.state = 'paused'
           run.error = 'The daemon restarted during director creation. Inspect existing agents before starting another project.'
+        }
+        for (const task of run.tasks) {
+          // An approval or a cancel step creates no external process: its preparation simply starts again.
+          if (task.state === 'launching' && (task.approval || task.cancel !== undefined)) Object.assign(task, { state: 'queued', cwd: '', inputs: {} })
         }
         for (const task of run.tasks) if (task.state === 'launching') {
           task.state = 'blocked'
@@ -274,7 +278,9 @@ export class OrchestratorService {
         finish()
       } catch (error) {
         this.reconciling.delete(run.id)
-        this.pause(run, error)
+        // A run that was cancelled or completed meanwhile, or a daemon that stopped, keeps its state: the error is only reported.
+        if (this.stopped || ['cancelled', 'completed'].includes(run.state)) console.error(`[orchestrator] ${run.id}: reconcile failed: ${reason(error)}`)
+        else this.pause(run, error)
         fail(error)
       }
     })()
@@ -297,8 +303,19 @@ export class OrchestratorService {
         catch (error) { if (!(error instanceof OrchestratorError && error.code === 'TASK_INACTIVE')) throw error } // a cancel won: nothing more is written
       })
     }
+    // 3. A recorded decision is finished; it beats a deadline that passed meanwhile.
+    for (const task of run.tasks) {
+      if (!live()) return
+      if (task.state !== 'waiting' || !task.decision) continue
+      const attempt = task.attempt
+      await this.exclusive(run, task, attempt, async () => {
+        if (task.attempt !== attempt || task.state !== 'waiting' || !task.decision) return
+        try { await this.finishApproval(run, task, attempt) }
+        catch (error) { if (!(error instanceof OrchestratorError && error.code === 'TASK_INACTIVE' && !live())) throw error } // a pause or a stop won: the decision is kept
+      })
+    }
     // 4. Every deadline that passed is enforced now, through the same path as its timer (the reconcile's own replay).
-    if (live()) await this.expireOverdue(run)
+    await this.expireOverdue(run) // checks the run again before each task
   }
   /** Nothing waits for the barrier: no kept result of this run. Synchronous. */
   private quiet(run: Run): boolean { return ![...this.pending.values()].some(entry => entry.run === run) }
@@ -311,7 +328,7 @@ export class OrchestratorService {
   private async expireOverdue(run: Run): Promise<void> {
     for (const task of run.tasks) {
       if (this.stopped || run.state !== 'active') return
-      if (task.state === 'running' && task.deadline !== undefined && task.deadline <= Date.now()) await this.expire(run, task, task.attempt, Date.now(), true)
+      if (['running', 'waiting'].includes(task.state) && task.deadline !== undefined && task.deadline <= Date.now()) await this.expire(run, task, task.attempt, Date.now(), true)
     }
   }
   catalog(): HarnessChoice[] { return this.deps.catalog() }
@@ -563,6 +580,23 @@ export class OrchestratorService {
       if (this.stopped || task.state !== 'launching' || run.state !== 'active') return
       // The run is being reconciled, which already passed this task: as after a pause, nothing starts and it is queued again.
       if (this.reconciling.has(run.id)) { interrupted = true; return }
+      if (task.approval) {
+        const choices = task.approval.decisions ? ` Decisions: ${task.approval.decisions.map(d => d.id).join(', ')}.` : ''
+        try {
+          this.commit(run, draft => {
+            const t = draft.tasks.find(x => x.id === task.id)!
+            t.state = 'waiting'
+            if (t.timeoutMs !== undefined) t.deadline = Date.now() + t.timeoutMs
+            this.appendMessage(draft, 'system', `Task ${task.id} is waiting for approval: ${task.approval!.message}${choices}`)
+          })
+        } catch (error) {
+          // Not a failed launch: nothing was published. The run pauses, and the reconcile on resume prepares the approval again.
+          this.pause(run, error)
+          return
+        }
+        if (task.deadline !== undefined) this.scheduleDeadline(run, task)
+        return // nothing runs: the release pump after the launch moves the run on
+      }
       if (task.run !== undefined) return this.launchStep(run, task)
       const harness = this.catalog().find(h => h.id === task.harness)
       const own = this.ownEngine(task.harness)
@@ -665,7 +699,7 @@ export class OrchestratorService {
   /** Saved deadlines without a timer: after a restart, or one that came due (and was ignored) while the project was paused. */
   private restoreDeadlines(run: Run): void {
     if (!this.ready) return
-    for (const task of run.tasks) if (task.state === 'running' && task.deadline !== undefined && !this.deadlines.has(this.attemptKey(run, task))) this.scheduleDeadline(run, task)
+    for (const task of run.tasks) if (['running', 'waiting'].includes(task.state) && task.deadline !== undefined && !this.deadlines.has(this.attemptKey(run, task))) this.scheduleDeadline(run, task)
   }
   private scheduleDeadline(run: Run, task: Task): void {
     const key = this.attemptKey(run, task), attempt = task.attempt
@@ -681,7 +715,9 @@ export class OrchestratorService {
     // Captured first: once the timeout wins, a retry may already have reset the task.
     const agentId = task.agentId, step = this.steps.get(this.attemptKey(run, task, attempt))
     const gone = task.run !== undefined && !step // the process already ended: its logs are complete
-    const outcome: Outcome = { failed: `Timed out after ${durationLabel(task.timeoutMs!)}.`, ...(gone ? { keep: STEP_LOGS } : {}) }
+    const outcome: Outcome = task.approval
+      ? { failed: `No decision within ${durationLabel(task.timeoutMs!)}.`, retryable: false }
+      : { failed: `Timed out after ${durationLabel(task.timeoutMs!)}.`, ...(gone ? { keep: STEP_LOGS } : {}) }
     // A timeout kept after a failed save stopped its work already; its replay cancels the agent again (a repeated cancel
     // of a stopped agent does nothing) and finds no step to stop.
     const stop = (): void => { step?.handle.stop(); if (agentId) this.deps.cancel(agentId) }
@@ -702,7 +738,8 @@ export class OrchestratorService {
     const { source, at = Date.now(), guard = () => true, replay = false, then } = opts
     const key = this.attemptKey(run, task, attempt)
     while (this.finishing.has(key)) await this.finishing.get(key) // never rejects: it only says that the owner has ended
-    const current = (): boolean => !this.stopped && task.attempt === attempt && ['running', 'launching'].includes(task.state) && guard()
+    // A recorded decision is authoritative: no automatic result (a timeout) replaces it.
+    const current = (): boolean => !this.stopped && task.attempt === attempt && ['running', 'launching', 'waiting'].includes(task.state) && !(task.approval && task.decision) && guard()
     const keep = (): 'deferred' => { if (!this.pending.has(key)) this.pending.set(key, { run, task, attempt, outcome, source, at, then }); return 'deferred' }
     const fact = source === 'exit' || source === 'check'
     if (!current()) return false
@@ -818,11 +855,11 @@ export class OrchestratorService {
    */
   private async settle(run: Run, task: Task, attempt: number, outcome: Outcome): Promise<boolean> {
     const key = this.attemptKey(run, task, attempt)
-    const current = (): boolean => !this.stopped && run.state === 'active' && ['running', 'launching'].includes(task.state) && task.attempt === attempt
+    const current = (): boolean => !this.stopped && run.state === 'active' && ['running', 'launching', 'waiting'].includes(task.state) && task.attempt === attempt
     const stillCurrent = (): void => requireThat(current(), 'TASK_INACTIVE', 'Task stopped while its result was being saved.')
     const operation = async (): Promise<boolean> => {
-      // Approval and cancel tasks never settle here, so every task that does may have left a verdict.
-      const verdict = await readVerdictSnapshot(this.execDir(run, task))
+      // An approval leaves no verdict (only its timeout settles here); every other task may have left one.
+      const verdict = task.approval ? undefined : await readVerdictSnapshot(this.execDir(run, task))
       // saveAttempt checks before each of its writes (none happen before its first check), and its staging cleanup waits
       // after its last check: the check below covers both the verdict read and that cleanup. The commit is synchronous.
       const kept = outcome.keep ? await this.keptFiles(run, task, attempt, outcome.keep, stillCurrent) : null
@@ -983,6 +1020,75 @@ export class OrchestratorService {
     if (released) this.steps.delete(key)
     this.pump(run); this.dispatchPending(run)
   }
+  /**
+   * A person's answer to the approval request of `attempt`. The decision is saved first (from then on it is authoritative),
+   * then its record becomes the attempt's artifact and the task ends. When a later step fails, the decision stays and the
+   * same answer again (or the next reconcile) completes it; any other answer is a conflict.
+   */
+  async answer(id: string, taskId: string, attempt: number, raw: { outcome: 'approved' | 'rejected'; decision?: string; comment?: string }): Promise<void> {
+    const comment = z.string().max(4000).optional().parse(raw.comment)?.trim() || undefined
+    const run = this.get(id), task = this.task(run, taskId)
+    requireThat(task.approval, 'TASK_INACTIVE', 'This task does not wait for a decision.')
+    const decisions = task.approval.decisions
+    if (raw.outcome === 'rejected') requireThat(raw.decision === undefined, 'INVALID_DECISION', 'A rejection takes no decision.')
+    else if (decisions) requireThat(decisions.some(d => d.id === raw.decision), 'INVALID_DECISION', `Choose one of: ${decisions.map(d => d.id).join(', ')}.`)
+    else requireThat(raw.decision === undefined, 'INVALID_DECISION', 'This approval has no decisions to choose from.')
+    const stale = (): void => requireThat(task.attempt === attempt, 'STALE_ATTEMPT', 'This answer belongs to an older request and was ignored.')
+    stale()
+    // Like every mutating request, an answer waits for a reconcile of its run, then is checked against what it left.
+    await this.reconciled(run.id)
+    const same = (d: NonNullable<Task['decision']>): boolean => d.outcome === raw.outcome && (d.decision ?? '') === (raw.decision ?? '') && (d.comment ?? '') === (comment ?? '')
+    await this.exclusive(run, task, attempt, async () => {
+      stale()
+      if (task.decision) {
+        requireThat(same(task.decision), 'DECISION_CONFLICT', 'This request was already answered differently.')
+        if (task.state !== 'waiting') return // answered and finished already, whatever the run state
+        requireThat(run.state === 'active', 'PROJECT_INACTIVE', 'Resume the project first.')
+      } else {
+        requireThat(run.state === 'active', 'PROJECT_INACTIVE', 'Resume the project first.')
+        requireThat(task.state === 'waiting', 'TASK_INACTIVE', 'This task is not waiting for a decision.')
+        // From here the decision is authoritative: a deadline that fires now does nothing.
+        this.commit(run, draft => {
+          draft.tasks.find(x => x.id === task.id)!.decision = { outcome: raw.outcome, ...(raw.decision ? { decision: raw.decision } : {}), ...(comment ? { comment } : {}), at: Date.now() }
+          if (comment) this.appendMessage(draft, 'user', `${task.id}: ${comment}`)
+        })
+      }
+      await this.finishApproval(run, task, attempt)
+    })
+  }
+  /** A cancel that won ends quietly (the decision stays as a record); a pause that won leaves the decision for the reconcile. */
+  private async finishApproval(run: Run, task: Task, attempt: number): Promise<void> {
+    try { await this.completeApproval(run, task, attempt) }
+    catch (error) { if (!(error instanceof OrchestratorError && error.code === 'TASK_INACTIVE') || task.state === 'waiting') throw error }
+  }
+  /** A recorded decision as the attempt's artifact, then its final state. Safe to repeat after a crash or a failed save. */
+  private async completeApproval(run: Run, task: Task, attempt: number): Promise<void> {
+    // Checked before and after every await, and inside the snapshot: a cancel or a pause that wins gets nothing more written.
+    const owned = (): void => {
+      requireThat(task.attempt === attempt && task.state === 'waiting', 'TASK_INACTIVE', 'The approval was cancelled meanwhile.')
+      requireThat(!this.stopped && run.state === 'active', 'TASK_INACTIVE', 'The project was paused or stopped meanwhile; the decision is kept.')
+    }
+    const answer = task.decision!
+    const label = task.approval!.decisions?.find(d => d.id === answer.decision)?.label
+    const record = { attempt, outcome: answer.outcome, ...(answer.decision ? { decision: answer.decision, label } : {}), ...(answer.comment ? { comment: answer.comment } : {}), at: answer.at }
+    owned()
+    await writeFile(join(this.taskDir(run, task), 'approval.json'), `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 })
+    owned()
+    // A folder that a failed save or a crash left for this attempt is replaced: no saved state refers to it.
+    const artifacts = await this.saveAttempt(run, task, attempt, ['approval.json'], this.taskDir(run, task), owned)
+    owned()
+    const approved = answer.outcome === 'approved'
+    const summary = approved
+      ? `Approved${answer.decision ? `: ${answer.decision}` : ''}${answer.comment ? ` (${answer.comment})` : ''}`
+      : `Rejected${answer.comment ? `: ${answer.comment}` : ''}`
+    this.commit(run, draft => {
+      const t = draft.tasks.find(x => x.id === task.id)!
+      Object.assign(t, { artifacts, state: approved ? 'succeeded' : 'failed', summary, error: approved ? null : summary })
+      this.resultMessage(draft, t, attempt)
+    })
+    const key = this.attemptKey(run, task, attempt)
+    clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
+  }
   cancel(id: string, taskId?: string): void {
     const run = this.get(id)
     const tasks = taskId ? [this.task(run, taskId)] : run.tasks
@@ -995,7 +1101,8 @@ export class OrchestratorService {
       clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
       delete task.retryAt; this.clearRetry(run, task)
     }
-    for (const task of tasks) if (['queued', 'running', 'launching', 'blocked'].includes(task.state)) {
+    // A recorded but unfinished decision stays on a cancelled approval as a record.
+    for (const task of tasks) if (['queued', 'running', 'launching', 'waiting', 'blocked'].includes(task.state)) {
       task.state = 'cancelled'
       if (task.agentId) agents.push(task.agentId)
     }

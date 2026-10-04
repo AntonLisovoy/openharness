@@ -34,7 +34,8 @@ export function decide(task: Task, tasks: readonly Task[], busy: Busy): Readines
   if (task.when === undefined) return { kind: 'launch' }
   const condition = parseCondition(task.when) as Condition // checked when the flow was compiled
   const dep = deps.find(d => d.id === condition.task)!
-  const result = evaluateCondition(condition, { state: dep.state, verdict: dep.verdict, decision: dep.decision?.decision })
+  // A decision counts only once its approval finished with it: one recorded on an approval cancelled before that is a record.
+  const result = evaluateCondition(condition, { state: dep.state, verdict: dep.verdict, decision: dep.state === 'succeeded' ? dep.decision?.decision : undefined })
   if (!result.ok) return { kind: 'fail', reason: result.reason }
   return result.value ? { kind: 'launch' } : { kind: 'skip', reason: `Skipped: ${condition.text} is false.` }
 }

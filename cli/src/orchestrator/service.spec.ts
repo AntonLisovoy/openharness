@@ -15,7 +15,7 @@ import { orchestratorRequest } from './wire.js'
 
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile) }
+  return { ...actual, rm: vi.fn(actual.rm), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename), stat: vi.fn(actual.stat), copyFile: vi.fn(actual.copyFile), writeFile: vi.fn(actual.writeFile) }
 })
 
 vi.mock('node:fs', async importOriginal => {
@@ -257,7 +257,7 @@ describe('durable orchestrator lifecycle', () => {
     service.plan(id, [task('a')])
     await vi.waitFor(() => expect(tasks()[0]).toMatchObject({ state: 'blocked', uncertain: true }))
     const run = (service as unknown as { runs: Map<string, Run> }).runs.get(id)!
-    run.tasks[0].state = 'waiting' // no service path reaches an approval yet: the model state alone
+    run.tasks[0].state = 'waiting' // Director plans cannot contain approvals (FLOW_ONLY): the model state alone
     expect(service.roleOf('agent-1')).toEqual({ role: 'director', busy: true })
   })
   it('persists transcript and reattaches without launching duplicate agents', async () => {
@@ -2767,5 +2767,278 @@ tasks:
     await vi.waitFor(() => expect(liveTask('b')).toMatchObject({ state: 'blocked', uncertain: true }))
     expect(internals().steps.size).toBe(1) // b's lingering owner
     expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'b still uses this result; cancel b first.' }))
+  })
+
+  describe('approvals', () => {
+    const approvalFlow = (extra: Record<string, unknown> = {}) => steps(
+      { id: 'build', run: 'echo built' },
+      { id: 'ok', approval: { message: 'Ship it?', decisions: [{ id: 'ship' }, { id: 'rework' }] }, depends_on: ['build'], ...extra },
+      { id: 'ship', run: 'cat inputs/ok/approval.json', depends_on: ['ok'], when: 'ok.decision == ship' },
+    )
+    const waiting = async () => { await vi.waitFor(() => expect(liveTask('ok').state).toBe('waiting')) }
+    const okSucceeded = (json: string) => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks.find(t => t.id === 'ok')?.state === 'succeeded'
+    it('waits for a decision, records it as an artifact, and branches on it', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      expect(live().messages.at(-1)!.text).toBe('Task ok is waiting for approval: Ship it? Decisions: ship, rework.')
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved' })).rejects.toMatchObject({ code: 'INVALID_DECISION' })
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'rejected', decision: 'ship' })).rejects.toMatchObject({ code: 'INVALID_DECISION' })
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship', comment: ' looks good ' })
+      await vi.waitFor(() => expect(live().state).toBe('completed'))
+      expect(liveTask('ok')).toMatchObject({ state: 'succeeded', summary: 'Approved: ship (looks good)', decision: { outcome: 'approved', decision: 'ship', comment: 'looks good' }, artifacts: [{ path: 'approval.json' }] })
+      expect(JSON.parse(liveTask('ship').summary)).toMatchObject({ attempt: 1, outcome: 'approved', decision: 'ship', label: 'ship', comment: 'looks good' })
+      expect(live().messages.some(m => m.role === 'user' && m.text === 'ok: looks good')).toBe(true)
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship', comment: 'looks good' }) // the same answer again: nothing happens
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'rejected' })).rejects.toMatchObject({ code: 'DECISION_CONFLICT' })
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship', comment: 'other' })).rejects.toMatchObject({ code: 'DECISION_CONFLICT' })
+    })
+    it('takes the same answer sent twice at once only once', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      await Promise.all([service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' }), service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })])
+      expect(readdirSync(join(live().root, 'artifacts', 'ok'))).toEqual(['attempt-1'])
+      expect(live().messages.filter(m => m.text.startsWith('Task ok attempt 1 succeeded'))).toHaveLength(1)
+    })
+    it('refuses the second of two different answers sent at once', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const results = await Promise.allSettled([service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' }), service.answer(flowId, 'ok', 1, { outcome: 'rejected' })])
+      expect(results.map(r => r.status)).toEqual(['fulfilled', 'rejected'])
+      expect((results[1] as PromiseRejectedResult).reason).toMatchObject({ code: 'DECISION_CONFLICT' })
+    })
+    it('fails the task on reject, never retries it by itself, and asks again on a manual retry', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      await service.answer(flowId, 'ok', 1, { outcome: 'rejected', comment: 'not yet' })
+      expect(liveTask('ok')).toMatchObject({ state: 'failed', error: 'Rejected: not yet' })
+      expect(liveTask('ok').retryAt).toBeUndefined()
+      await expect(service.answer(flowId, 'ok', 2, { outcome: 'rejected' })).rejects.toMatchObject({ code: 'STALE_ATTEMPT' })
+      service.retry(flowId, 'ok')
+      await vi.waitFor(() => expect(liveTask('ok')).toMatchObject({ state: 'waiting', attempt: 2 }))
+      expect(liveTask('ok').decision).toBeUndefined()
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toMatchObject({ code: 'STALE_ATTEMPT' })
+    })
+    it('changes nothing when the decision itself cannot be saved', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      diskFull()
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toThrow(/ENOSPC/)
+      vi.mocked(fs.writeFileSync).mockReset()
+      expect(liveTask('ok').decision).toBeUndefined()
+      await service.answer(flowId, 'ok', 1, { outcome: 'rejected' }) // still open: any answer may come
+      expect(liveTask('ok').state).toBe('failed')
+    })
+    it('keeps the decision when its record cannot be stored, and finishes it when the same answer comes again', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      vi.mocked(filesystem.rename).mockRejectedValueOnce(new Error('disk full'))
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toThrow('disk full')
+      expect(liveTask('ok')).toMatchObject({ state: 'waiting', decision: { decision: 'ship' } })
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'rejected' })).rejects.toMatchObject({ code: 'DECISION_CONFLICT' })
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      expect(liveTask('ok')).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'approval.json' }] })
+    })
+    it('keeps the decision and its record when the final save fails, and finishes it on the same answer', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const recover = failWrites(okSucceeded)
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toThrow(/ENOSPC/)
+      recover()
+      expect(liveTask('ok')).toMatchObject({ state: 'waiting', decision: { decision: 'ship' }, artifacts: [] })
+      expect(readdirSync(join(live().root, 'artifacts', 'ok'))).toEqual(['attempt-1']) // the folder no saved state refers to
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      expect(liveTask('ok')).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'approval.json' }] })
+      expect(readdirSync(join(live().root, 'artifacts', 'ok'))).toEqual(['attempt-1'])
+    })
+    it('keeps a recorded decision over an expired deadline', async () => {
+      await startFlow(approvalFlow({ timeout: '1h' })); await waiting()
+      const recover = failWrites(okSucceeded)
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toThrow(/ENOSPC/)
+      recover()
+      await internals().expire(live(), liveTask('ok'), 1)
+      expect(liveTask('ok')).toMatchObject({ state: 'waiting', decision: { decision: 'ship' } })
+    })
+    it('finishes a recorded decision after a crash even when its deadline passed meanwhile', async () => {
+      await startFlow(approvalFlow({ timeout: '1h' })); await waiting()
+      const recover = failWrites(okSucceeded)
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toThrow(/ENOSPC/)
+      recover()
+      const { run } = await restartOn(saved => { saved.tasks[1].deadline = Date.now() - 1000 })
+      expect(run().tasks[1]).toMatchObject({ state: 'succeeded', artifacts: [{ path: 'approval.json' }] })
+      expect(readdirSync(join(run().root, 'artifacts', 'ok'))).toEqual(['attempt-1'])
+    })
+    it('keeps waiting across a daemon restart, and takes the answer afterwards', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const { next, run } = await restartOn()
+      expect(run().tasks[1]).toMatchObject({ state: 'waiting', uncertain: false })
+      await next.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      await vi.waitFor(() => expect(run().state).toBe('completed'))
+    })
+    it('lets a cancel win over a decision that is not finished yet', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const realRename = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).rename
+      vi.mocked(filesystem.rename).mockImplementationOnce(async (from, to) => { service.cancel(flowId, 'ok'); return realRename(from, to) })
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      expect(liveTask('ok')).toMatchObject({ state: 'cancelled', decision: { decision: 'ship' } })
+    })
+    it('returns an approval interrupted while being prepared to the queue after a crash', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const { run } = await restartOn(saved => { saved.tasks[1].state = 'launching' })
+      await vi.waitFor(() => expect(run().tasks[1]).toMatchObject({ state: 'waiting', uncertain: false, attempt: 1 }))
+    })
+    it('fails an approval nobody answered in time without retrying it, and refuses a late answer', async () => {
+      await startFlow(approvalFlow({ timeout: '1h' })); await waiting()
+      await internals().expire(live(), liveTask('ok'), 1)
+      expect(liveTask('ok')).toMatchObject({ state: 'failed', error: 'No decision within 1h.' })
+      expect(liveTask('ok').retryAt).toBeUndefined()
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    })
+    it('refuses answers while the project is paused', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      live().state = 'paused'
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'rejected' })).rejects.toMatchObject({ code: 'PROJECT_INACTIVE' })
+    })
+    it('lets a waiting approval take no parallelism slot', async () => {
+      const g = gate('p')
+      await startFlow(steps({ id: 'ok', approval: 'Go?' }, { id: 'a', run: g.run }, { id: 'b', run: g.run }, { id: 'c', run: g.run }))
+      await vi.waitFor(() => expect(live().tasks.map(t => t.state)).toEqual(['waiting', 'running', 'running', 'running']))
+      g.open()
+    })
+    it('refuses a cascade while an approval downstream waits', async () => {
+      await startFlow(steps({ id: 'a', run: 'exit 1' }, { id: 'ok', approval: 'Go?', depends_on: ['a'], trigger_rule: 'all_done' }))
+      await waiting()
+      expect(() => service.retry(flowId, 'a')).toThrow(expect.objectContaining({ code: 'RESULT_IN_USE', message: 'ok still uses this result; cancel ok first.' }))
+    })
+    it('pauses when the waiting state of an approval cannot be saved, and asks once on resume', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks.find(t => t.id === 'ok')?.state === 'waiting')
+      await startFlow(approvalFlow())
+      await vi.waitFor(() => expect(live()).toMatchObject(pausedByDisk))
+      expect(liveTask('ok')).toMatchObject({ state: 'launching', error: null })
+      recover(); await service.resume(flowId)
+      await waiting()
+      expect(liveTask('ok').attempt).toBe(1)
+      expect(live().messages.filter(m => m.text.startsWith('Task ok is waiting for approval'))).toHaveLength(1)
+    })
+    it('takes a plain approval without a decision', async () => {
+      await startFlow(steps({ id: 'ok', approval: 'Go?' }))
+      await waiting()
+      expect(live().messages.at(-1)!.text).toBe('Task ok is waiting for approval: Go?')
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toMatchObject({ code: 'INVALID_DECISION' })
+      await service.answer(flowId, 'ok', 1, { outcome: 'approved', comment: '   ' }) // an empty comment is no comment
+      expect(liveTask('ok')).toMatchObject({ state: 'succeeded', summary: 'Approved', error: null })
+      expect(liveTask('ok').decision).not.toHaveProperty('comment')
+      expect(JSON.parse(readFileSync(join(live().root, 'artifacts', 'ok', 'attempt-1', 'approval.json'), 'utf8'))).toEqual({ attempt: 1, outcome: 'approved', at: liveTask('ok').decision!.at })
+      await expect(service.answer(flowId, 'build', 1, { outcome: 'rejected' })).rejects.toMatchObject({ code: 'TASK_NOT_FOUND' })
+    })
+    it('refuses an answer for a task that is not an approval', async () => {
+      await startFlow(steps({ id: 'a', run: 'true' }))
+      await expect(service.answer(flowId, 'a', 1, { outcome: 'rejected' })).rejects.toMatchObject({ code: 'TASK_INACTIVE' })
+    })
+    it('leaves a recorded decision alone in a reconcile once a cancel won while it waited for the attempt', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const recover = failWrites(okSucceeded)
+      await expect(service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })).rejects.toThrow(/ENOSPC/)
+      recover()
+      let release!: () => void
+      const held = internals().exclusive(live(), liveTask('ok'), 1, () => new Promise<void>(r => { release = r }))
+      const waits = vi.spyOn(internals().finishing, 'get')
+      const resuming = service.resume(flowId)
+      await vi.waitFor(() => expect(waits).toHaveBeenCalledWith(`${flowId}/ok/1`)) // the reconcile waits for the attempt
+      service.cancel(flowId, 'ok')
+      release(); await held; await resuming
+      expect(liveTask('ok')).toMatchObject({ state: 'cancelled', decision: { decision: 'ship' }, artifacts: [] })
+      expect(live().messages.some(m => m.text.startsWith('Task ok attempt 1 succeeded'))).toBe(false)
+    })
+    it('fails an approval whose deadline passed while the daemon was down, without retrying it', async () => {
+      await startFlow(approvalFlow({ timeout: '1h' })); await waiting()
+      const { run } = await restartOn(saved => { saved.tasks[1].deadline = Date.now() - 1000 })
+      expect(run().tasks[1]).toMatchObject({ state: 'failed', error: 'No decision within 1h.' })
+      expect(run().tasks[1].retryAt).toBeUndefined()
+    })
+    it('keeps waiting after a restart with its deadline armed again', async () => {
+      await startFlow(approvalFlow({ timeout: '1h' })); await waiting()
+      const { next, run } = await restartOn()
+      expect(run().tasks[1]).toMatchObject({ state: 'waiting', uncertain: false })
+      expect([...(next as unknown as { deadlines: Map<string, unknown> }).deadlines.keys()]).toEqual([`${flowId}/ok/1`])
+    })
+    /** Holds the next approval.json write until the test lets it go on or fail. */
+    const holdWrite = async (): Promise<() => Promise<{ go(): void; fail(error: Error): void }>> => {
+      const realWrite = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).writeFile
+      let held: { go(): void; fail(error: Error): void } | undefined
+      vi.mocked(filesystem.writeFile).mockImplementationOnce(async (...args: Parameters<typeof realWrite>) => {
+        await new Promise<void>((resolve, reject) => { held = { go: resolve, fail: reject } })
+        return realWrite(...args)
+      })
+      return () => vi.waitFor(() => { expect(held).toBeDefined(); return held! })
+    }
+    /** Two approvals; `go` has a recorded decision whose final save failed, so the next reconcile finishes it. */
+    const decidedGo = async (): Promise<void> => {
+      await startFlow(steps({ id: 'go', approval: 'Go?' }, { id: 'ok', approval: { message: 'Ship it?', decisions: [{ id: 'ship' }] } }))
+      await vi.waitFor(() => expect(live().tasks.map(t => t.state)).toEqual(['waiting', 'waiting']))
+      const recover = failWrites(json => json.startsWith('{"version"') && (JSON.parse(json) as Run).tasks.find(t => t.id === 'go')?.state === 'succeeded')
+      await expect(service.answer(flowId, 'go', 1, { outcome: 'approved' })).rejects.toThrow(/ENOSPC/)
+      recover()
+    }
+    it('takes an answer only once the reconcile of its run ended', async () => {
+      await decidedGo()
+      const held = await holdWrite()
+      const resuming = service.resume(flowId), write = await held()
+      const answering = service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      expect(liveTask('ok').decision).toBeUndefined() // it waits for the reconcile
+      write.go(); await resuming; await answering
+      expect(live().tasks.map(t => t.state)).toEqual(['succeeded', 'succeeded'])
+    })
+    it('refuses an answer that waited for a reconcile which paused the run again', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await decidedGo()
+      const held = await holdWrite()
+      const resuming = service.resume(flowId), write = await held()
+      const answering = service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      write.fail(Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' }))
+      await expect(resuming).rejects.toThrow(/EIO/)
+      await expect(answering).rejects.toMatchObject({ code: 'PROJECT_INACTIVE' })
+      expect(live().state).toBe('paused')
+      expect(liveTask('ok').decision).toBeUndefined()
+    })
+    it.each(['cancelled', 'stopped'])('never pauses a run that was %s while a reconcile stored a decision', async how => {
+      const reported = vi.spyOn(console, 'error').mockImplementation(() => {})
+      await decidedGo()
+      const held = await holdWrite()
+      const resuming = service.resume(flowId), write = await held()
+      if (how === 'cancelled') service.cancel(flowId); else service.stop()
+      write.fail(Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' }))
+      await expect(resuming).rejects.toThrow(/EIO/)
+      expect(live().state).toBe(how === 'cancelled' ? 'cancelled' : 'active')
+      expect(onDisk().state).toBe(how === 'cancelled' ? 'cancelled' : 'active')
+      expect(reported).toHaveBeenCalledWith(`[orchestrator] ${flowId}: reconcile failed: EIO: i/o error, write`)
+    })
+    it('keeps a decision and the pause reason when a pause wins while a reconcile stores it', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await decidedGo()
+      const held = await holdWrite()
+      const resuming = service.resume(flowId), write = await held()
+      ;(service as unknown as { pause(run: Run, error: unknown): void }).pause(live(), new Error('elsewhere'))
+      write.go(); await resuming
+      expect(live()).toMatchObject({ state: 'paused', error: expect.stringContaining('elsewhere') })
+      expect(liveTask('go')).toMatchObject({ state: 'waiting', decision: { outcome: 'approved' }, artifacts: [] })
+    })
+    it('tells the person that a pause, not a cancel, interrupted their answer', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      await startFlow(approvalFlow()); await waiting()
+      const held = await holdWrite()
+      const answering = service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      const write = await held()
+      ;(service as unknown as { pause(run: Run, error: unknown): void }).pause(live(), new Error('elsewhere'))
+      write.go()
+      await expect(answering).rejects.toMatchObject({ code: 'TASK_INACTIVE', message: 'The project was paused or stopped meanwhile; the decision is kept.' })
+      expect(liveTask('ok')).toMatchObject({ state: 'waiting', decision: { decision: 'ship' } })
+    })
+    it('writes and publishes nothing more for an answer once a cancel wins during its record', async () => {
+      await startFlow(approvalFlow()); await waiting()
+      const realWrite = (await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).writeFile
+      let release: (() => void) | undefined
+      vi.mocked(filesystem.writeFile).mockImplementationOnce(async (...args: Parameters<typeof realWrite>) => { await new Promise<void>(r => { release = r }); return realWrite(...args) })
+      const answering = service.answer(flowId, 'ok', 1, { outcome: 'approved', decision: 'ship' })
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      service.cancel(flowId, 'ok')
+      release!(); await answering
+      expect(liveTask('ok')).toMatchObject({ state: 'cancelled', decision: { decision: 'ship' }, artifacts: [] })
+      expect(existsSync(join(live().root, 'artifacts', 'ok'))).toBe(false)
+      expect(live().messages.some(m => m.text.startsWith('Task ok attempt 1 succeeded'))).toBe(false)
+    })
   })
 })

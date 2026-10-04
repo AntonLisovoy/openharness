@@ -45,6 +45,8 @@ describe('graph', () => {
     expect(w('a.state == succeeded', t('a', 'failed'))).toEqual({ kind: 'skip', reason: 'Skipped: a.state == succeeded is false.' })
     expect(w('a.verdict.errors == 0', t('a', 'succeeded'))).toEqual({ kind: 'fail', reason: 'a wrote no verdict; the condition a.verdict.errors == 0 cannot be evaluated.' })
     expect(w('a.decision == ship', t('a', 'succeeded', { decision: { outcome: 'approved', decision: 'ship', at: 1 } }))).toEqual({ kind: 'launch' })
+    // a decision recorded on an approval that was cancelled before it finished is only a record: it decides nothing
+    expect(w('a.decision == ship', t('a', 'cancelled', { decision: { outcome: 'approved', decision: 'ship', at: 1 } }))).toEqual({ kind: 'fail', reason: 'a has no decision; the condition a.decision == ship cannot be evaluated.' })
     // a skipped dependency under all_success skips before the condition is looked at
     expect(decide(t('w', 'queued', { dependsOn: ['a'], when: 'a.state == succeeded' }), [t('a', 'skipped')], idle)).toMatchObject({ kind: 'skip', reason: 'Skipped: upstream a was skipped.' })
   })
