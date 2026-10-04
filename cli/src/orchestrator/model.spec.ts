@@ -54,8 +54,8 @@ const approvalTask = {
 const cancelTask = { id: 'stop', title: 'stop', harness: 'cancel', prompt: 'Rework', dependsOn: ['ok'], cancel: 'Rework', when: 'ok.decision == ship',
   state: 'skipped', attempt: 1, agentId: null, cwd: '', summary: 'Skipped: ok.decision == ship is false', error: null, uncertain: false, artifacts: [], inputs: {} }
 
-describe('phase-2 model fields', () => {
-  it('round-trips every phase-2 field before and after execution', () => {
+describe('model fields for conditions, approvals, loops and retries', () => {
+  it('round-trips every optional field before and after execution', () => {
     const run = { ...legacyRun, directorId: null, flow: { name: 'x', path: '/p/x.yaml', sha256: 'e'.repeat(64), inputs: {}, warnings: [], source: 'flow.yaml' }, tasks: [filledTask, approvalTask, cancelTask] }
     expect(JSON.parse(JSON.stringify(Run.parse(run)))).toEqual(run)
     const queued = { ...filledTask, state: 'queued', attempt: 3, agentId: null, cwd: '', artifacts: [], inputs: {} }

@@ -421,7 +421,7 @@ describe('durable orchestrator lifecycle', () => {
   })
   it('does not start cancelled work while its folder is being prepared', async () => {
     await start(); await active(); service.plan(id, [task('a')]); service.cancel(id, 'a')
-    await new Promise(resolve => setTimeout(resolve, 30))
+    await vi.waitFor(() => expect((service as unknown as { launching: Set<string> }).launching.size).toBe(0))
     expect(tasks()[0].state).toBe('cancelled'); expect(launches).toHaveLength(1)
   })
   it('handles a removed harness without mistaking it for an uncertain spawn', async () => {
@@ -515,7 +515,7 @@ describe('durable orchestrator lifecycle', () => {
     deps.create = () => new Promise((_resolve, r) => { reject = r })
     service.plan(id, [task('a')]); await vi.waitFor(() => expect(reject).toBeTypeOf('function'))
     service.cancel(id, 'a'); reject(new Error('Late spawn refusal'))
-    await new Promise(resolve => setTimeout(resolve, 20))
+    await vi.waitFor(() => expect((service as unknown as { launching: Set<string> }).launching.size).toBe(0))
     expect(tasks()[0]).toMatchObject({ state: 'cancelled', uncertain: false })
   })
   it('does not downgrade a very fast worker result while creation is returning', async () => {
@@ -831,7 +831,7 @@ tasks:
     await startFlow(`spec: 1\nname: demo\ntasks: [{ id: a, run: 'true' }]\n`)
     service.stop()
     release()
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await vi.waitFor(() => expect(internals().launching.size).toBe(0))
     expect(spawned).not.toHaveBeenCalled()
     expect(launches).toHaveLength(0)
   })
@@ -847,7 +847,7 @@ tasks:
     await inRename
     service.stop()
     release()
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await vi.waitFor(() => expect(internals().finishing.size).toBe(0))
     expect(state('a').state).not.toBe('succeeded')
   })
   it('keeps a cancelled step cancelled when the daemon stops right after', async () => {
@@ -1330,7 +1330,7 @@ tasks:
     writeFileSync(file, JSON.stringify(saved))
     service = new OrchestratorService(deps)
     expect(service.roleOf(a.agentId!)).toEqual({ role: 'worker' }) // the daemon asks this while it is still starting
-    await new Promise(resolve => setTimeout(resolve, 50))
+    // loading is synchronous: nothing was scheduled that could still arm a deadline
     expect(internals().deadlines.size).toBe(0)
     expect(state('a').state).toBe('running')
     expect(cancelled).toEqual([])
@@ -1361,8 +1361,8 @@ tasks:
     await gone.exited
     const { recovered, step } = await afterCrash(gone.pid)
     expect(step()).toMatchObject({ state: 'failed', uncertain: false, error: `Interrupted by a daemon restart (pid ${gone.pid} had already exited). Retry to run it again.` })
-    await new Promise(resolve => setTimeout(resolve, 50))
-    expect(step()).toMatchObject({ state: 'failed', attempt: 1 }) // never retried automatically
+    expect((recovered as unknown as { retryDue: Set<string> }).retryDue.size).toBe(0) // never retried automatically
+    expect(step()).toMatchObject({ state: 'failed', attempt: 1 })
     recovered.retry(flowId, 's')
     await vi.waitFor(() => expect(step()).toMatchObject({ state: 'running', attempt: 2 }))
   })

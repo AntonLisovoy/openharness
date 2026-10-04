@@ -31,7 +31,13 @@ const holdLogs = (): (() => void) => {
   return () => { logGate.hold = null; release() }
 }
 
-const sh: StepSpawner = (script, opts) => spawn('/bin/sh', ['-c', script], { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+/** The detached shells `sh` spawned: each is its own process-group leader. */
+const leaders: ChildProcess[] = []
+const sh: StepSpawner = (script, opts) => {
+  const child = spawn('/bin/sh', ['-c', script], { cwd: opts.cwd, env: { ...process.env, ...opts.env }, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+  leaders.push(child)
+  return child
+}
 const fakeChild = ({ pid }: { pid?: number }) => Object.assign(new EventEmitter(), { pid, stdout: new PassThrough(), stderr: new PassThrough() })
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
 
@@ -39,7 +45,7 @@ describe('shell steps', () => {
   let cwd: string
   beforeEach(() => { cwd = mkdtempSync(join(tmpdir(), 'steps-')) })
   const pids: number[] = []
-  afterEach(() => { logGate.hold = null; for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
+  afterEach(() => { logGate.hold = null; for (const child of leaders) { if (child.pid && child.exitCode === null && child.signalCode === null) for (const target of [-child.pid, child.pid]) { try { process.kill(target, 'SIGKILL') } catch { /* gone */ } } } for (const pid of pids) { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } } pids.length = 0; leaders.length = 0; vi.restoreAllMocks(); rmSync(cwd, { recursive: true, force: true }) })
 
   it('writes its logs where it is told to', async () => {
     const logs = join(cwd, 'logs'); mkdirSync(logs)
@@ -88,7 +94,7 @@ describe('shell steps', () => {
     step.stop() // a graceful stop afterwards changes nothing
     expect(await step.done).toMatchObject({ signal: 'SIGKILL', error: null })
   })
-  it('clears its SIGKILL escalation once the group is gone, and ignores stop afterwards', async () => {
+  it('is disarmed once its group is gone, so a later stop sends nothing', async () => {
     const killed = vi.spyOn(process, 'kill')
     const step = startStep('sleep 5', { cwd, env: {}, spawn: sh, graceMs: 60_000 }) // escalation far in the future
     expect(step.armed()).toBe(true)
