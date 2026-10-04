@@ -58,6 +58,17 @@ async function groupGone(gone: () => boolean, until: number): Promise<boolean> {
   }
 }
 
+/**
+ * A recorded process (one this daemon holds no handle for) counts as stopped only when its leader and its whole group
+ * are gone: both probes answer ESRCH. Any other answer, EPERM included, means it may still run.
+ */
+export function processGone(pid: number): boolean {
+  for (const target of [pid, -pid]) {
+    try { process.kill(target, 0); return false } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false }
+  }
+  return true
+}
+
 /** Run a flow's shell step in its task folder and its own process group, output streamed to files. */
 export function startStep(script: string, opts: { cwd: string; env: Record<string, string>; spawn?: StepSpawner; graceMs?: number; logs?: { stdout: string; stderr: string } }): StepHandle {
   const spawner = opts.spawn ?? ((s, o) => spawnDshCommand(s, o))

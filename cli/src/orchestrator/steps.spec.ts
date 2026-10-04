@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } fr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as shell from '../dsh/shell.js'
-import { STEP_LOG_LIMIT, startStep, stepFailure, type StepSpawner } from './steps.js'
+import { STEP_LOG_LIMIT, processGone, startStep, stepFailure, type StepSpawner } from './steps.js'
 
 /** While `hold` is set, every log file opened from then on finishes closing only once it settles. */
 const logGate = vi.hoisted(() => ({ hold: null as Promise<void> | null }))
@@ -281,5 +281,20 @@ describe('shell steps', () => {
     const spy = vi.spyOn(shell, 'spawnDshCommand').mockImplementation((script, opts) => sh(script, { cwd: opts.cwd, env: opts.env ?? {} }))
     await startStep('true', { cwd, env: { A: '1' } }).done
     expect(spy).toHaveBeenCalledWith('true', { cwd, env: { A: '1' } })
+  })
+  it('counts a recorded process as gone only when its leader and its group are gone', () => {
+    const real = process.kill.bind(process)
+    const answers = new Map<number, string | null>([[999_999, 'ESRCH'], [-999_999, null]])
+    vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string | number) => {
+      if (!answers.has(target)) return real(target, signal as NodeJS.Signals)
+      const code = answers.get(target)
+      if (code) throw Object.assign(new Error(code), { code })
+      return true
+    }) as typeof process.kill)
+    expect(processGone(999_999)).toBe(false) // the leader exited, a process of its group still runs
+    answers.set(-999_999, 'ESRCH'); expect(processGone(999_999)).toBe(true)
+    answers.set(999_999, 'EPERM'); expect(processGone(999_999)).toBe(false) // a probe we may not make counts as alive
+    answers.set(999_999, null); expect(processGone(999_999)).toBe(false)
+    answers.set(999_999, 'ESRCH'); answers.set(-999_999, 'EPERM'); expect(processGone(999_999)).toBe(false)
   })
 })
