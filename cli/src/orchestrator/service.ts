@@ -68,13 +68,16 @@ export const WORKER_ACTIVITY: ReadonlySet<string> = new Set(['turn_started', 'tu
  * the group.
  */
 type StepEntry = { run: Run; task: Task; attempt: number; handle: StepHandle; uncertain?: string; lingering?: true }
-/** A loop check process this daemon owns, number `number` of its attempt. `lingering`: as for a step. */
-type CheckOwner = { run: Run; task: Task; attempt: number; number: number; handle: StepHandle; lingering?: true }
+/** A loop check process this daemon owns, number `number` of its attempt. `uncertain` and `lingering`: as for a step. */
+type CheckOwner = { run: Run; task: Task; attempt: number; number: number; handle: StepHandle; uncertain?: string; lingering?: true }
 /**
  * How a check result is handled: `replay` when a reconcile applies a kept one; `pid`: the process the check ran as, named
  * when its group could not be confirmed gone.
  */
 interface CheckCall { replay?: boolean; pid?: number }
+
+/** The error of an attempt whose loop check may still run. */
+const checkUncertain = (pid: number | undefined): string => `A loop check may still be running (pid ${pid ?? 'unknown'}). Make sure it stopped before retrying.`
 
 /** A shell step's logs, in the task folder. */
 const STEP_LOGS = ['stdout.log', 'stderr.log']
@@ -161,6 +164,20 @@ export class OrchestratorService {
           task.state = 'blocked'
           task.uncertain = true
           task.error = `The daemon restarted while this step was running (pid ${task.pid ?? 'unknown'}). Make sure it stopped before retrying.`
+        }
+        // A loop check the daemon was running: run again (with the same number) only when its whole group is known to be
+        // gone. An attempt that already ended may still carry a check started while it was being settled: one that may
+        // still run makes it uncertain too (a cancelled task stays cancelled), and no retry replaces it until it is gone.
+        for (const task of run.tasks) if (!task.uncertain && task.loopState?.phase === 'checking') {
+          const check = task.loopState.check, pid = check?.pid
+          if (task.state !== 'running' && (check === undefined || !['failed', 'cancelled'].includes(task.state))) continue
+          if (pid !== undefined && processGone(pid)) {
+            if (task.state === 'running') { task.loopState.phase = 'check-requested'; delete task.loopState.check }
+            continue
+          }
+          if (task.state !== 'cancelled') task.state = 'blocked'
+          task.uncertain = true; delete task.retryAt
+          task.error = checkUncertain(pid)
         }
         // A failed or cancelled step that was still stopping when the daemon died (a timeout or a cancel in its grace
         // period): no retry, automatic or by hand, replaces it until its group is gone. A cancelled one stays cancelled.
@@ -296,9 +313,10 @@ export class OrchestratorService {
         // waits and the lifting of the barrier are one synchronous step, so nothing can slip in between.
         while (!this.stopped && run.state === 'active' && !this.quiet(run)) await this.settleRest(run)
         this.reconciling.delete(run.id)
-        // The barrier is down: a ready cancel step goes first; otherwise arm what came due later, deliver what waited,
-        // and move the run once.
-        if (!this.stopped && run.state === 'active' && !this.cancelReady(run)) {
+        // The barrier is down: a ready cancel step goes first (after the transitions that start nothing); otherwise arm what
+        // came due later, deliver what waited, and move the run once.
+        if (!this.stopped && run.state === 'active' && !this.advance(run)) {
+          this.startRequested(run) // also a check requested during the last phase
           this.restoreDeadlines(run)
           for (const task of run.tasks) this.armIdle(run, task) // from now: idle time before a pause or a restart does not count
           this.dispatchPending(run); this.pump(run)
@@ -344,11 +362,33 @@ export class OrchestratorService {
     }
     // 4. Every deadline that passed is enforced now, through the same path as its timer (the reconcile's own replay).
     await this.expireOverdue(run) // checks the run again before each task
+    // 5. A cancel step that the steps above made ready stops the run before anything starts (after the transitions that
+    // start nothing); otherwise a requested check starts now (a task whose deadline passed was failed in step 4).
+    if (live() && this.advance(run)) return
+    this.startRequested(run)
   }
-  /** Nothing waits for the barrier: no kept result of this run. Synchronous. */
-  private quiet(run: Run): boolean { return ![...this.pending.values()].some(entry => entry.run === run) }
+  /**
+   * Starts the check of every running loop task that requested one and owns none. Not for an attempt that is about to
+   * end: one whose deadline passed (its timer, armed when the barrier lifts, expires it) or whose feedback was lost.
+   */
+  private startRequested(run: Run): void {
+    for (const task of run.tasks) {
+      if (this.stopped || run.state !== 'active') return // a cancel, or a check whose pid could not be saved, stops the scan
+      if (task.state !== 'running' || task.loopState?.phase !== 'check-requested' || this.checks.has(this.attemptKey(run, task))) continue
+      if ((task.deadline !== undefined && task.deadline <= Date.now()) || this.feedbackFailed(run, task)) continue
+      this.startCheck(run, task)
+    }
+  }
+  /** Nothing waits for the barrier: no kept result of this run, and no running loop attempt whose feedback was lost. Synchronous. */
+  private quiet(run: Run): boolean {
+    return ![...this.pending.values()].some(entry => entry.run === run) && !run.tasks.some(task => this.feedbackFailed(run, task))
+  }
   /** One more pass over what arrived during the reconcile. */
-  private async settleRest(run: Run): Promise<void> { await this.drain(run) }
+  private async settleRest(run: Run): Promise<void> { await this.drain(run); await this.lostFeedback(run) }
+  /** A running loop attempt whose last feedback has a failed receipt. */
+  private feedbackFailed(run: Run, task: Task): boolean {
+    return task.state === 'running' && !!task.loopState?.feedbackId && run.messages.find(m => m.id === task.loopState!.feedbackId)?.delivery === 'failed'
+  }
   /** A launch that started nothing goes back to the queue; its half-prepared folder is removed when it launches again. */
   private unlaunch(run: Run, task: Task): void {
     this.commit(run, draft => Object.assign(draft.tasks.find(t => t.id === task.id)!, { state: 'queued', cwd: '', inputs: {} }))
@@ -1139,10 +1179,11 @@ export class OrchestratorService {
     else requireThat(!step, 'TASK_STOPPING', 'The previous attempt is still stopping; retry when it has ended.')
     // A lingering check started: its process has a pid.
     if (check?.lingering) requireThat(processGone(check.handle.pid!), 'RETRY_UNSAFE', `This loop check may still be running (pid ${check.handle.pid}). Stop that process, then retry.`)
-    // A step left running by a crashed daemon is safe to replace once its process is gone.
-    const orphan = task.uncertain && task.run !== undefined
-    requireThat(released || (orphan && task.pid !== undefined && processGone(task.pid)) || (!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state)), 'RETRY_UNSAFE', orphan
-      ? `This step may still be running from before the daemon restart (pid ${task.pid ?? 'unknown'}). Stop that process, then retry.`
+    // A step or a loop check left running by a crashed daemon is safe to replace once its process is gone.
+    const orphanPid = task.run !== undefined ? task.pid : task.loopState?.check?.pid
+    const orphan = task.uncertain && (task.run !== undefined || task.loopState?.check !== undefined)
+    requireThat(released || (orphan && orphanPid !== undefined && processGone(orphanPid)) || (!task.uncertain && ['failed', 'blocked', 'cancelled'].includes(task.state)), 'RETRY_UNSAFE', orphan
+      ? `This ${task.run !== undefined ? 'step' : 'loop check'} may still be running from before the daemon restart (pid ${orphanPid ?? 'unknown'}). Stop that process, then retry.`
       : 'Only a known failed or stopped task can be retried. Inspect uncertain launches before creating replacement work.')
     if (run.flow) {
       // A cascade: the target and everything that used its result get a new attempt, in one save.
@@ -1360,7 +1401,31 @@ export class OrchestratorService {
       message.delivery = event.state === 'rejected' ? 'failed' : event.state
       message.deliveryReason = event.reason
       this.changed(run)
+      const task = message.delivery === 'failed' ? run.tasks.find(t => t.state === 'running' && t.loopState?.feedbackId === message.id) : undefined
+      if (task) this.background(run, this.feedbackLost(run, task, task.attempt))
       return
+    }
+  }
+  /**
+   * Loop feedback the worker never got: the attempt cannot go on, so it ends, and what it still owns stops (with the
+   * transition, through `then`). The receipt is saved, so a paused run or a running reconcile leaves it to the next scan.
+   */
+  private async feedbackLost(run: Run, task: Task, attempt: number, replay = false): Promise<void> {
+    if (run.state !== 'active' || (this.reconciling.has(run.id) && !replay)) return
+    const agentId = task.agentId!, key = this.attemptKey(run, task, attempt)
+    const log = `.harness/loop/${task.loopState!.completed}.stderr.log`
+    // The check is looked up when it is stopped: a turn that ended while the failure was being saved may have started one.
+    // No later check result of the attempt replaces the lost feedback first (see finishCheck), so it still ends the attempt.
+    await this.settleAuto(run, task, attempt, { failed: `The check feedback could not be delivered. Log: ${log}` }, {
+      source: 'feedback', replay,
+      then: () => { this.checks.get(key)?.handle.stop(); this.deps.cancel(agentId) },
+    })
+  }
+  /** Ends every running loop attempt whose feedback receipt failed (while paused, before a restart, or during a reconcile). */
+  private async lostFeedback(run: Run): Promise<void> {
+    for (const task of run.tasks) {
+      if (this.stopped || run.state !== 'active') return
+      if (this.feedbackFailed(run, task)) await this.feedbackLost(run, task, task.attempt, true)
     }
   }
   private background(run: Run, operation: Promise<void>): void {
@@ -1418,10 +1483,13 @@ export class OrchestratorService {
     try {
       // Counted also while the run is paused: a turn that started then and ends after the resume is a new turn.
       if (frame.type === 'turn_started') { this.commit(run, draft => { draft.tasks.find(t => t.id === task.id)!.loopState!.turn++ }); return }
-      if (run.state !== 'active' || frame.type !== 'turn_ended' || (frame.payload as { aborted?: unknown } | undefined)?.aborted === true) return
+      if (frame.type !== 'turn_ended' || (frame.payload as { aborted?: unknown } | undefined)?.aborted === true) return
       const state = task.loopState!
       if (state.phase !== 'working') return // a check is requested or running
       if (state.eligibleAfter !== undefined && state.turn <= state.eligibleAfter) return // the end of a turn that was already checked
+      // While the run is paused (a running task's run is active or paused) or reconciled, the check is only requested: the
+      // reconcile starts it once every deadline that passed was enforced.
+      if (run.state !== 'active' || this.reconciling.has(run.id)) { this.commit(run, draft => { draft.tasks.find(t => t.id === task.id)!.loopState!.phase = 'check-requested' }); return }
       this.startCheck(run, task)
     } catch (error) { this.pause(run, error) }
   }
@@ -1451,6 +1519,8 @@ export class OrchestratorService {
       const observedAt = Date.now()
       // A check the daemon stopped because its pid could not be saved did not check anything, however it exited.
       const result: CheckResult = unsaved && raw.kind !== 'uncertain' ? { kind: 'error', error: `its process id could not be saved (${unsaved})` } : raw
+      // Recorded before the fence waits for the attempt: a daemon stop meanwhile still saves the uncertainty.
+      if (result.kind === 'uncertain') entry.uncertain = checkUncertain(check.handle.pid)
       try { await this.finishCheck(run, task, attempt, number, result, observedAt, { pid: check.handle.pid }) }
       catch (error) { this.pause(run, error) }
       finally {
@@ -1471,10 +1541,12 @@ export class OrchestratorService {
     const key = this.attemptKey(run, task, attempt), agentId = task.agentId! // a loop task that ran a check has its agent
     const cancelWorker = (): void => { this.deps.cancel(agentId) }
     if (result.kind === 'uncertain') {
-      await this.fenceUncertain(run, task, attempt, `A loop check may still be running (pid ${pid}). Make sure it stopped before retrying.`, 'check', observedAt, { replay, then: cancelWorker })
+      await this.fenceUncertain(run, task, attempt, checkUncertain(pid), 'check', observedAt, { replay, then: cancelWorker })
       return
     }
-    const guard = (): boolean => task.attempt === attempt && task.loopState?.phase === 'checking' && task.loopState.completed + 1 === number
+    // A lost feedback of this attempt is resolved first: the result never replaces it or ends the attempt in its place
+    // (the receipt ends the attempt, through delivery or the reconcile's scan).
+    const guard = (): boolean => task.attempt === attempt && task.loopState?.phase === 'checking' && task.loopState.completed + 1 === number && !this.feedbackFailed(run, task)
     const current = (): boolean => !this.stopped && task.state === 'running' && guard()
     const keep = (): void => { if (!this.pending.has(key)) this.pending.set(key, { run, task, attempt, outcome: { failed: '' }, source: 'check', at: observedAt, check: { number, result } }) }
     /** True when the result must wait for the next reconcile: it is kept. */
@@ -1549,12 +1621,12 @@ export class OrchestratorService {
     for (const timer of [...this.retryTimers.values(), ...this.idleTimers.values()]) clearTimeout(timer)
     this.deadlines.clear(); this.retryTimers.clear(); this.idleTimers.clear()
     const unsaved = new Set([...this.dirty.keys()].map(id => this.runs.get(id)!))
-    // Evidence that a group may still run (a kept uncertainty, or a step whose group outlived it and is not fenced yet) is
-    // saved as an uncertainty: the next daemon must not replace the attempt until the group is gone. A running or failed
-    // task becomes blocked, a cancelled one stays cancelled; its pid stays.
+    // Evidence that a group may still run (a kept uncertainty, or a step or check whose group outlived it and is not fenced
+    // yet) is saved as an uncertainty: the next daemon must not replace the attempt until the group is gone. A running or
+    // failed task becomes blocked, a cancelled one stays cancelled; its pid stays.
     const evidence = [
       ...[...this.pending.values(), ...this.replaying].flatMap(e => 'uncertain' in e.outcome ? [{ ...e, uncertain: e.outcome.uncertain }] : []),
-      ...[...this.steps.values()].flatMap(e => e.uncertain === undefined ? [] : [{ ...e, uncertain: e.uncertain }]),
+      ...[...this.steps.values(), ...this.checks.values()].flatMap(e => e.uncertain === undefined ? [] : [{ ...e, uncertain: e.uncertain }]),
     ]
     for (const { run, task, attempt, uncertain } of evidence) {
       if (task.attempt !== attempt || !['running', 'cancelled', 'failed'].includes(task.state)) continue

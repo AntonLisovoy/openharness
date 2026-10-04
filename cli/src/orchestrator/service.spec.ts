@@ -3248,6 +3248,21 @@ tasks:
       expect(live()).toMatchObject({ state: 'cancelled', error: 'Cancelled by step stop: nothing to do' })
       expect(onDisk().error).toBe('Cancelled by step stop: nothing to do')
     })
+    it('runs a cancel step made ready by a reconcile before a requested loop check starts', async () => {
+      const spawned = vi.fn(sh); deps.spawnStep = spawned
+      await startFlow(steps(
+        { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+        { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+        { id: 'stop', cancel: 'x is over', depends_on: ['x'], trigger_rule: 'all_done' },
+      ))
+      await vi.waitFor(() => { expect(liveTask('x').state).toBe('running'); expect(liveTask('fix').state).toBe('running') })
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1 // came due while paused
+      liveTask('fix').loopState!.phase = 'check-requested'
+      await service.resume(flowId)
+      expect(live()).toMatchObject({ state: 'cancelled', error: 'Cancelled by step stop: x is over' })
+      expect(spawned).not.toHaveBeenCalled()
+      expect(internals().checks.size).toBe(0)
+    })
     it('never moves a cancelled project to paused after a late background error', async () => {
       vi.spyOn(console, 'error').mockImplementation(() => {})
       await startFlow(steps({ id: 'a', harness: 'test/cad', prompt: 'work' }))
@@ -3493,6 +3508,18 @@ tasks:
       await service.resume(flowId)
       turn('turn_ended')
       expect(checked().phase).toBe('checking')
+    })
+    it('requests the check for a turn that ends while the run is paused, and runs it on resume', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      live().state = 'paused'
+      turn('turn_ended')
+      expect(checked().phase).toBe('check-requested')
+      expect(onDisk().tasks[0].loopState!.phase).toBe('check-requested')
+      expect(internals().checks.size).toBe(0)
+      await service.resume(flowId)
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1 }))
+      expect(existsSync(join(liveTask('fix').cwd, '.harness/loop/1.stderr.log'))).toBe(true)
     })
     it.each([
       ['the attempt timeout', false],
@@ -3764,6 +3791,343 @@ tasks:
       expect(liveTask('fix').state).toBe('running') // the timeout itself waits for the resume
       recover(); await service.resume(flowId)
       expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+    })
+
+    it('treats a check that may still run after a crash as uncertain, and allows a retry once it is gone', async () => {
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().check?.pid).toEqual(expect.any(Number)))
+      const left = orphan()
+      const { next, run } = await restartOn(saved => { saved.tasks[0].loopState!.check!.pid = left.pid })
+      expect(run().tasks[0]).toMatchObject({ state: 'blocked', uncertain: true, error: `A loop check may still be running (pid ${left.pid}). Make sure it stopped before retrying.` })
+      expect(() => next.retry(flowId, 'fix')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE' }))
+      process.kill(-left.pid, 'SIGKILL')
+      await vi.waitFor(() => expect(processGone(left.pid)).toBe(true))
+      next.retry(flowId, 'fix')
+      expect(run().tasks[0].attempt).toBe(2)
+    })
+    it('runs a check again after a restart when its process is gone, with the same number', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const ended = await exitedPid('true', []); await ended.exited
+      const { run } = await restartOn(saved => { saved.tasks[0].loopState = { phase: 'checking', completed: 0, turn: 0, check: { pid: ended.pid, startedAt: Date.now() } } })
+      await vi.waitFor(() => expect(run().tasks[0].loopState).toMatchObject({ phase: 'working', completed: 1 }))
+      expect(existsSync(join(run().tasks[0].cwd, '.harness/loop/1.stderr.log'))).toBe(true)
+    })
+    it('treats a check whose pid was never saved as uncertain after a crash', async () => {
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const { run } = await restartOn(saved => { saved.tasks[0].loopState = { phase: 'checking', completed: 0, turn: 0, check: { startedAt: Date.now() } } })
+      expect(run().tasks[0]).toMatchObject({ state: 'blocked', uncertain: true, error: 'A loop check may still be running (pid unknown). Make sure it stopped before retrying.' })
+    })
+    it('enforces an expired deadline before a recovered check starts', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const { next, run } = await restartOn(saved => { saved.tasks[0].loopState = { phase: 'check-requested', completed: 0, turn: 0 }; saved.tasks[0].deadline = Date.now() - 1 })
+      expect(run().tasks[0]).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' })
+      expect((next as unknown as { checks: Map<string, unknown> }).checks.size).toBe(0)
+      expect(existsSync(join(run().tasks[0].cwd, '.harness/loop/1.stdout.log'))).toBe(false)
+    })
+    it('defers a check requested during a reconcile until the deadlines were enforced', async () => {
+      await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const hold = holdVerdictRead()
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      service.ingest({ type: 'turn_ended', agentId: liveTask('fix').agentId, payload: {} })
+      expect(checked().phase).toBe('check-requested')
+      expect(internals().checks.size).toBe(0)
+      hold.release(); await resumed
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1 }))
+    })
+    it('starts a check requested during the last phase of a reconcile once the barrier is down', async () => {
+      await startFlow(steps(
+        { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+        { id: 'w', harness: 'test/cad', prompt: 'p', outputs: { files: ['out.txt'] } },
+        { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+      ))
+      await vi.waitFor(() => { for (const id of ['x', 'w', 'fix']) expect(liveTask(id).state).toBe('running') })
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).readVerdictSnapshot
+      const gates: (() => void)[] = []
+      const held = async (dir: string) => { await new Promise<void>(r => { gates.push(r) }); return actual(dir) }
+      vi.mocked(outputsModule.readVerdictSnapshot).mockImplementationOnce(held).mockImplementationOnce(held) // x's expiry, then w's result
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(gates).toHaveLength(1)) // step 4 holds on x
+      writeFileSync(join(liveTask('w').cwd, 'out.txt'), 'x')
+      service.ingest({ type: 'turn_ended', agentId: liveTask('w').agentId, payload: {} }) // kept: a reconcile runs
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      gates[0]()
+      await vi.waitFor(() => expect(gates).toHaveLength(2)) // the last phase's drain holds on w: step 5 has passed
+      service.ingest({ type: 'turn_ended', agentId: liveTask('fix').agentId, payload: {} })
+      expect(checked().phase).toBe('check-requested')
+      gates[1](); await resumed
+      expect(liveTask('w').state).toBe('succeeded')
+      await vi.waitFor(() => expect(checked()).toMatchObject({ phase: 'working', completed: 1 }))
+    })
+    it('starts no requested check once the run was cancelled during the reconcile', async () => {
+      await startFlow(steps({ id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' }, { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' }))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const hold = holdVerdictRead() // x's expiry holds step 4
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      service.ingest({ type: 'turn_ended', agentId: liveTask('fix').agentId, payload: {} })
+      expect(checked().phase).toBe('check-requested')
+      service.cancel(flowId)
+      hold.release(); await resumed
+      expect(internals().checks.size).toBe(0)
+      expect(existsSync(join(liveTask('fix').cwd, '.harness/loop/1.stdout.log'))).toBe(false)
+    })
+    it('fails the task when its check feedback cannot be delivered, and stops what it still owns', async () => {
+      const g = gate('second')
+      await startFlow(loopFlow(`[ -e "$HARNESS_PROJECT_DIR/first" ] && { ${g.run}; }; touch "$HARNESS_PROJECT_DIR/first"; exit 1`))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      turn('turn_started'); turn('turn_ended') // a steer turn starts the second check, which waits
+      await vi.waitFor(() => expect(internals().checks.size).toBe(1))
+      service.delivery({ deliveryId: checked().feedbackId!, sessionId: 'agent-1', state: 'rejected', reason: 'gone' })
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' }))
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      expect(cancelled).toContain('agent-1')
+    })
+    it('leaves a check that a daemon stop killed to the next start, which runs it again', async () => {
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().check?.pid).toEqual(expect.any(Number)))
+      const pid = checked().check!.pid!
+      service.stop() // kills the check at once and saves nothing over its loopState
+      await vi.waitFor(() => expect(processGone(pid)).toBe(true))
+      expect(onDisk().tasks[0].loopState).toMatchObject({ phase: 'checking', check: { pid } })
+      const { run } = await restartOn()
+      await vi.waitFor(() => expect(run().tasks[0].loopState).toMatchObject({ phase: 'checking', completed: 0 }))
+      expect(run().tasks[0].loopState!.check!.pid).not.toBe(pid)
+    })
+    it('saves a check that could not be confirmed stopped as uncertain when the daemon stops before its fence', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+      await startFlow(loopFlow('x'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const check = lingeringStep()
+      turn('turn_ended')
+      let release!: () => void
+      const owner = internals().exclusive(live(), liveTask('fix'), 1, () => new Promise<void>(r => { release = r })) // the fence waits for it
+      await check.end()
+      await vi.waitFor(() => expect([...internals().checks.values()][0]).toMatchObject({ uncertain: expect.any(String) }))
+      service.stop()
+      release(); await owner
+      expect(onDisk().tasks[0]).toMatchObject({ state: 'blocked', uncertain: true, error: 'A loop check may still be running (pid 999999). Make sure it stopped before retrying.' })
+    })
+    it.each(['failed', 'cancelled'] as const)('decides by the check pid after a crash for a %s task whose check may still run', async state => {
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const left = orphan()
+      const { next, run } = await restartOn(saved => {
+        Object.assign(saved.tasks[0], { state, error: 'Timed out after 1h.', retryAt: Date.now() + 60_000, loopState: { phase: 'checking', completed: 0, turn: 1, check: { pid: left.pid, startedAt: Date.now() } } })
+      })
+      expect(run().tasks[0]).toMatchObject({ state: state === 'failed' ? 'blocked' : 'cancelled', uncertain: true, error: `A loop check may still be running (pid ${left.pid}). Make sure it stopped before retrying.` })
+      expect(run().tasks[0].retryAt).toBeUndefined()
+      expect(() => next.retry(flowId, 'fix')).toThrow(expect.objectContaining({ code: 'RETRY_UNSAFE', message: `This loop check may still be running from before the daemon restart (pid ${left.pid}). Stop that process, then retry.` }))
+      process.kill(-left.pid, 'SIGKILL')
+      await vi.waitFor(() => expect(processGone(left.pid)).toBe(true))
+      next.retry(flowId, 'fix')
+      expect(run().tasks[0].attempt).toBe(2)
+    })
+    it('leaves a failed task alone after a crash when its check is known to be gone', async () => {
+      await startFlow(loopFlow('sleep 30'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      const ended = await exitedPid('true', []); await ended.exited
+      const { run } = await restartOn(saved => {
+        Object.assign(saved.tasks[0], { state: 'failed', error: 'Timed out after 1h.', loopState: { phase: 'checking', completed: 0, turn: 1, check: { pid: ended.pid, startedAt: Date.now() } } })
+      })
+      expect(run().tasks[0]).toMatchObject({ state: 'failed', uncertain: false, error: 'Timed out after 1h.' })
+    })
+    it('ends the attempt on resume when its feedback receipt failed while paused', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      live().state = 'paused'
+      service.delivery({ deliveryId: checked().feedbackId!, sessionId: 'agent-1', state: 'rejected', reason: 'gone' })
+      expect(liveTask('fix').state).toBe('running')
+      await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' })
+      expect(cancelled).toContain('agent-1')
+    })
+    it('ends the attempt after a restart when its feedback receipt failed before it was settled', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      const { run } = await restartOn(saved => { saved.messages.find(m => m.id === saved.tasks[0].loopState!.feedbackId)!.delivery = 'failed' })
+      expect(run().tasks[0]).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' })
+    })
+    it('ends the attempt when its feedback receipt fails during the last phase of a reconcile', async () => {
+      await startFlow(steps(
+        { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+        { id: 'w', harness: 'test/cad', prompt: 'p', outputs: { files: ['out.txt'] } },
+        { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+      ))
+      await vi.waitFor(() => { for (const id of ['x', 'w', 'fix']) expect(liveTask(id).state).toBe('running') })
+      service.ingest({ type: 'turn_ended', agentId: liveTask('fix').agentId, payload: {} })
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).readVerdictSnapshot
+      const gates: (() => void)[] = []
+      const held = async (dir: string) => { await new Promise<void>(r => { gates.push(r) }); return actual(dir) }
+      vi.mocked(outputsModule.readVerdictSnapshot).mockImplementationOnce(held).mockImplementationOnce(held) // x's expiry, then w's result
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(gates).toHaveLength(1)) // step 4 holds on x
+      writeFileSync(join(liveTask('w').cwd, 'out.txt'), 'x')
+      service.ingest({ type: 'turn_ended', agentId: liveTask('w').agentId, payload: {} }) // kept: a reconcile runs
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      gates[0]()
+      await vi.waitFor(() => expect(gates).toHaveLength(2)) // the last phase's drain holds on w: the receipt fails after any earlier scan
+      service.delivery({ deliveryId: checked().feedbackId!, sessionId: liveTask('fix').agentId!, state: 'rejected', reason: 'gone' })
+      gates[1](); await resumed
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' })
+      expect(liveTask('w').state).toBe('succeeded')
+    })
+    it('applies a result that arrives while the last pass scans feedback receipts, before the barrier lifts', async () => {
+      const g = gate('s')
+      await startFlow(steps(
+        { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+        { id: 's', run: g.run },
+      ))
+      await vi.waitFor(() => { expect(liveTask('fix').state).toBe('running'); expect(liveTask('s').state).toBe('running') })
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      live().state = 'paused'
+      service.delivery({ deliveryId: checked().feedbackId!, sessionId: 'agent-1', state: 'rejected', reason: 'gone' }) // saved, left for the scan
+      const hold = holdVerdictRead() // the scan's settlement of fix
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      g.open() // s exits while the scan is held: kept, because the barrier is up
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      hold.release(); await resumed
+      expect(liveTask('fix').state).toBe('failed')
+      expect(liveTask('s').state).toBe('succeeded') // another pass ran before the barrier lifted
+      expect(internals().pending.size).toBe(0)
+    })
+    it('ends an attempt whose receipt fails after the scan passed it, before the barrier lifts', async () => {
+      await startFlow(steps(
+        { id: 'early', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+        { id: 'late', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+      ))
+      await vi.waitFor(() => { expect(liveTask('early').state).toBe('running'); expect(liveTask('late').state).toBe('running') })
+      for (const id of ['early', 'late']) service.ingest({ type: 'turn_ended', agentId: liveTask(id).agentId, payload: {} })
+      await vi.waitFor(() => { for (const id of ['early', 'late']) expect(liveTask(id).loopState!.feedbackId).toBeDefined() })
+      live().state = 'paused'
+      const receipt = (id: string) => ({ deliveryId: liveTask(id).loopState!.feedbackId!, sessionId: liveTask(id).agentId!, state: 'rejected' as const, reason: 'gone' })
+      service.delivery(receipt('late')) // the scan passes `early` (fine) and holds on `late`
+      const hold = holdVerdictRead()
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      service.delivery(receipt('early')) // fails after the scan passed `early`
+      hold.release(); await resumed
+      expect(liveTask('late').state).toBe('failed')
+      expect(liveTask('early')).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' })
+    })
+    it('ends the attempt on a lost feedback even when a later check result of that attempt waits to be applied', async () => {
+      const g = gate('second')
+      await startFlow(loopFlow(`[ -e "$HARNESS_PROJECT_DIR/first" ] && { ${g.run}; }; touch "$HARNESS_PROJECT_DIR/first"; exit 1`))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      const lost = checked().feedbackId!
+      turn('turn_started'); turn('turn_ended') // the second check starts and waits
+      await vi.waitFor(() => expect(internals().checks.size).toBe(1))
+      live().state = 'paused'
+      service.delivery({ deliveryId: lost, sessionId: 'agent-1', state: 'rejected', reason: 'gone' })
+      g.open() // the second check fails below the limit while paused
+      await vi.waitFor(() => expect(internals().checks.size).toBe(0))
+      await service.resume(flowId)
+      expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' })
+      expect(checked()).toMatchObject({ completed: 1, feedbackId: lost }) // the second result never replaced the lost feedback
+      expect(cancelled).toContain('agent-1')
+      expect(sentTo('agent-1').some(text => text.includes('iteration 2 of 3'))).toBe(false)
+    })
+    it('starts no recovered check for an attempt whose feedback was lost', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      const { next, run } = await restartOn(saved => {
+        saved.messages.find(m => m.id === saved.tasks[0].loopState!.feedbackId)!.delivery = 'failed'
+        saved.tasks[0].loopState!.phase = 'check-requested'
+      })
+      expect(run().tasks[0]).toMatchObject({ state: 'failed', error: 'The check feedback could not be delivered. Log: .harness/loop/1.stderr.log' })
+      expect((next as unknown as { checks: Map<string, unknown> }).checks.size).toBe(0)
+      expect(existsSync(join(run().tasks[0].cwd, '.harness/loop/2.stdout.log'))).toBe(false)
+    })
+    it('leaves a check requested during the last phase to the timeout when the deadline passed meanwhile', async () => {
+      await startFlow(steps(
+        { id: 'x', harness: 'test/cad', prompt: 'p', timeout: '1h' },
+        { id: 'w', harness: 'test/cad', prompt: 'p', outputs: { files: ['out.txt'] } },
+        { id: 'fix', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+      ))
+      await vi.waitFor(() => { for (const id of ['x', 'w', 'fix']) expect(liveTask(id).state).toBe('running') })
+      live().state = 'paused'; liveTask('x').deadline = Date.now() - 1
+      const actual = (await vi.importActual<typeof import('./outputs.js')>('./outputs.js')).readVerdictSnapshot
+      const gates: (() => void)[] = []
+      const held = async (dir: string) => { await new Promise<void>(r => { gates.push(r) }); return actual(dir) }
+      vi.mocked(outputsModule.readVerdictSnapshot).mockImplementationOnce(held).mockImplementationOnce(held) // x's expiry, then w's result
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(gates).toHaveLength(1)) // step 4 holds on x
+      writeFileSync(join(liveTask('w').cwd, 'out.txt'), 'x')
+      service.ingest({ type: 'turn_ended', agentId: liveTask('w').agentId, payload: {} }) // kept: a reconcile runs
+      await vi.waitFor(() => expect(internals().pending.size).toBe(1))
+      gates[0]()
+      await vi.waitFor(() => expect(gates).toHaveLength(2)) // the last phase's drain holds on w: step 5 has passed
+      service.ingest({ type: 'turn_ended', agentId: liveTask('fix').agentId, payload: {} })
+      liveTask('fix').deadline = Date.now() - 1
+      clearTimeout(internals().deadlines.get(`${flowId}/fix/1`) as ReturnType<typeof setTimeout>); internals().deadlines.delete(`${flowId}/fix/1`) // its new deadline is armed when the barrier lifts
+      const recovering = service.recover() // ready at once: the barrier's end arms deadlines (it joins the running reconcile)
+      gates[1](); await resumed; await recovering
+      expect(internals().checks.size).toBe(0)
+      await vi.waitFor(() => expect(liveTask('fix')).toMatchObject({ state: 'failed', error: 'Timed out after 1h.' }))
+      expect(existsSync(join(liveTask('fix').cwd, '.harness/loop/1.stdout.log'))).toBe(false)
+    })
+    it('stops ending attempts with lost feedback once the run was cancelled during the scan', async () => {
+      await startFlow(steps(
+        { id: 'early', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+        { id: 'late', harness: 'test/cad', prompt: 'fix', loop: { until_run: 'exit 1', max_iterations: 3 }, timeout: '1h' },
+      ))
+      await vi.waitFor(() => { expect(liveTask('early').state).toBe('running'); expect(liveTask('late').state).toBe('running') })
+      for (const id of ['early', 'late']) service.ingest({ type: 'turn_ended', agentId: liveTask(id).agentId, payload: {} })
+      await vi.waitFor(() => { for (const id of ['early', 'late']) expect(liveTask(id).loopState!.feedbackId).toBeDefined() })
+      live().state = 'paused'
+      for (const id of ['early', 'late']) service.delivery({ deliveryId: liveTask(id).loopState!.feedbackId!, sessionId: liveTask(id).agentId!, state: 'rejected', reason: 'gone' })
+      const hold = holdVerdictRead() // the scan holds on `early`
+      const resumed = service.resume(flowId)
+      await vi.waitFor(() => expect(hold.reading()).toBe(true))
+      service.cancel(flowId)
+      hold.release(); await resumed
+      for (const id of ['early', 'late']) expect(liveTask(id)).toMatchObject({ state: 'cancelled', error: null })
+    })
+    it('leaves a failed loop task alone after a restart when its last check ended it', async () => {
+      await startFlow(loopFlow('exit 1', 1))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('failed'))
+      expect(checked().phase).toBe('checking')
+      expect(checked().check).toBeUndefined()
+      const { run } = await restartOn()
+      expect(run().tasks[0]).toMatchObject({ state: 'failed', uncertain: false, error: expect.stringMatching(/^Check still failing after 1 iteration/) })
+    })
+    it('leaves a loop task working when its feedback receipt is unknown after a restart, and resends nothing', async () => {
+      await startFlow(loopFlow('exit 1'))
+      await vi.waitFor(() => expect(liveTask('fix').state).toBe('running'))
+      turn('turn_ended')
+      await vi.waitFor(() => expect(checked().feedbackId).toBeDefined())
+      const sendsBefore = sends.length
+      const { run } = await restartOn(saved => { saved.messages.find(m => m.id === saved.tasks[0].loopState!.feedbackId)!.delivery = 'accepted' }) // load turns it into unknown
+      expect(run().tasks[0]).toMatchObject({ state: 'running', loopState: { phase: 'working', completed: 1 } })
+      expect(run().messages.find(m => m.id === run().tasks[0].loopState!.feedbackId)!.delivery).toBe('unknown')
+      expect(sends.length).toBe(sendsBefore)
     })
   })
 })
