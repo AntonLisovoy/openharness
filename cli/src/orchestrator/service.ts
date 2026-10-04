@@ -1094,31 +1094,38 @@ export class OrchestratorService {
     const tasks = taskId ? [this.task(run, taskId)] : run.tasks
     // A flow's error only advises what to do next; nothing is left to do once the whole project is cancelled.
     if (!taskId) { run.state = 'cancelled'; run.directorWorking = false; if (run.flow) run.error = null }
+    const agents = this.fenceCancel(run, tasks, !taskId)
+    // Stop first: a save that fails (and throws to the caller) must not leave a process running without its deadline.
+    this.cleanupCancel(run, tasks, agents)
+    this.changed(run)
+    this.pump(run)
+  }
+  /** The cancellation fence, on the live run: what is cancelled launches, retries and delivers nothing from now on. */
+  private fenceCancel(run: Run, tasks: Task[], whole: boolean): string[] {
     const agents: string[] = []
     for (const task of tasks) {
       // Also for a failed task: its pending retry is dropped.
-      const key = this.attemptKey(run, task)
-      clearTimeout(this.deadlines.get(key)); this.deadlines.delete(key)
-      delete task.retryAt; this.clearRetry(run, task)
+      this.clearTimers(run, task); delete task.retryAt
     }
     // A recorded but unfinished decision stays on a cancelled approval as a record.
     for (const task of tasks) if (['queued', 'running', 'launching', 'waiting', 'blocked'].includes(task.state)) {
       task.state = 'cancelled'
       if (task.agentId) agents.push(task.agentId)
     }
-    if (!taskId && run.directorId) agents.push(run.directorId)
+    if (whole && run.directorId) agents.push(run.directorId)
     for (const message of run.messages) {
-      if (taskId && !agents.includes(message.targetAgentId ?? '')) continue
+      if (!whole && !agents.includes(message.targetAgentId ?? '')) continue
       if (!['pending', 'accepted', 'queued'].includes(message.delivery ?? '')) continue
       const revoked = message.delivery === 'pending' || this.deps.cancelDelivery?.(message.id)
       message.delivery = revoked ? 'failed' : 'unknown'
       message.deliveryReason = revoked ? 'Cancelled before delivery.' : 'Stopped after dispatch; inspect the agent before resending.'
     }
-    // Stop first: a save that fails (and throws to the caller) must not leave a process running without its deadline.
+    return agents
+  }
+  /** Stops the armed step handles of these tasks and cancels the agents. */
+  private cleanupCancel(run: Run, tasks: Task[], agents: string[]): void {
     for (const task of tasks) this.steps.get(this.attemptKey(run, task))?.handle.stop()
     for (const agent of agents) this.deps.cancel(agent)
-    this.changed(run)
-    this.pump(run)
   }
   async resume(id: string): Promise<void> {
     const run = this.get(id)
