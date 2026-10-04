@@ -44,6 +44,9 @@ describe('graph', () => {
     expect(w('a.state == failed', t('a', 'failed'))).toEqual({ kind: 'launch' })
     expect(w('a.state == succeeded', t('a', 'failed'))).toEqual({ kind: 'skip', reason: 'Skipped: a.state == succeeded is false.' })
     expect(w('a.verdict.errors == 0', t('a', 'succeeded'))).toEqual({ kind: 'fail', reason: 'a wrote no verdict; the condition a.verdict.errors == 0 cannot be evaluated.' })
+    const odd = t('a', 'succeeded', { verdict: { ready: true, errors: 1.5, warnings: Number.NaN } })
+    expect(w('a.verdict.errors == 0', odd)).toEqual({ kind: 'fail', reason: 'a has a verdict.errors of 1.5, which is not a whole number; the condition a.verdict.errors == 0 cannot be evaluated.' })
+    expect(w('a.verdict.warnings < 1', odd)).toEqual({ kind: 'fail', reason: 'a has a verdict.warnings of NaN, which is not a whole number; the condition a.verdict.warnings < 1 cannot be evaluated.' })
     expect(w('a.decision == ship', t('a', 'succeeded', { decision: { outcome: 'approved', decision: 'ship', at: 1 } }))).toEqual({ kind: 'launch' })
     // a decision recorded on an approval that was cancelled before it finished is only a record: it decides nothing
     expect(w('a.decision == ship', t('a', 'cancelled', { decision: { outcome: 'approved', decision: 'ship', at: 1 } }))).toEqual({ kind: 'fail', reason: 'a has no decision; the condition a.decision == ship cannot be evaluated.' })

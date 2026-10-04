@@ -21,7 +21,7 @@ export function parseCondition(raw: string): Condition | { error: string } {
   if (!counted && !['==', '!='].includes(op)) return { error: 'Only verdict.errors and verdict.warnings can be compared with <, <=, > or >=.' }
   if (field === 'state' && !(CONDITION_STATES as readonly string[]).includes(value)) return { error: `a state is one of ${CONDITION_STATES.join(', ')}.` }
   if (field === 'verdict.ready' && value !== 'true' && value !== 'false') return { error: 'verdict.ready is true or false.' }
-  if (counted && !/^(0|[1-9][0-9]{0,8})$/.test(value)) return { error: `${field} is compared with a whole number.` }
+  if (counted && !/^(0|[1-9][0-9]*)$/.test(value)) return { error: `${field} is compared with a whole number.` }
   if (field === 'decision' && !/^[a-z][a-z0-9-]{0,31}$/.test(value)) return { error: 'a decision id looks like ship or needs-work.' }
   return { task, field, op, value, text: `${task}.${field} ${op} ${value}` }
 }
@@ -37,8 +37,10 @@ export function evaluateCondition(condition: Condition, subject: ConditionSubjec
     if (!subject.verdict) return { ok: false, reason: `${task} wrote no verdict; the condition ${text} cannot be evaluated.` }
     actual = field === 'verdict.ready' ? String(subject.verdict.ready) : field === 'verdict.errors' ? subject.verdict.errors : subject.verdict.warnings
   }
-  const expected = typeof actual === 'number' ? Number(value) : value
-  const result = op === '==' ? actual === expected : op === '!=' ? actual !== expected
-    : op === '<' ? actual < expected : op === '<=' ? actual <= expected : op === '>' ? actual > expected : actual >= expected
+  // Counts are compared as BigInt from the literal text: a literal may exceed 2^53 and must not be rounded.
+  if (typeof actual === 'number' && !(Number.isInteger(actual) && actual >= 0)) return { ok: false, reason: `${task} has a ${field} of ${actual}, which is not a whole number; the condition ${text} cannot be evaluated.` }
+  const [left, expected] = typeof actual === 'number' ? [BigInt(actual), BigInt(value)] : [actual, value]
+  const result = op === '==' ? left === expected : op === '!=' ? left !== expected
+    : op === '<' ? left < expected : op === '<=' ? left <= expected : op === '>' ? left > expected : left >= expected
   return { ok: true, value: result }
 }
