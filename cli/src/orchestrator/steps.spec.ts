@@ -104,7 +104,14 @@ describe('shell steps', () => {
     const step = startStep('true', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
     fake.emit('error', new Error('kill failed'))
     fake.emit('exit', 1, null); fake.emit('close', 1, null)
-    expect(await step.done).toMatchObject({ code: 1, error: 'the shell could not start (unknown error)', started: true })
+    expect(await step.done).toMatchObject({ code: 1, error: "the step's process reported an error (unknown error)", started: true })
+  })
+  it('names the code of a running process error', async () => {
+    const fake = Object.assign(new EventEmitter(), { pid: 999_999, stdout: null, stderr: null }) as unknown as ChildProcess
+    const step = startStep('x', { cwd, env: {}, spawn: () => fake, graceMs: 10 })
+    fake.emit('error', Object.assign(new Error('pipe'), { code: 'EPIPE' }))
+    fake.emit('exit', 1, null); fake.emit('close', 1, null)
+    expect((await step.done).error).toBe("the step's process reported an error (EPIPE)")
   })
   it('settles once when a process that never started also reports an exit', async () => {
     const fake = Object.assign(new EventEmitter(), { pid: undefined, stdout: null, stderr: null }) as unknown as ChildProcess

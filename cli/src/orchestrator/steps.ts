@@ -92,7 +92,10 @@ export function startStep(script: string, opts: { cwd: string; env: Record<strin
       if (child.pid !== undefined && !await groupGone(child.pid, giveUpAt!)) error ??= 'processes it started could not be confirmed stopped'
       resolve({ code: error && code === null ? 127 : code, signal, error, started: child.pid !== undefined, stdoutTail: stdout.tail(), stderrTail: stderr.tail() })
     }
-    child.on('error', e => { error ??= describe(e); if (child.pid === undefined) void finish(null, null) })
+    child.on('error', e => {
+      error ??= child.pid === undefined ? describe(e) : `the step's process reported an error (${(e as NodeJS.ErrnoException).code ?? 'unknown error'})`
+      if (child.pid === undefined) void finish(null, null)
+    })
     child.on('exit', (code, signal) => { void finish(code, signal) })
   })
   return { pid: child.pid, done, stop }
