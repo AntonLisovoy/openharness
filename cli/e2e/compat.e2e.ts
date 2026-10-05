@@ -30,7 +30,14 @@ const FROM = process.env.COMPAT_FROM
  * Differences on purpose, by the path that differs (a prefix covers everything under it), each with
  * why. Keep this honest: a difference nobody can explain is a regression until shown otherwise.
  */
-const CHANGED: Record<string, string> = {}
+const CHANGED: Record<string, string> = {
+  // The terminal streams passed `terminal_info` over and nothing answered it, so hn waited out its
+  // three seconds each time. It is answered now: what the pane runs and where, or why not.
+  'terminal_info claude': 'answered now; the released build left it unanswered',
+  'terminal_info codex': 'answered now; the released build left it unanswered',
+  'terminal_info with nothing': 'answered now; the released build left it unanswered',
+  'terminal_info for no such agent': 'answered now; the released build left it unanswered',
+}
 
 type Engine = 'claude' | 'codex'
 type Answers = Record<string, unknown>
@@ -152,12 +159,12 @@ async function scenario(d: IsolatedDaemon): Promise<Answers> {
       const from = client.frames.length
       const asked = client.next((frame) => frame.type === 'commander_question' && frame.agentId === agent[engine], 30_000, `${step} (${engine})`)
       client.send('message', { agentId: agent[engine], content })
-      const question = await asked
-      const shaped = question.payload?.questions?.[0]
-      answers[`${step} on ${engine}`] = walk(question.payload)
+      const question = (await asked).payload ?? {}
+      const shaped = question.questions?.[0]
+      answers[`${step} on ${engine}`] = walk(question)
       const ended = client.next((frame) => frame.type === 'turn_ended' && frame.agentId === agent[engine], 60_000, `turn_ended after ${step}`)
-      const replied = client.next((frame) => frame.type === 'question_response_result' && frame.payload?.requestId === question.payload.requestId, 45_000, `${step} answered`)
-      client.send('question_response', { requestId: question.payload.requestId, agentId: agent[engine], answers: { [shaped.q]: typeof pick === 'number' ? shaped.options[pick] : pick } })
+      const replied = client.next((frame) => frame.type === 'question_response_result' && frame.payload?.requestId === question.requestId, 45_000, `${step} answered`)
+      client.send('question_response', { requestId: question.requestId, agentId: agent[engine], answers: { [shaped.q]: typeof pick === 'number' ? shaped.options[pick] : pick } })
       answers[`${step} answered on ${engine}`] = walk((await replied).payload)
       await ended
       await new Promise((done) => setTimeout(done, 1_000))
@@ -284,7 +291,11 @@ describe.skipIf(!FROM)('what the apps see, compared with the released build', ()
     const released = sides.released!
     const current = sides.this!
     const found = differences(released.answers, current.answers)
-    const explained = (path: string) => Object.keys(CHANGED).find((prefix) => path === prefix || path.startsWith(`${prefix}.`) || path.startsWith(`${prefix}[`))
+    // Paths read `.<step>.<field>…`; a CHANGED entry names a step, or a path under one.
+    const explained = (path: string) => Object.keys(CHANGED).find((prefix) => {
+      const step = `.${prefix}`
+      return path === step || path.startsWith(`${step}.`) || path.startsWith(`${step}[`)
+    })
     const added = found.filter((difference) => difference.from === undefined)
     const unexplained = found.filter((difference) => difference.from !== undefined && !explained(difference.path))
     if (process.env.COMPAT_REPORT) {
