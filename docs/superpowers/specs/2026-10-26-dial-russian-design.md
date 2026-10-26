@@ -67,13 +67,11 @@ text, (b) Russian question prompts, options and dictated answers render on the d
 - No key → exactly today's path (hosted backend, sign-in required).
 - **Language:** pass the dial's `lang` through unchanged (no allow-list on the direct path); an empty/invalid
   value falls back to the existing host fallback.
-- **Model:** built-in per-language defaults that start from upstream's measured map: `vi` → `nova-2`
-  (nova-3 returns empty transcripts for Vietnamese), everything else → `nova-3`, plus `ru` as measured below.
-  Precedence: per-language config override > `DEEPGRAM_MODEL` (all languages) > built-in default. The `ru`
-  default is settled by measurement, not assumption: before the stage is called done, transcribe at least one
-  real Russian clip recorded on the dial (or the Mac mic at 16 kHz mono) with both nova-3 and nova-2 and
-  record the result in the code comment, the way upstream did for `vi`. Also run one English and one
-  Vietnamese clip through the direct path as regression checks.
+- **Model:** built-in per-language defaults: `vi` → `nova-2` (kept from upstream's measured map: nova-3
+  returns empty transcripts for Vietnamese), everything else, `ru` and `en` included, → `nova-3` (the person's
+  call: nova-3 handles Russian and English well; no separate clip measurement). Precedence: per-language config
+  override > `DEEPGRAM_MODEL` (all languages) > built-in default. The live Russian dictation check on the
+  board (§4) is the acceptance test; if it ever comes back empty, switch `ru` with `DEEPGRAM_MODELS=ru=nova-2`.
 - **Key configuration:** `DEEPGRAM_API_KEY` (and optional `DEEPGRAM_MODEL` / per-language map) read where the
   CLI reads env (`C/config/env.ts`). The devices service runs in its own process (`C/services/devices.ts`,
   `devicesProcess.ts`); the builder must make sure the value reaches that process and document, in the
@@ -147,7 +145,8 @@ text, (b) Russian question prompts, options and dictated answers render on the d
 - **On the board (after stage 0):** set language to Russian; ask a Russian question to an openharness agent
   and see it on the dial; answer by voice in Russian; send a Russian draft; check the Focus build and an
   `ALL_SKINS` build.
-- **STT measurement** as in §3.1.
+- **STT acceptance:** Russian and English dictation on the board through the direct path (§3.1); no clip
+  measurement.
 
 ## 5. Left to the builder
 

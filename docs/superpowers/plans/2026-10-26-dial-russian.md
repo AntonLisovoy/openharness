@@ -52,7 +52,7 @@
 - [ ] **Step 1: Write failing tests in `deepgramDirect.spec.ts`**
 
 Assertion contract (write each as a concrete test; `fetch` stubbed with `vi.stubGlobal` as in `cableVoice.spec.ts`):
-  - `deepgramModelFor('en', {}) === 'nova-3'`, `('vi', {}) === 'nova-2'`, `('ru', {}) === 'nova-3'` (literal; Task 2 changes this literal if the measurement says so).
+  - `deepgramModelFor('en', {}) === 'nova-3'`, `('vi', {}) === 'nova-2'`, `('ru', {}) === 'nova-3'`.
   - precedence: `('ru', {model:'nova-3', models:'ru=nova-2'}) === 'nova-2'`; `('vi', {model:'nova-3'}) === 'nova-3'`; `('ru-RU', {models:'ru=nova-2'}) === 'nova-2'`.
   - `transcribeWithDeepgram(Buffer.from([1,2,3]), 'ru', {key:'k', models:'ru=nova-2'})` calls `fetch` once with URL `https://api.deepgram.com/v1/listen?model=nova-2&language=ru&punctuate=true&smart_format=false`, headers `Authorization: Token k` and `Content-Type: audio/wav`, body bytes `[1,2,3]`.
   - language normalisation: `'RU-ru'` → `language=ru-ru`; an empty or invalid code (not `/^[a-z]{2}(-[a-z]{2})?$/i`) → `language=en` and model for `en`.
@@ -62,7 +62,7 @@ Assertion contract (write each as a concrete test; `fetch` stubbed with `vi.stub
 
 - [ ] **Step 2: Run** `cd cli && npx vitest run src/cable/deepgramDirect.spec.ts` — Expected: FAIL (module not found).
 
-- [ ] **Step 3: Implement `deepgramDirect.ts`.** Mirror `backend/src/lib/deepgramWav.ts` (no encoding params; `Content-Type: audio/wav`; body `new Uint8Array(wavBytes)`); copy its vi/nova-3 measurement comment. Export `RU_DEFAULT_MODEL = 'nova-3'` (Task 2 may change it). Network errors become `DeepgramError` with status 0 and message `Transcription failed (network)`.
+- [ ] **Step 3: Implement `deepgramDirect.ts`.** Mirror `backend/src/lib/deepgramWav.ts` (no encoding params; `Content-Type: audio/wav`; body `new Uint8Array(wavBytes)`); copy its vi/nova-3 measurement comment and note that `ru`/`en` use nova-3 by the person's call (override: `DEEPGRAM_MODELS=ru=nova-2`). Network errors become `DeepgramError` with status 0 and message `Transcription failed (network)`.
 
 - [ ] **Step 4: Add env keys** in the cable block of `env.ts` (`DEEPGRAM_API_KEY: maybe`, `DEEPGRAM_MODEL: maybe`, `DEEPGRAM_MODELS: matching(...)`).
 
@@ -82,20 +82,11 @@ Assertion contract (write each as a concrete test; `fetch` stubbed with `vi.stub
 
 - [ ] **Step 10: Commit** `feat(cable): direct Deepgram transcription with your own key`.
 
-### Task 2: Measure Russian on a real clip and pin the `ru` default
+### Task 2: (removed)
 
-**Files:**
-- Create: `cli/scripts/deepgram-probe.ts`
-- Modify: `cli/src/cable/deepgramDirect.ts` (`RU_DEFAULT_MODEL` + measurement comment)
-
-**Interfaces:**
-- Consumes: `transcribeWithDeepgram`, `deepgramModelFor` (Task 1).
-
-- [ ] **Step 1: Write `deepgram-probe.ts`**: `npx tsx cli/scripts/deepgram-probe.ts <file.wav> <lang>` prints, for `nova-3` and `nova-2`, the transcript and its length; reads the key from `DEEPGRAM_API_KEY`; refuses to print the key.
-- [ ] **Step 2: The person records clips** (16 kHz mono, ~8 s each): one Russian, one English and one Vietnamese (a Vietnamese text read aloud, or a public-domain Vietnamese sample converted with `ffmpeg -i in -ar 16000 -ac 1 vi.wav`) — e.g. `ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 -t 8 ru.wav`. Keep them outside the repo. A missing clip is reported as **incomplete** in Task 9's results, never as passed.
-- [ ] **Step 3: Run** the probe for each clip. Expected: Russian text is Cyrillic and sensible for at least one model; English unchanged for nova-3; Vietnamese non-empty for nova-2.
-- [ ] **Step 4: Set `RU_DEFAULT_MODEL`** to the better model and write the measurement (date, clip length, both outputs' quality in one line each) in the comment above it. Update the Task 1 test expectation if it changed. Run `npx vitest run src/cable/deepgramDirect.spec.ts` — PASS.
-- [ ] **Step 5: Commit** `chore(cable): pin Russian Deepgram model from a measured clip`.
+Clip measurement dropped: the person is confident nova-3 handles Russian and English, and Vietnamese is not
+needed. Russian/English quality is accepted by live dictation on the board in Task 9. Task numbers below are
+kept as they were.
 
 ### Task 3: Host text filters accept Cyrillic
 
@@ -218,5 +209,5 @@ These tests are expected to **pass** once Tasks 5–7 are in; to prove they guar
 - [ ] **Step 1: Sizes before:** on `main` (stash nothing; use a separate worktree) `cd devices/harness-device/firmware && idf.py set-target esp32s3 && idf.py build && idf.py size`, and `idf.py -B build-all -DDEVICE_ALL_SKINS=1 build size`. Record app image bytes vs the 0x7E0000 slot.
 - [ ] **Step 2: Sizes after** on `feat/dial-russian`, same two builds. Expected: both images < 0x7E0000; growth ≈ 40 KB (atlases) + ≈ 134 KB (Focus faces).
 - [ ] **Step 3: Headroom** (requires stage 0 done): for **both** the Focus build and the `ALL_SKINS` build, on `main` and on the branch, flash and read the `RAM tag=…` lines from `ram_telemetry` at boot and after opening a question; compare `psram_free`/`int_free`/`*_largest`. Expected: no allocation failures; record all four sets of numbers. A measurement that could not be taken is recorded as **incomplete**.
-- [ ] **Step 4: On the board:** set the dial's voice language to Русский in the desktop app; with `DEEPGRAM_API_KEY` set via `HARNESS_ENV_FILE`, ask a Russian question to an openharness agent → it renders; answer by option and by Russian dictation; send a Russian draft; repeat one question on an `ALL_SKINS` build. Then unset the key and check English voice still works through the hosted path after `harness login`.
+- [ ] **Step 4: On the board:** set the dial's voice language to Русский in the desktop app; with `DEEPGRAM_API_KEY` set via `HARNESS_ENV_FILE`, ask a Russian question to an openharness agent → it renders; answer by option and by Russian dictation; dictate one English sentence (direct path, nova-3); send a Russian draft; repeat one question on an `ALL_SKINS` build. Then unset the key and check English voice still works through the hosted path after `harness login`.
 - [ ] **Step 5: Write Results** (sizes, headroom deltas, model choice, anything that failed) into the spec and commit `docs: Russian on the dial — results`.
