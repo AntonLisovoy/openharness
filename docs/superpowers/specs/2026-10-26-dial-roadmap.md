@@ -31,7 +31,7 @@ new pieces separable (see stage 2).
 
 | # | Stage | Spec | Status |
 |---|---|---|---|
-| 0 | Flash the openharness firmware onto the board, verify over USB with the daemon (incl. voice) | this file, below | to do |
+| 0 | Flash the openharness firmware onto the board, verify over USB with the daemon (incl. voice) | this file, below | done |
 | 1 | Russian on the dial: own Deepgram STT with `ru`, Cyrillic glyphs, host fixes | `2026-10-26-dial-russian-design.md` | design |
 | 2 | Claude Code sessions without tmux (desktop + terminal) on the dial, via a Claude Code mod | `2026-10-26-dial-claude-sessions-design.md` | design |
 | 3 | "v2": Wi-Fi transport in firmware + LAN listener, mDNS discovery, pairing/auth, quota screen (Claude 5h/week + Codex arcs), battery on screen | not yet | later |
@@ -54,6 +54,13 @@ new pieces separable (see stage 2).
    openharness agents, a question can be answered from the dial, BOOT stops a turn, voice (English, through
    the stock backend after `harness login`) produces a transcript.
 5. Note anything that does not work; Wi-Fi and battery display are known absent.
+
+### Stage 0 results (2026-10-26)
+
+- Done. The person reports everything in the stage-0 checklist works with the daemon over USB.
+- Stock Xiaozhi image backed up to `~/xiaozhi-1.75c-backup.bin` (33,554,432 bytes = 32 MB flash).
+- Built with ESP-IDF 5.5.4 (the build rewrites `firmware/dependencies.lock`'s `idf` version locally; not
+  committed).
 
 ## Decisions log
 
